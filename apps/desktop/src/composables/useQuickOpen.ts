@@ -15,6 +15,7 @@ const REMOTE_SEARCH_MAX_REQUESTS = 8;
 const REMOTE_SEARCH_CONCURRENCY = 2;
 const REMOTE_SEARCH_RESULTS_PER_REQUEST = 25;
 const REMOTE_SEARCH_MAX_RESULTS = 100;
+const REMOTE_METADATA_CACHE_MAX_ITEMS = 2000;
 const QUICK_OPEN_MAX_RESULTS = 200;
 const INITIAL_SQL_LIBRARY_LIMIT = 20;
 const INITIAL_SQL_FILE_LIMIT = 20;
@@ -37,6 +38,15 @@ export interface QuickOpenItem {
   sqlFileId?: string; // For saved SQL library files
 }
 
+export type QuickOpenCategory = "all" | "database" | "file" | "code" | "action" | "text";
+export type QuickOpenDatabaseScope = "context" | "connected" | "all" | `connection:${string}`;
+
+export interface QuickOpenConnectionOption {
+  id: string;
+  name: string;
+  connected: boolean;
+}
+
 export type QuickOpenMatchKind = "exact" | "initials" | "prefix" | "word-prefix" | "substring" | "fuzzy";
 
 export interface QuickOpenMatch {
@@ -51,6 +61,9 @@ interface IdentifierWord {
 }
 
 const IDENTIFIER_SEPARATOR_RE = /[_\-. /\\]/;
+const DATABASE_ITEM_TYPES = new Set<QuickOpenItem["type"]>(["connection", "database", "schema", "table", "view", "materialized_view", "procedure", "function", "sequence", "package", "package-body"]);
+const FILE_ITEM_TYPES = new Set<QuickOpenItem["type"]>(["sql_file"]);
+const CODE_ITEM_TYPES = new Set<QuickOpenItem["type"]>(["sql_library_file"]);
 
 function identifierWords(text: string): IdentifierWord[] {
   const words: IdentifierWord[] = [];
@@ -203,8 +216,11 @@ export function useQuickOpen() {
   const connectionStore = useConnectionStore();
   const savedSqlStore = useSavedSqlStore();
   const searchQuery = ref("");
+  const selectedCategory = ref<QuickOpenCategory>("all");
+  const databaseScope = ref<QuickOpenDatabaseScope>("all");
   const selectedIndex = ref(0);
   const remoteItems = ref<QuickOpenItem[]>([]);
+  const cachedRemoteItems = ref<QuickOpenItem[]>([]);
   const sqlFileItems = ref<QuickOpenItem[]>([]);
   let remoteSearchGeneration = 0;
   let remoteSearchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -214,10 +230,46 @@ export function useQuickOpen() {
   let sqlFilesLoadingPromise: Promise<void> | null = null;
   let sqlFilesLoadGeneration = 0;
 
+  function isConnectionConnected(connectionId: string): boolean {
+    return !!connectionStore.connectedIds?.has(connectionId);
+  }
+
   function getConnectionLabel(connectionId: string): string {
     if (!connectionId) return i18n.global.t("sqlLibrary.unassociated");
     const conn = connectionStore.connections.find((c) => c.id === connectionId);
     return conn?.name || i18n.global.t("sqlLibrary.deletedConnection");
+  }
+
+  const connectionOptions = computed<QuickOpenConnectionOption[]>(() =>
+    connectionStore.connections.map((conn) => ({
+      id: conn.id,
+      name: conn.name,
+      connected: isConnectionConnected(conn.id),
+    })),
+  );
+
+  function itemMatchesCategory(item: QuickOpenItem): boolean {
+    if (selectedCategory.value === "all") return true;
+    if (selectedCategory.value === "database") return DATABASE_ITEM_TYPES.has(item.type);
+    if (selectedCategory.value === "file") return FILE_ITEM_TYPES.has(item.type);
+    if (selectedCategory.value === "code") return CODE_ITEM_TYPES.has(item.type);
+    // Code, action, and text are reserved filters for the Search Everywhere shell.
+    return false;
+  }
+
+  function itemMatchesDatabaseScope(item: QuickOpenItem): boolean {
+    if (!DATABASE_ITEM_TYPES.has(item.type)) return true;
+    if (selectedCategory.value !== "database") return true;
+    if (!connectionStore.connections.some((conn) => conn.id === item.connectionId)) return false;
+    if (databaseScope.value === "all") return true;
+    if (databaseScope.value === "connected") return isConnectionConnected(item.connectionId);
+    if (databaseScope.value.startsWith("connection:")) return item.connectionId === databaseScope.value.slice("connection:".length);
+    const contextConnectionId = connectionStore.activeConnectionId || connectionStore.connections[0]?.id;
+    return !!contextConnectionId && item.connectionId === contextConnectionId;
+  }
+
+  function itemMatchesActiveFilters(item: QuickOpenItem): boolean {
+    return itemMatchesCategory(item) && itemMatchesDatabaseScope(item);
   }
 
   const sqlLibraryAllItems = computed<QuickOpenItem[]>(() => {
@@ -534,6 +586,37 @@ export function useQuickOpen() {
     return item.id.toLowerCase();
   }
 
+  function cacheRemoteMetadata(items: QuickOpenItem[]): void {
+    if (items.length === 0) return;
+    const knownConnectionIds = new Set(connectionStore.connections.map((conn) => conn.id));
+    const merged = new Map<string, QuickOpenItem>();
+    const order: string[] = [];
+
+    for (const item of cachedRemoteItems.value) {
+      if (!knownConnectionIds.has(item.connectionId)) continue;
+      const key = quickOpenItemKey(item);
+      merged.set(key, item);
+      order.push(key);
+    }
+
+    for (const item of items) {
+      if (!knownConnectionIds.has(item.connectionId)) continue;
+      const key = quickOpenItemKey(item);
+      merged.set(key, item);
+      const existingIndex = order.indexOf(key);
+      if (existingIndex >= 0) order.splice(existingIndex, 1);
+      order.push(key);
+    }
+
+    while (order.length > REMOTE_METADATA_CACHE_MAX_ITEMS) {
+      const oldestKey = order.shift();
+      if (!oldestKey) break;
+      merged.delete(oldestKey);
+    }
+
+    cachedRemoteItems.value = order.map((key) => merged.get(key)).filter((item): item is QuickOpenItem => !!item);
+  }
+
   function remoteTableItem(table: SqlCompletionTable, conn: ConnectionConfig, database: string): QuickOpenItem {
     // Completion "tables" may carry routine navigation types; quick-open relation entries only accept relation kinds.
     const type = table.type === "view" || table.type === "materialized_view" ? table.type : "table";
@@ -561,14 +644,31 @@ export function useQuickOpen() {
     }
   }
 
+  function scopedConnections(): ConnectionConfig[] {
+    if (selectedCategory.value !== "database") return connectionStore.connections;
+    if (databaseScope.value === "connected") {
+      return connectionStore.connections.filter((conn) => isConnectionConnected(conn.id));
+    }
+    if (databaseScope.value.startsWith("connection:")) {
+      const connectionId = databaseScope.value.slice("connection:".length);
+      return connectionStore.connections.filter((conn) => conn.id === connectionId);
+    }
+    if (databaseScope.value === "context") {
+      const contextConnectionId = connectionStore.activeConnectionId || connectionStore.connections[0]?.id;
+      return contextConnectionId ? connectionStore.connections.filter((conn) => conn.id === contextConnectionId) : [];
+    }
+    return connectionStore.connections;
+  }
+
   function remoteSearchContexts(): Array<{ conn: ConnectionConfig; database: string }> {
     if (typeof connectionStore.listCompletionTables !== "function") return [];
+    if (selectedCategory.value !== "all" && selectedCategory.value !== "database") return [];
 
     const databasesByConnection: Array<{ conn: ConnectionConfig; databases: string[] }> = [];
-    const orderedConnections = [...connectionStore.connections].sort((left, right) => {
+    const orderedConnections = scopedConnections().sort((left, right) => {
       const priority = (conn: ConnectionConfig) => {
         if (conn.id === connectionStore.activeConnectionId) return 0;
-        if (connectionStore.connectedIds.has(conn.id)) return 1;
+        if (isConnectionConnected(conn.id)) return 1;
         return 2;
       };
       return priority(left) - priority(right);
@@ -647,6 +747,7 @@ export function useQuickOpen() {
           if (generation !== remoteSearchGeneration) return;
           groups[index] = tables.slice(0, REMOTE_SEARCH_RESULTS_PER_REQUEST).map((table) => remoteTableItem(table, conn, database));
           remoteItems.value = groups.flat().slice(0, REMOTE_SEARCH_MAX_RESULTS);
+          cacheRemoteMetadata(remoteItems.value);
         } catch {
           return;
         } finally {
@@ -668,8 +769,17 @@ export function useQuickOpen() {
   });
 
   watch(
-    searchQuery,
-    (query) => {
+    () => connectionStore.connections.map((conn) => conn.id),
+    () => {
+      const knownConnectionIds = new Set(connectionStore.connections.map((conn) => conn.id));
+      cachedRemoteItems.value = cachedRemoteItems.value.filter((item) => knownConnectionIds.has(item.connectionId));
+    },
+    { flush: "sync" },
+  );
+
+  watch(
+    [searchQuery, selectedCategory, databaseScope],
+    ([query]) => {
       selectedIndex.value = 0;
       const generation = ++remoteSearchGeneration;
       cancelStaleRemoteRequestWaiters(generation);
@@ -679,7 +789,7 @@ export function useQuickOpen() {
       const normalizedQuery = query.trim();
 
       // Ensure external SQL files are loaded when the user starts searching
-      if (normalizedQuery.length > 0 && !sqlFilesLoaded && !sqlFilesLoadingPromise) {
+      if ((selectedCategory.value === "all" || selectedCategory.value === "file") && normalizedQuery.length > 0 && !sqlFilesLoaded && !sqlFilesLoadingPromise) {
         void loadExternalSqlFiles();
       }
 
@@ -698,7 +808,7 @@ export function useQuickOpen() {
   const filteredItems = computed((): MatchedItem[] => {
     if (!searchQuery.value.trim()) {
       // Show all tree items plus a limited set of recent SQL library files and external SQL files
-      return [...allItems.value, ...sqlLibraryRecentItems.value, ...sqlFileRecentItems.value].map((item) => ({
+      return [...allItems.value, ...sqlLibraryRecentItems.value, ...sqlFileRecentItems.value].filter(itemMatchesActiveFilters).map((item) => ({
         ...item,
         matchScore: Infinity,
         matchIndices: [],
@@ -709,7 +819,8 @@ export function useQuickOpen() {
 
     const seen = new Set<string>();
     // When searching, include ALL SQL library files and external SQL files
-    for (const item of [...allItems.value, ...sqlLibraryAllItems.value, ...sqlFileItems.value, ...remoteItems.value]) {
+    for (const item of [...allItems.value, ...sqlLibraryAllItems.value, ...sqlFileItems.value, ...cachedRemoteItems.value, ...remoteItems.value]) {
+      if (!itemMatchesActiveFilters(item)) continue;
       const key = quickOpenItemKey(item);
       if (seen.has(key)) continue;
       seen.add(key);
@@ -786,6 +897,9 @@ export function useQuickOpen() {
 
   return {
     searchQuery,
+    selectedCategory,
+    databaseScope,
+    connectionOptions,
     filteredItems,
     selectedIndex,
     selectedItem,

@@ -75,6 +75,7 @@ import {
   isNewQueryShortcut,
   isObjectSourceSaveShortcutTarget,
   isOpenSettingsShortcut,
+  isPlainShiftTapShortcut,
   isQuickOpenShortcut,
   isResetZoomShortcut,
   isRefreshDataShortcut,
@@ -199,7 +200,9 @@ const { mcpUpdateAvailable, refreshMcpUpdateStatus, handleMcpStatusChanged } = u
 });
 const drawDesktopWindowFrame = shouldDrawDesktopWindowFrame(isMacOS(), isDesktop, isWindows());
 const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+const DOUBLE_SHIFT_QUICK_OPEN_INTERVAL_MS = 500;
 let updateCheckTimer: ReturnType<typeof setInterval> | undefined;
+let lastPlainShiftTapAt = 0;
 const needsAuth = ref(!isDesktop);
 const authenticated = ref(isDesktop);
 const setupRequired = ref(false);
@@ -2221,6 +2224,19 @@ async function handleKeydown(e: KeyboardEvent) {
   const shortcuts = settingsStore.editorSettings.shortcuts;
   const switchTabIndex = switchToTabIndexFromShortcut(e, shortcuts);
 
+  if (isPlainShiftTapShortcut(e)) {
+    const now = performance.now();
+    if (now - lastPlainShiftTapAt <= DOUBLE_SHIFT_QUICK_OPEN_INTERVAL_MS) {
+      lastPlainShiftTapAt = 0;
+      e.preventDefault();
+      e.stopPropagation();
+      showQuickOpen.value = true;
+      return;
+    }
+    lastPlainShiftTapAt = now;
+    return;
+  }
+
   if (isOpenSettingsShortcut(e, shortcuts)) {
     e.preventDefault();
     e.stopPropagation();
@@ -2775,6 +2791,7 @@ onUnmounted(() => {
                 :saved-sql-history-items="savedSqlHistoryItems"
                 :app-version="appVersion"
                 :has-connections="connectionStore.connections.length > 0"
+                :shortcuts="settingsStore.editorSettings.shortcuts"
                 @open-connection-query="openConnectionQuery"
                 @open-saved-sql="openSavedSqlFromWelcome"
                 @new-connection="showConnectionDialog = true"

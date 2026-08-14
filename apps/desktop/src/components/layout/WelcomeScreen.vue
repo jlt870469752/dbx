@@ -1,9 +1,12 @@
 <script setup lang="ts">
+import { computed } from "vue";
 import { useI18n } from "vue-i18n";
-import { FilePlus2, Plus, History, Download, Database, Search, ShieldCheck, Sparkles } from "@lucide/vue";
+import { FilePlus2, Plus, History, Download, Database, Search, ShieldCheck, Sparkles, Keyboard } from "@lucide/vue";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import TruncatedTextTooltip from "@/components/ui/TruncatedTextTooltip.vue";
 import { connectionDriverLabel, connectionIconType, connectionRedactedNameLabel, connectionRedactedOptionSubtitle } from "@/lib/connection/connectionPresentation";
+import { shortcutDisplayStrokes, shortcutKeyLabel } from "@/lib/editor/shortcutDisplay";
+import { normalizeShortcutSettings, type ShortcutSettings } from "@/lib/editor/shortcutRegistry";
 import type { ConnectionConfig } from "@/types/database";
 
 export interface WelcomeSavedSqlHistoryItem {
@@ -15,12 +18,20 @@ export interface WelcomeSavedSqlHistoryItem {
   openCount?: number;
 }
 
-defineProps<{
+interface WelcomeShortcutRow {
+  id: string;
+  title: string;
+  description: string;
+  shortcuts: Array<{ id: string; strokes: string[][] }>;
+}
+
+const props = defineProps<{
   connectionStats: { total: number; connected: number; types: number };
   recentConnections: ConnectionConfig[];
   savedSqlHistoryItems: WelcomeSavedSqlHistoryItem[];
   appVersion: string;
   hasConnections: boolean;
+  shortcuts: Partial<ShortcutSettings>;
 }>();
 
 const emit = defineEmits<{
@@ -35,9 +46,62 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
+const normalizedShortcuts = computed(() => normalizeShortcutSettings(props.shortcuts));
+
+const shortcutRows = computed<WelcomeShortcutRow[]>(() => [
+  {
+    id: "quick-open",
+    title: t("welcome.shortcutQuickOpen"),
+    description: t("welcome.shortcutQuickOpenDescription"),
+    shortcuts: [
+      { id: "double-shift", strokes: shortcutStrokeLabels("Shift Shift") },
+      { id: normalizedShortcuts.value.quickOpen, strokes: shortcutStrokeLabels(normalizedShortcuts.value.quickOpen) },
+    ],
+  },
+  {
+    id: "quick-open-category",
+    title: t("welcome.shortcutQuickOpenCategory"),
+    description: t("welcome.shortcutQuickOpenCategoryDescription"),
+    shortcuts: [
+      { id: "Tab", strokes: shortcutStrokeLabels("Tab") },
+      { id: "Shift+Tab", strokes: shortcutStrokeLabels("Shift+Tab") },
+    ],
+  },
+  {
+    id: "new-query",
+    title: t("welcome.shortcutNewQuery"),
+    description: t("welcome.shortcutNewQueryDescription"),
+    shortcuts: [{ id: normalizedShortcuts.value.newQuery, strokes: shortcutStrokeLabels(normalizedShortcuts.value.newQuery) }],
+  },
+  {
+    id: "execute-sql",
+    title: t("welcome.shortcutExecuteSql"),
+    description: t("welcome.shortcutExecuteSqlDescription"),
+    shortcuts: [{ id: normalizedShortcuts.value.executeSql, strokes: shortcutStrokeLabels(normalizedShortcuts.value.executeSql) }],
+  },
+  {
+    id: "switch-tab",
+    title: t("welcome.shortcutSwitchTab"),
+    description: t("welcome.shortcutSwitchTabDescription"),
+    shortcuts: [
+      { id: normalizedShortcuts.value.switchToPreviousTab, strokes: shortcutStrokeLabels(normalizedShortcuts.value.switchToPreviousTab) },
+      { id: normalizedShortcuts.value.switchToNextTab, strokes: shortcutStrokeLabels(normalizedShortcuts.value.switchToNextTab) },
+    ],
+  },
+  {
+    id: "open-settings",
+    title: t("welcome.shortcutOpenSettings"),
+    description: t("welcome.shortcutOpenSettingsDescription"),
+    shortcuts: [{ id: normalizedShortcuts.value.openSettings, strokes: shortcutStrokeLabels(normalizedShortcuts.value.openSettings) }],
+  },
+]);
 
 function welcomeConnectionSubtitle(connection: ConnectionConfig): string {
   return connectionRedactedOptionSubtitle(connection) || connectionDriverLabel(connection);
+}
+
+function shortcutStrokeLabels(shortcut: string): string[][] {
+  return shortcutDisplayStrokes(shortcut).map((stroke) => stroke.map((part) => shortcutKeyLabel(part)));
 }
 </script>
 
@@ -88,7 +152,7 @@ function welcomeConnectionSubtitle(connection: ConnectionConfig): string {
 
         <div class="min-w-0 overflow-hidden rounded-lg border">
           <div class="border-b px-4 py-3">
-            <div class="text-sm font-medium">{{ t("welcome.shortcuts") }}</div>
+            <div class="text-sm font-medium">{{ t("welcome.actions") }}</div>
           </div>
           <div class="grid min-w-0 gap-1 p-2">
             <button class="flex min-w-0 items-center gap-2 overflow-hidden rounded-md px-3 py-2 text-left text-sm hover:bg-muted/50" @click="emit('new-connection')">
@@ -106,6 +170,38 @@ function welcomeConnectionSubtitle(connection: ConnectionConfig): string {
             <div class="mt-2 min-w-0 overflow-hidden rounded-md bg-muted/30 px-3 py-2 text-xs leading-5 text-muted-foreground">
               <Search class="mr-1 inline h-3.5 w-3.5 shrink-0" />
               {{ t("welcome.tip") }}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="min-w-0 overflow-hidden rounded-lg border">
+        <div class="flex items-center justify-between border-b px-4 py-3">
+          <div class="flex min-w-0 items-center gap-2 text-sm font-medium">
+            <Keyboard class="h-4 w-4 shrink-0" />
+            <span class="min-w-0 truncate">{{ t("welcome.keyboardShortcuts") }}</span>
+          </div>
+          <div class="text-xs text-muted-foreground">{{ t("welcome.keyboardShortcutsHint") }}</div>
+        </div>
+        <div class="grid gap-1 p-2">
+          <div v-for="row in shortcutRows" :key="row.id" class="flex min-w-0 flex-col gap-3 rounded-md px-3 py-3 transition-colors hover:bg-muted/30 md:flex-row md:items-center md:justify-between">
+            <div class="min-w-0">
+              <div class="truncate text-sm font-medium">{{ row.title }}</div>
+              <div class="mt-1 text-xs leading-5 text-muted-foreground">{{ row.description }}</div>
+            </div>
+            <div class="flex shrink-0 flex-wrap items-center gap-2">
+              <div v-for="shortcut in row.shortcuts" :key="shortcut.id" class="flex items-center gap-2">
+                <div class="flex items-center gap-1.5">
+                  <template v-for="(stroke, strokeIndex) in shortcut.strokes" :key="`${shortcut.id}-${strokeIndex}`">
+                    <div class="flex items-center gap-1">
+                      <kbd v-for="(keyLabel, keyIndex) in stroke" :key="`${shortcut.id}-${strokeIndex}-${keyIndex}`" class="inline-flex min-h-7 min-w-7 items-center justify-center rounded-md border border-border/70 bg-muted/40 px-2 text-[11px] font-medium text-foreground shadow-sm">
+                        {{ keyLabel }}
+                      </kbd>
+                    </div>
+                    <span v-if="strokeIndex < shortcut.strokes.length - 1" class="text-xs text-muted-foreground">{{ t("welcome.shortcutThen") }}</span>
+                  </template>
+                </div>
+              </div>
             </div>
           </div>
         </div>

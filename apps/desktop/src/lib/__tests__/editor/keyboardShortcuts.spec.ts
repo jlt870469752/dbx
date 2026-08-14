@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { eventToModifierOnlyShortcut, eventToShortcut, isExecuteSqlInNewResultTabShortcut, matchesModifierOnlyShortcut, matchesShortcut } from "@/lib/editor/keyboardShortcuts";
+import { eventToModifierOnlyShortcut, eventToShortcut, isExecuteSqlInNewResultTabShortcut, isPlainShiftTapShortcut, matchesModifierOnlyShortcut, matchesShortcut } from "@/lib/editor/keyboardShortcuts";
 import { formatShortcutDisplay, isMacShortcutPlatform } from "@/lib/editor/shortcutDisplay";
 
 describe("keyboard shortcut matching", () => {
@@ -11,6 +11,16 @@ describe("keyboard shortcut matching", () => {
     expect(eventToModifierOnlyShortcut({ key: "Meta", metaKey: true }, "MacIntel")).toBe("Mod");
     expect(eventToModifierOnlyShortcut({ key: "Control", ctrlKey: true }, "MacIntel")).toBe("Ctrl");
     expect(eventToModifierOnlyShortcut({ key: "A", altKey: true })).toBeNull();
+  });
+
+  it("recognizes a plain Shift tap for DataGrip-style quick open", () => {
+    expect(isPlainShiftTapShortcut({ key: "Shift", shiftKey: true })).toBe(true);
+    expect(isPlainShiftTapShortcut({ key: "Shift", shiftKey: true, repeat: true })).toBe(false);
+    expect(isPlainShiftTapShortcut({ key: "Shift", shiftKey: true, metaKey: true })).toBe(false);
+    expect(isPlainShiftTapShortcut({ key: "Shift", shiftKey: true, ctrlKey: true })).toBe(false);
+    expect(isPlainShiftTapShortcut({ key: "Shift", shiftKey: true, altKey: true })).toBe(false);
+    expect(isPlainShiftTapShortcut({ key: "Shift", shiftKey: true, isComposing: true })).toBe(false);
+    expect(isPlainShiftTapShortcut({ key: "A", shiftKey: true })).toBe(false);
   });
 
   it("matches a configured mouse modifier exactly", () => {

@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed, ref, watch, nextTick } from "vue";
 import { useI18n } from "vue-i18n";
-import { Command, FileCode, FileText } from "@lucide/vue";
+import { Check, ChevronDown, Command, Database, FileCode, FileText } from "@lucide/vue";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { useQuickOpen, type QuickOpenItem } from "@/composables/useQuickOpen";
+import { Button } from "@/components/ui/button";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { useQuickOpen, type QuickOpenCategory, type QuickOpenDatabaseScope, type QuickOpenItem } from "@/composables/useQuickOpen";
 
 const props = defineProps<{
   open: boolean;
@@ -16,13 +18,46 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
-const { searchQuery, filteredItems, selectedIndex, selectedItem, selectNext, selectPrevious, setQuery, loadExternalSqlFiles } = useQuickOpen();
+const { searchQuery, selectedCategory, databaseScope, connectionOptions, filteredItems, selectedIndex, selectedItem, selectNext, selectPrevious, setQuery, loadExternalSqlFiles } = useQuickOpen();
 const inputRef = ref<HTMLInputElement | null>(null);
+
+const categories: Array<{ id: QuickOpenCategory; labelKey: string }> = [
+  { id: "all", labelKey: "quickOpen.categoryAll" },
+  { id: "database", labelKey: "quickOpen.categoryDatabase" },
+  { id: "file", labelKey: "quickOpen.categoryFile" },
+  { id: "code", labelKey: "quickOpen.categoryCode" },
+  { id: "action", labelKey: "quickOpen.categoryAction" },
+  { id: "text", labelKey: "quickOpen.categoryText" },
+];
 
 const dialogOpen = computed({
   get: () => props.open,
   set: (value) => emit("update:open", value),
 });
+
+function searchInputElement(): HTMLInputElement | null {
+  if (inputRef.value instanceof HTMLInputElement) return inputRef.value;
+  const element = (inputRef.value as { $el?: HTMLInputElement | null } | null)?.$el;
+  return element instanceof HTMLInputElement ? element : null;
+}
+
+function focusSearchInput(): void {
+  nextTick(() => {
+    requestAnimationFrame(() => {
+      searchInputElement()?.focus({ preventScroll: true });
+    });
+  });
+}
+
+function handleOpenAutoFocus(e: Event): void {
+  e.preventDefault();
+  focusSearchInput();
+}
+
+function handleDatabaseScopeCloseAutoFocus(e: Event): void {
+  e.preventDefault();
+  focusSearchInput();
+}
 
 function handleKeyDown(e: KeyboardEvent): void {
   if (e.key === "ArrowDown") {
@@ -31,6 +66,12 @@ function handleKeyDown(e: KeyboardEvent): void {
   } else if (e.key === "ArrowUp") {
     e.preventDefault();
     selectPrevious();
+  } else if (e.key === "Tab") {
+    e.preventDefault();
+    const currentIndex = categories.findIndex((category) => category.id === selectedCategory.value);
+    const direction = e.shiftKey ? -1 : 1;
+    const nextIndex = (currentIndex + direction + categories.length) % categories.length;
+    setCategory(categories[nextIndex]?.id ?? "all");
   } else if (e.key === "Enter" && selectedItem.value) {
     e.preventDefault();
     handleSelect(selectedItem.value);
@@ -43,6 +84,35 @@ function handleKeyDown(e: KeyboardEvent): void {
 function handleSelect(item: QuickOpenItem): void {
   emit("select", item);
   dialogOpen.value = false;
+}
+
+function setCategory(category: QuickOpenCategory): void {
+  selectedCategory.value = category;
+  selectedIndex.value = 0;
+  if (category === "file") void loadExternalSqlFiles();
+  focusSearchInput();
+}
+
+function setDatabaseScope(scope: QuickOpenDatabaseScope): void {
+  databaseScope.value = scope;
+  selectedIndex.value = 0;
+  focusSearchInput();
+}
+
+function databaseScopeLabel(): string {
+  if (databaseScope.value === "context") return t("quickOpen.scopeContext");
+  if (databaseScope.value === "connected") return t("quickOpen.scopeConnected");
+  if (databaseScope.value === "all") return t("quickOpen.scopeAll");
+  const connectionId = databaseScope.value.slice("connection:".length);
+  return connectionOptions.value.find((option) => option.id === connectionId)?.name ?? t("quickOpen.scopeAll");
+}
+
+function scopeConnectionValue(connectionId: string): QuickOpenDatabaseScope {
+  return `connection:${connectionId}`;
+}
+
+function isSelectedDatabaseScope(scope: QuickOpenDatabaseScope): boolean {
+  return databaseScope.value === scope;
 }
 
 function getHighlightedLabel(item: any): (string | { text: string; highlight: boolean })[] {
@@ -129,9 +199,7 @@ watch(
       setQuery("");
       // Eagerly load external SQL files so they appear in the initial list
       void loadExternalSqlFiles();
-      nextTick(() => {
-        inputRef.value?.focus();
-      });
+      focusSearchInput();
     }
   },
 );
@@ -139,8 +207,54 @@ watch(
 
 <template>
   <Dialog :open="dialogOpen" @update:open="dialogOpen = $event">
-    <DialogContent class="max-w-2xl p-0 gap-0 rounded-lg overflow-hidden">
+    <DialogContent portalClass="items-start justify-items-center pt-14 sm:pt-20" class="max-w-3xl p-0 gap-0 rounded-lg overflow-hidden" @open-auto-focus="handleOpenAutoFocus">
       <div class="flex flex-col bg-background">
+        <!-- Category Tabs -->
+        <div class="flex items-center justify-between gap-3 border-b bg-muted/30 px-3 py-2">
+          <div class="flex min-w-0 items-center gap-1 overflow-x-auto">
+            <button
+              v-for="category in categories"
+              :key="category.id"
+              type="button"
+              tabindex="-1"
+              :class="['shrink-0 rounded-md px-2.5 py-1 text-sm transition-colors', selectedCategory === category.id ? 'border border-primary/40 bg-primary/10 text-primary shadow-sm' : 'text-muted-foreground hover:bg-muted hover:text-foreground']"
+              @click="setCategory(category.id)"
+            >
+              {{ t(category.labelKey) }}
+            </button>
+          </div>
+          <DropdownMenu v-if="selectedCategory === 'database'">
+            <DropdownMenuTrigger as-child>
+              <Button variant="ghost" size="sm" class="h-7 shrink-0 gap-1.5 px-2 text-xs text-muted-foreground hover:text-foreground">
+                <Database class="h-3.5 w-3.5" />
+                <span class="max-w-40 truncate">{{ databaseScopeLabel() }}</span>
+                <ChevronDown class="h-3.5 w-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" class="w-64" @close-auto-focus="handleDatabaseScopeCloseAutoFocus">
+              <DropdownMenuLabel>{{ t("quickOpen.databaseScope") }}</DropdownMenuLabel>
+              <DropdownMenuItem @click="setDatabaseScope('context')">
+                <Check :class="['h-4 w-4', isSelectedDatabaseScope('context') ? 'opacity-100' : 'opacity-0']" />
+                <span>{{ t("quickOpen.scopeContext") }}</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem @click="setDatabaseScope('connected')">
+                <Check :class="['h-4 w-4', isSelectedDatabaseScope('connected') ? 'opacity-100' : 'opacity-0']" />
+                <span>{{ t("quickOpen.scopeConnected") }}</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem @click="setDatabaseScope('all')">
+                <Check :class="['h-4 w-4', isSelectedDatabaseScope('all') ? 'opacity-100' : 'opacity-0']" />
+                <span>{{ t("quickOpen.scopeAll") }}</span>
+              </DropdownMenuItem>
+              <DropdownMenuSeparator v-if="connectionOptions.length > 0" />
+              <DropdownMenuItem v-for="connection in connectionOptions" :key="connection.id" @click="setDatabaseScope(scopeConnectionValue(connection.id))">
+                <Check :class="['h-4 w-4', isSelectedDatabaseScope(scopeConnectionValue(connection.id)) ? 'opacity-100' : 'opacity-0']" />
+                <span class="min-w-0 flex-1 truncate">{{ connection.name }}</span>
+                <span v-if="connection.connected" class="h-1.5 w-1.5 rounded-full bg-emerald-500" :title="t('quickOpen.connected')" />
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+
         <!-- Search Input -->
         <div class="flex items-center gap-3 px-4 py-3 border-b">
           <Command class="h-5 w-5 text-muted-foreground" />

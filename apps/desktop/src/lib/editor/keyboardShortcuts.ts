@@ -8,6 +8,7 @@ export interface ShortcutLikeEvent {
   ctrlKey?: boolean;
   altKey?: boolean;
   shiftKey?: boolean;
+  repeat?: boolean;
   isComposing?: boolean;
 }
 
@@ -229,6 +230,10 @@ export function isViewTableDdlShortcut(event: ShortcutLikeEvent, shortcuts?: Par
 
 export function isQuickOpenShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
   return matchesShortcut(event, actionShortcut("quickOpen", shortcuts));
+}
+
+export function isPlainShiftTapShortcut(event: ShortcutLikeEvent): boolean {
+  return event.key === "Shift" && !!event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey && !event.repeat && !event.isComposing;
 }
 
 export function isSwitchToPreviousTabShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {

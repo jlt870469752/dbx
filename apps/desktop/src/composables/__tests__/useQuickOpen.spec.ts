@@ -248,6 +248,137 @@ describe("useQuickOpen", () => {
   });
 
   describe("filtering and searching", () => {
+    it("filters to database results when the Database category is selected", () => {
+      vi.mocked(useConnectionStore).mockReturnValue({
+        connections: [{ id: "conn1", name: "ProdConnection", db_type: "mysql" }],
+        treeNodes: [
+          {
+            connectionId: "conn1",
+            type: "database",
+            database: "UserDB",
+            label: "UserDB",
+          },
+        ],
+      } as any);
+      vi.mocked(useSavedSqlStore).mockReturnValue({
+        allFiles: [{ id: "sql-1", name: "users.sql", connectionId: "conn1", updatedAt: "2026-08-14T00:00:00.000Z" }],
+        getFile: vi.fn().mockReturnValue({ id: "sql-1", name: "users.sql", connectionId: "conn1", updatedAt: "2026-08-14T00:00:00.000Z" }),
+      } as any);
+
+      const { filteredItems, selectedCategory, setQuery } = useQuickOpen();
+      selectedCategory.value = "database";
+      setQuery("user");
+
+      expect(filteredItems.value.map((item) => item.type)).toEqual(["database"]);
+      expect(filteredItems.value[0]?.label).toBe("UserDB");
+    });
+
+    it("filters database results to connected data sources", () => {
+      vi.mocked(useConnectionStore).mockReturnValue({
+        connections: [
+          { id: "conn1", name: "Connected", db_type: "mysql" },
+          { id: "conn2", name: "Cold", db_type: "mysql" },
+        ],
+        connectedIds: new Set(["conn1"]),
+        treeNodes: [
+          { connectionId: "conn1", type: "database", database: "app", label: "app" },
+          { connectionId: "conn2", type: "database", database: "archive", label: "archive" },
+        ],
+      } as any);
+
+      const { filteredItems, selectedCategory, databaseScope, setQuery } = useQuickOpen();
+      selectedCategory.value = "database";
+      databaseScope.value = "connected";
+      setQuery("");
+
+      expect(filteredItems.value.map((item) => item.label)).toEqual(["Connected", "app"]);
+    });
+
+    it("keeps the current query when switching categories and only changes the search scope", () => {
+      vi.mocked(useConnectionStore).mockReturnValue({
+        connections: [{ id: "conn1", name: "ProdConnection", db_type: "mysql" }],
+        treeNodes: [
+          {
+            connectionId: "conn1",
+            type: "database",
+            database: "UserDB",
+            label: "UserDB",
+          },
+        ],
+      } as any);
+      vi.mocked(useSavedSqlStore).mockReturnValue({
+        allFiles: [{ id: "sql-1", name: "users.sql", connectionId: "conn1", updatedAt: "2026-08-14T00:00:00.000Z" }],
+        getFile: vi.fn().mockReturnValue({ id: "sql-1", name: "users.sql", connectionId: "conn1", updatedAt: "2026-08-14T00:00:00.000Z" }),
+      } as any);
+
+      const { searchQuery, filteredItems, selectedCategory, setQuery } = useQuickOpen();
+      setQuery("user");
+      expect(searchQuery.value).toBe("user");
+      expect(filteredItems.value.map((item) => item.label)).toEqual(["UserDB", "users.sql"]);
+
+      selectedCategory.value = "database";
+      expect(searchQuery.value).toBe("user");
+      expect(filteredItems.value.map((item) => item.label)).toEqual(["UserDB"]);
+
+      selectedCategory.value = "code";
+      expect(searchQuery.value).toBe("user");
+      expect(filteredItems.value.map((item) => item.label)).toEqual(["users.sql"]);
+    });
+
+    it("applies database scope only inside the Database category", () => {
+      vi.mocked(useConnectionStore).mockReturnValue({
+        connections: [
+          { id: "conn1", name: "Alpha", db_type: "mysql" },
+          { id: "conn2", name: "Beta", db_type: "mysql" },
+        ],
+        treeNodes: [
+          { connectionId: "conn1", type: "database", database: "alpha_db", label: "alpha_db" },
+          { connectionId: "conn2", type: "database", database: "beta_db", label: "beta_db" },
+        ],
+      } as any);
+      vi.mocked(useSavedSqlStore).mockReturnValue({
+        allFiles: [{ id: "sql-1", name: "shared.sql", connectionId: "conn1", updatedAt: "2026-08-14T00:00:00.000Z" }],
+        getFile: vi.fn().mockReturnValue({ id: "sql-1", name: "shared.sql", connectionId: "conn1", updatedAt: "2026-08-14T00:00:00.000Z" }),
+      } as any);
+
+      const { filteredItems, selectedCategory, databaseScope, setQuery } = useQuickOpen();
+      databaseScope.value = "connection:conn2";
+      setQuery("");
+
+      expect(filteredItems.value.map((item) => item.label)).toContain("shared.sql");
+      expect(filteredItems.value.map((item) => item.label)).toContain("Alpha");
+      expect(filteredItems.value.map((item) => item.label)).toContain("alpha_db");
+      expect(filteredItems.value.map((item) => item.label)).toContain("Beta");
+      expect(filteredItems.value.map((item) => item.label)).toContain("beta_db");
+
+      selectedCategory.value = "database";
+      expect(filteredItems.value.map((item) => item.label)).toEqual(["Beta", "beta_db"]);
+    });
+
+    it("keeps the current query when switching database scope and only narrows database results", () => {
+      vi.mocked(useConnectionStore).mockReturnValue({
+        connections: [
+          { id: "conn1", name: "Alpha", db_type: "mysql" },
+          { id: "conn2", name: "Beta", db_type: "mysql" },
+        ],
+        treeNodes: [
+          { connectionId: "conn1", type: "database", database: "users_primary", label: "users_primary" },
+          { connectionId: "conn2", type: "database", database: "users_archive", label: "users_archive" },
+        ],
+      } as any);
+
+      const { searchQuery, filteredItems, selectedCategory, databaseScope, setQuery } = useQuickOpen();
+      selectedCategory.value = "database";
+      setQuery("users");
+
+      expect(searchQuery.value).toBe("users");
+      expect(filteredItems.value.map((item) => item.label)).toEqual(["users_archive", "users_primary"]);
+
+      databaseScope.value = "connection:conn1";
+      expect(searchQuery.value).toBe("users");
+      expect(filteredItems.value.map((item) => item.label)).toEqual(["users_primary"]);
+    });
+
     it("keeps database-object highlight indices relative to the visible label", () => {
       vi.mocked(useConnectionStore).mockReturnValue({
         connections: [{ id: "conn1", name: "Test TiDB", db_type: "mysql" }],
@@ -929,6 +1060,22 @@ describe("useQuickOpen", () => {
       expect(filteredItems.value).toEqual(expect.arrayContaining([expect.objectContaining({ label: "orders", type: "table", database: "app" })]));
     });
 
+    it("reuses cached remote metadata locally before scheduling another remote search", async () => {
+      const listCompletionTables = vi.fn().mockResolvedValue([{ name: "orders", type: "table" }]);
+      const mockStore = remoteSearchStore({ listCompletionTables });
+      vi.mocked(useConnectionStore).mockReturnValue(mockStore as any);
+
+      const { filteredItems, setQuery } = useQuickOpen();
+      setQuery("ord");
+      await runDebouncedSearch();
+      expect(filteredItems.value.map((item) => item.label)).toContain("orders");
+
+      setQuery("o");
+
+      expect(filteredItems.value.map((item) => item.label)).toContain("orders");
+      expect(listCompletionTables).toHaveBeenCalledTimes(1);
+    });
+
     it("deduplicates loaded and remote table results", async () => {
       const mockStore = remoteSearchStore({
         treeNodes: [
@@ -1195,6 +1342,30 @@ describe("useQuickOpen", () => {
       await flushAsyncWork();
       expect(listCompletionTables).toHaveBeenCalledTimes(8);
       expect(filteredItems.value).toHaveLength(100);
+    });
+
+    it("limits remote database metadata search to the selected connection scope", async () => {
+      const mockStore = remoteSearchStore({
+        connections: [
+          { id: "conn1", name: "Alpha", db_type: "mysql", database: "app" },
+          { id: "conn2", name: "Beta", db_type: "mysql", database: "archive" },
+        ],
+        treeNodes: [
+          { id: "conn1:app", connectionId: "conn1", type: "database", database: "app", label: "app" },
+          { id: "conn2:archive", connectionId: "conn2", type: "database", database: "archive", label: "archive" },
+        ],
+        listCompletionTables: vi.fn().mockResolvedValue([]),
+      });
+      vi.mocked(useConnectionStore).mockReturnValue(mockStore as any);
+
+      const { selectedCategory, databaseScope, setQuery } = useQuickOpen();
+      selectedCategory.value = "database";
+      databaseScope.value = "connection:conn2";
+      setQuery("orders");
+      await runDebouncedSearch();
+
+      expect(mockStore.listCompletionTables).toHaveBeenCalledTimes(1);
+      expect(mockStore.listCompletionTables).toHaveBeenCalledWith("conn2", "archive", "orders", 25, undefined, true, undefined, undefined, { activateConnection: false });
     });
   });
 });
