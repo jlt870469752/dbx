@@ -32,6 +32,7 @@ export type ShortcutActionId =
   | "closeTab"
   | "closeOtherTabs"
   | "focusSearch"
+  | "focusTableWhere"
   | "quickOpen"
   | "switchToPreviousTab"
   | "switchToNextTab"
@@ -104,7 +105,7 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     id: "formatSql",
     labelKey: "settings.shortcutFormatSql",
     scope: "editor",
-    defaultShortcut: "Shift+Mod+F",
+    defaultShortcut: "Mod+Alt+L",
   },
   {
     id: "expandSelectStar",
@@ -272,6 +273,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     id: "focusSearch",
     labelKey: "settings.shortcutFocusSearch",
     scope: "global",
+    defaultShortcut: "Shift+Mod+F",
+  },
+  {
+    id: "focusTableWhere",
+    labelKey: "settings.shortcutFocusTableWhere",
+    scope: "grid",
     defaultShortcut: "Mod+F",
   },
   {
@@ -368,7 +375,7 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     id: "find",
     labelKey: "settings.shortcutFind",
     scope: "editor",
-    defaultShortcut: "Mod+F",
+    defaultShortcut: "Shift+Mod+F",
   },
   {
     id: "replace",
@@ -469,6 +476,14 @@ export function normalizeShortcutSettings(settings?: Partial<ShortcutSettings>):
       // Meta+W was the old macOS-only default. Treat that exact value as a
       // legacy default so existing Windows/Linux settings adopt Ctrl+W.
       if (definition.id === "closeTab" && configured === LEGACY_CLOSE_TAB_DEFAULT) {
+        configured = definition.defaultShortcut;
+      }
+      // Migrate the previous defaults after splitting table WHERE focus from
+      // current-view search and moving SQL formatting off the new search key.
+      if ((definition.id === "focusSearch" || definition.id === "find") && configured === "Mod+F") {
+        configured = definition.defaultShortcut;
+      }
+      if (definition.id === "formatSql" && configured === "Shift+Mod+F") {
         configured = definition.defaultShortcut;
       }
       const normalized = definition.inputKind === "modifier-only" ? normalizeModifierOnlyShortcut(configured, definition.defaultShortcut) : configured;

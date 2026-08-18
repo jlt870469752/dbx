@@ -26,6 +26,7 @@ import { useExportTracker } from "@/composables/useExportTracker";
 import { useFileDrop } from "@/composables/useFileDrop";
 import { usePanelResize } from "@/composables/usePanelResize";
 import { useDatabaseOptions } from "@/composables/useDatabaseOptions";
+import type { QuickOpenActionId, QuickOpenItem } from "@/composables/useQuickOpen";
 import { useSqlExecution } from "@/composables/useSqlExecution";
 import MultiDbExecuteDialog from "@/components/editor/MultiDbExecuteDialog.vue";
 import { useDialogSources } from "@/composables/useDialogSources";
@@ -71,6 +72,7 @@ import {
   isExecuteSqlInNewResultTabShortcut,
   isExecuteSqlShortcut,
   isFocusSearchShortcut,
+  isFocusTableWhereShortcut,
   isModRShortcut,
   isNewQueryShortcut,
   isObjectSourceSaveShortcutTarget,
@@ -2015,9 +2017,75 @@ function onAiOpenExplainPlan(sql: string) {
   });
 }
 
-async function handleQuickOpenSelect(item: any) {
+async function handleQuickOpenAction(actionId: QuickOpenActionId): Promise<void> {
+  switch (actionId) {
+    case "new-query":
+      await newQuery();
+      return;
+    case "open-settings":
+      openSettings();
+      return;
+    case "open-shortcuts":
+      openSettings("shortcuts");
+      return;
+    case "open-driver-store":
+      openDriverStorePage();
+      return;
+    case "open-history":
+      toggleRightSidebarPanel("history");
+      return;
+    case "open-sql-library":
+      openRightSidebarPanel("sqlLibrary");
+      return;
+    case "open-sql-files":
+      openRightSidebarPanel("sqlFile");
+      return;
+    case "toggle-sidebar":
+      setSidebarOpen(!sidebarOpen.value);
+      return;
+    case "open-data-transfer":
+      dialogs.showTransferDialog.value = true;
+      return;
+    case "refresh-current":
+      contentAreaRef.value?.refreshData();
+      return;
+    case "execute-sql":
+      if (activeTab.value?.mode === "query") requestActiveEditorExecute();
+      return;
+    case "format-sql":
+      formatActiveSql();
+      return;
+    case "save-sql":
+      if (activeTab.value?.mode === "query") await openSaveSqlDialog();
+      return;
+    case "close-tab":
+      if (!queryStore.activeTabId) return;
+      if (await queryStore.clearQueryResults(queryStore.activeTabId)) return;
+      queryStore.closeTab(queryStore.activeTabId);
+      return;
+    case "focus-table-where":
+      contentAreaRef.value?.focusTableWhere();
+      return;
+    case "toggle-transpose":
+      contentAreaRef.value?.toggleDataGridTranspose();
+      return;
+    case "show-ddl":
+      contentAreaRef.value?.showDataGridDdl();
+      return;
+    case "toggle-ai":
+      toggleRightSidebarPanel("ai");
+      return;
+  }
+}
+
+async function handleQuickOpenSelect(item: QuickOpenItem) {
   const connectionStore = useConnectionStore();
   const queryStore = useQueryStore();
+
+  if (item.type === "action") {
+    if (item.actionId) await handleQuickOpenAction(item.actionId);
+    return;
+  }
 
   // Handle SQL file types first — they don't require a database connection
   if (item.type === "sql_file" && item.filePath) {
@@ -2083,6 +2151,7 @@ async function handleQuickOpenSelect(item: any) {
     }
     return;
   } else if (item.type === "database") {
+    if (!item.database) return;
     // Expand connection node first
     // Tree node ID for connection is just the connectionId
     const connNode = findTreeNodeById(connectionStore.treeNodes, item.connectionId);
@@ -2126,18 +2195,21 @@ async function handleQuickOpenSelect(item: any) {
     }
     return;
   } else if (item.type === "schema") {
+    if (!item.database || !item.schema) return;
     const dbNode = findTreeNodeById(connectionStore.treeNodes, `${item.connectionId}:${item.database}`);
     if (dbNode && !dbNode.isExpanded) await connectionStore.loadSchemas(item.connectionId, item.database);
     const schemaNode = findTreeNodeById(connectionStore.treeNodes, `${item.connectionId}:${item.database}:${item.schema}`);
     if (schemaNode && !schemaNode.isExpanded) await connectionStore.loadTables(item.connectionId, item.database, item.schema);
     return;
   } else if (item.type === "table" || item.type === "view" || item.type === "materialized_view") {
+    const tableName = item.objectName || item.tableName;
+    if (!item.database || !tableName) return;
     // Open the table/view in a data tab
     await openTableTarget({
       connectionId: item.connectionId,
       database: item.database,
       schema: item.schema,
-      tableName: item.objectName || item.tableName,
+      tableName,
       tableType: item.type === "view" ? "VIEW" : item.type === "materialized_view" ? "MATERIALIZED_VIEW" : "TABLE",
     });
   } else if (item.type === "procedure" || item.type === "function" || item.type === "trigger" || item.type === "sequence" || item.type === "package" || item.type === "package-body" || item.type === "type" || item.type === "type-body") {
@@ -2156,11 +2228,12 @@ async function handleQuickOpenSelect(item: any) {
     const objectType = objectTypeMap[item.type];
     if (!objectType) return;
 
+    const objectName = item.objectName || item.tableName;
+    if (!item.database || !objectName) return;
     const schema = item.schema || item.database;
     try {
       const databaseType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(item.connectionId));
       if (!databaseType) throw new Error("Connection type is unavailable.");
-      const objectName = item.objectName || item.tableName;
       const { editableSource, objectType: resolvedType } = await loadEditableObjectSourceForEditor(api.getObjectSource, buildEditableObjectSource, {
         connectionId: item.connectionId,
         database: item.database,
@@ -2247,6 +2320,14 @@ async function handleKeydown(e: KeyboardEvent) {
     e.preventDefault();
     e.stopPropagation();
     showQuickOpen.value = true;
+    return;
+  }
+  if (isFocusTableWhereShortcut(e, shortcuts)) {
+    const focused = contentAreaRef.value?.focusTableWhere() ?? false;
+    if (focused) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
     return;
   }
   if (isFocusSearchShortcut(e, shortcuts)) {

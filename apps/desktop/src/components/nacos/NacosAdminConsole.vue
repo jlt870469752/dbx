@@ -103,6 +103,7 @@ const connectionStore = useConnectionStore();
 const queryStore = useQueryStore();
 const { isDark, themePalette } = useTheme();
 const activeTab = ref<AdminTab>("configs");
+const rootRef = ref<HTMLElement | null>(null);
 const connectionInfo = ref<NacosConnectionInfo | null>(null);
 const connectionError = ref("");
 const infoLoading = ref(false);
@@ -247,6 +248,15 @@ const instancesRequestGuard = createNacosLatestRequestGuard();
 let instanceUpdateSequence = 0;
 let instanceOperationToken = 0;
 let serviceMutationSequence = 0;
+
+function focusSearch(): boolean {
+  const selector = activeTab.value === "services" ? "[data-nacos-service-query]" : "[data-nacos-config-query]";
+  const input = rootRef.value?.querySelector<HTMLInputElement>(selector);
+  if (!input) return false;
+  input.focus();
+  input.select();
+  return true;
+}
 
 const NACOS_SPLIT_SIZE_KEY = "dbx-nacos-admin-split-size";
 const savedNacosSplitSize = Number(safeLocalStorageGet(NACOS_SPLIT_SIZE_KEY));
@@ -2393,10 +2403,12 @@ onBeforeUnmount(() => {
   configEditorZoomCommitScheduler.dispose();
   destroyConfigEditor();
 });
+
+defineExpose({ focusSearch });
 </script>
 
 <template>
-  <div class="flex h-full min-h-0 flex-col bg-background">
+  <div ref="rootRef" class="flex h-full min-h-0 flex-col bg-background">
     <div class="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b px-3 py-2">
       <div class="flex min-w-0 items-center gap-2 text-sm">
         <Network class="h-4 w-4 text-sky-600" />
@@ -2453,7 +2465,7 @@ onBeforeUnmount(() => {
         <div class="flex h-full min-h-0 flex-col">
           <div class="grid shrink-0 grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_auto_auto] gap-2 border-b p-2">
             <div class="relative min-w-0">
-              <Input v-model="configDataId" class="h-8 min-w-0 pr-8" placeholder="dataId" @keyup.enter="loadConfigsWithRetry(1)" />
+              <Input v-model="configDataId" data-nacos-config-query class="h-8 min-w-0 pr-8" placeholder="dataId" @keyup.enter="loadConfigsWithRetry(1)" />
               <button
                 v-if="configDataId"
                 type="button"
@@ -2749,7 +2761,7 @@ onBeforeUnmount(() => {
         <div class="flex h-full min-h-0 flex-col">
           <div class="grid shrink-0 grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto_auto] gap-2 border-b p-2">
             <div class="relative min-w-0">
-              <Input v-model="serviceName" class="h-8 min-w-0 pr-8" :placeholder="t('nacos.service')" @keyup.enter="loadServicesWithRetry(1)" />
+              <Input v-model="serviceName" data-nacos-service-query class="h-8 min-w-0 pr-8" :placeholder="t('nacos.service')" @keyup.enter="loadServicesWithRetry(1)" />
               <button
                 v-if="serviceName"
                 type="button"

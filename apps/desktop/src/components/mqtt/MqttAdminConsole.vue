@@ -29,6 +29,7 @@ const error = ref<string | null>(null);
 const pollingTimer = ref<ReturnType<typeof setInterval> | null>(null);
 const displayEncoding = ref<PayloadEncoding>("plaintext");
 const topicSearch = ref("");
+const topicSearchInputRef = ref<HTMLInputElement | null>(null);
 const showSubscriptionDialog = ref(false);
 const savingSubscription = ref(false);
 const formTopic = ref("");
@@ -206,6 +207,14 @@ function togglePublishPanel() {
   safeLocalStorageSet(MQTT_PUBLISH_PANEL_COLLAPSED_STORAGE_KEY, String(publishPanelCollapsed.value));
 }
 
+function focusSearch(): boolean {
+  const input = topicSearchInputRef.value;
+  if (!input) return false;
+  input.focus();
+  input.select();
+  return true;
+}
+
 async function handleClearMessages() {
   try {
     await mqttClearMessages(props.connectionId);
@@ -254,6 +263,8 @@ onMounted(async () => {
 });
 
 onUnmounted(stopPolling);
+
+defineExpose({ focusSearch });
 </script>
 
 <template>
@@ -287,7 +298,7 @@ onUnmounted(stopPolling);
           </div>
         </div>
         <div class="border-b p-2">
-          <input v-model="topicSearch" class="h-8 w-full rounded border bg-transparent px-2 text-xs outline-none focus-visible:ring-1 focus-visible:ring-ring" :placeholder="t('connection.mqttSearchSubscriptionsPlaceholder')" />
+          <input ref="topicSearchInputRef" v-model="topicSearch" class="h-8 w-full rounded border bg-transparent px-2 text-xs outline-none focus-visible:ring-1 focus-visible:ring-ring" :placeholder="t('connection.mqttSearchSubscriptionsPlaceholder')" />
         </div>
         <div class="min-h-0 flex-1 overflow-auto">
           <div v-if="loading" class="p-3 text-xs text-muted-foreground">{{ t("common.loading") }}</div>

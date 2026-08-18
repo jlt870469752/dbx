@@ -80,6 +80,12 @@ const shortcutRows = computed<WelcomeShortcutRow[]>(() => [
     shortcuts: [{ id: normalizedShortcuts.value.executeSql, strokes: shortcutStrokeLabels(normalizedShortcuts.value.executeSql) }],
   },
   {
+    id: "focus-table-where",
+    title: t("welcome.shortcutFocusTableWhere"),
+    description: t("welcome.shortcutFocusTableWhereDescription"),
+    shortcuts: [{ id: normalizedShortcuts.value.focusTableWhere, strokes: shortcutStrokeLabels(normalizedShortcuts.value.focusTableWhere) }],
+  },
+  {
     id: "switch-tab",
     title: t("welcome.shortcutSwitchTab"),
     description: t("welcome.shortcutSwitchTabDescription"),

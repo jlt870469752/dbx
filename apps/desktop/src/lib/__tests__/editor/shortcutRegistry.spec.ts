@@ -50,14 +50,34 @@ describe("shortcutRegistry editor actions", () => {
     expect(findShortcutConflict("expandSelectStar", DEFAULT_SHORTCUT_SETTINGS.expandSelectStar, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
   });
 
-  it("keeps current-view search and editor find contextual on Mod+F", () => {
+  it("keeps current-view search and editor find contextual on Shift+Mod+F", () => {
     const focusSearch = SHORTCUT_DEFINITIONS.find((item) => item.id === "focusSearch");
     const find = SHORTCUT_DEFINITIONS.find((item) => item.id === "find");
 
-    expect(focusSearch).toMatchObject({ scope: "global", defaultShortcut: "Mod+F" });
-    expect(find).toMatchObject({ scope: "editor", defaultShortcut: "Mod+F" });
+    expect(focusSearch).toMatchObject({ scope: "global", defaultShortcut: "Shift+Mod+F" });
+    expect(find).toMatchObject({ scope: "editor", defaultShortcut: "Shift+Mod+F" });
     expect(findShortcutConflict("focusSearch", DEFAULT_SHORTCUT_SETTINGS.focusSearch, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
     expect(findShortcutConflict("find", DEFAULT_SHORTCUT_SETTINGS.find, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
+  it("uses Mod+F as a dedicated table WHERE shortcut", () => {
+    const focusTableWhere = SHORTCUT_DEFINITIONS.find((item) => item.id === "focusTableWhere");
+
+    expect(focusTableWhere).toMatchObject({ scope: "grid", defaultShortcut: "Mod+F" });
+    expect(DEFAULT_SHORTCUT_SETTINGS.focusTableWhere).toBe("Mod+F");
+    expect(findShortcutConflict("focusTableWhere", DEFAULT_SHORTCUT_SETTINGS.focusTableWhere, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
+  it("migrates the previous search, find, and format defaults", () => {
+    const shortcuts = normalizeShortcutSettings({
+      focusSearch: "Mod+F",
+      find: "Mod+F",
+      formatSql: "Shift+Mod+F",
+    });
+
+    expect(shortcuts.focusSearch).toBe("Shift+Mod+F");
+    expect(shortcuts.find).toBe("Shift+Mod+F");
+    expect(shortcuts.formatSql).toBe("Mod+Alt+L");
   });
 
   it("uses Shift+Enter for inserting a complete line below", () => {
@@ -112,7 +132,7 @@ describe("shortcutRegistry editor actions", () => {
     const shortcuts = normalizeShortcutSettings({ executeSql: "Mod+Shift+Enter" });
 
     expect(shortcuts.executeSql).toBe("Mod+Shift+Enter");
-    expect(shortcuts.formatSql).toBe("Shift+Mod+F");
+    expect(shortcuts.formatSql).toBe("Mod+Alt+L");
     expect(shortcuts.toggleLineComment).toBe("Mod+/");
     expect(shortcuts.indentMore).toBe("");
     expect(shortcuts.indentLess).toBe("Shift+Tab");
@@ -140,7 +160,7 @@ describe("shortcutRegistry editor actions", () => {
   });
 
   it("detects conflicts between formatter editor shortcuts and other editor shortcuts", () => {
-    const shortcuts = normalizeShortcutSettings({ duplicateLine: "Mod+F" });
+    const shortcuts = normalizeShortcutSettings({ duplicateLine: "Shift+Mod+F" });
 
     expect(findShortcutConflict("duplicateLine", shortcuts.duplicateLine, shortcuts)).toBe("find");
   });

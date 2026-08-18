@@ -151,6 +151,10 @@ export function isFocusSearchShortcut(event: ShortcutLikeEvent, shortcuts?: Part
   return matchesShortcut(event, actionShortcut("focusSearch", shortcuts));
 }
 
+export function isFocusTableWhereShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
+  return matchesShortcut(event, actionShortcut("focusTableWhere", shortcuts));
+}
+
 export function isRefreshDataShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
   return matchesShortcut(event, actionShortcut("refreshData", shortcuts));
 }

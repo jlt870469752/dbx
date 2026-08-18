@@ -7,6 +7,7 @@ import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import * as api from "@/lib/backend/api";
 import type { SqlFileEntry } from "@/lib/backend/api";
 import { getSqlFileFolderPaths, sqlFileFoldersVersion } from "@/lib/sqlFile/sqlFileFolders";
+import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import i18n from "@/i18n";
 
 const REMOTE_SEARCH_DEBOUNCE_MS = 180;
@@ -19,12 +20,13 @@ const REMOTE_METADATA_CACHE_MAX_ITEMS = 2000;
 const QUICK_OPEN_MAX_RESULTS = 200;
 const INITIAL_SQL_LIBRARY_LIMIT = 20;
 const INITIAL_SQL_FILE_LIMIT = 20;
+const QUICK_OPEN_ACTION_USAGE_STORAGE_KEY = "dbx-quick-open-action-usage";
 
 const REMOTE_SEARCH_UNSUPPORTED_TYPES = new Set<ConnectionConfig["db_type"]>(["redis", "mongodb", "elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "neo4j", "influxdb", "victoriametrics", "etcd", "zookeeper", "mq", "nacos", "consul"]);
 
 export interface QuickOpenItem {
   id: string;
-  type: "connection" | "database" | "schema" | "table" | "view" | "materialized_view" | "procedure" | "function" | "sequence" | "package" | "package-body" | "sql_file" | "sql_library_file";
+  type: "connection" | "database" | "schema" | "table" | "view" | "materialized_view" | "procedure" | "function" | "trigger" | "sequence" | "package" | "package-body" | "type" | "type-body" | "sql_file" | "sql_library_file" | "action";
   label: string;
   description?: string;
   connectionId: string;
@@ -34,12 +36,36 @@ export interface QuickOpenItem {
   tableName?: string; // Kept for backward compatibility
   connectionName?: string;
   searchText: string; // Lowercase text for searching
+  searchKeywords?: string[]; // Search aliases kept separate to avoid cross-keyword fuzzy matches
   filePath?: string; // For external SQL files
   sqlFileId?: string; // For saved SQL library files
+  actionId?: QuickOpenActionId;
+  signature?: string;
+  usageCount?: number;
+  lastUsedAt?: number;
 }
 
-export type QuickOpenCategory = "all" | "database" | "file" | "code" | "action" | "text";
+export type QuickOpenCategory = "all" | "database" | "file" | "code" | "action";
 export type QuickOpenDatabaseScope = "context" | "connected" | "all" | `connection:${string}`;
+export type QuickOpenActionId =
+  | "new-query"
+  | "open-settings"
+  | "open-shortcuts"
+  | "open-driver-store"
+  | "open-history"
+  | "open-sql-library"
+  | "open-sql-files"
+  | "toggle-sidebar"
+  | "open-data-transfer"
+  | "refresh-current"
+  | "execute-sql"
+  | "format-sql"
+  | "save-sql"
+  | "close-tab"
+  | "focus-table-where"
+  | "toggle-transpose"
+  | "show-ddl"
+  | "toggle-ai";
 
 export interface QuickOpenConnectionOption {
   id: string;
@@ -61,9 +87,55 @@ interface IdentifierWord {
 }
 
 const IDENTIFIER_SEPARATOR_RE = /[_\-. /\\]/;
-const DATABASE_ITEM_TYPES = new Set<QuickOpenItem["type"]>(["connection", "database", "schema", "table", "view", "materialized_view", "procedure", "function", "sequence", "package", "package-body"]);
+const DATABASE_ITEM_TYPES = new Set<QuickOpenItem["type"]>(["connection", "database", "schema", "table", "view", "materialized_view", "procedure", "function", "trigger", "sequence", "package", "package-body", "type", "type-body"]);
 const FILE_ITEM_TYPES = new Set<QuickOpenItem["type"]>(["sql_file"]);
 const CODE_ITEM_TYPES = new Set<QuickOpenItem["type"]>(["sql_library_file"]);
+const ACTION_ITEM_TYPES = new Set<QuickOpenItem["type"]>(["action"]);
+
+const ACTION_DEFINITIONS: Array<{ id: QuickOpenActionId; command: string; labelKey: string; keywords: string[] }> = [
+  { id: "new-query", command: "/new-query", labelKey: "quickOpen.actions.newQuery", keywords: ["新建查询", "新建", "sql 查询", "query", "new query", "console", "editor"] },
+  { id: "open-settings", command: "/settings", labelKey: "quickOpen.actions.openSettings", keywords: ["打开设置", "设置", "settings", "preferences", "configuration"] },
+  { id: "open-shortcuts", command: "/shortcuts", labelKey: "quickOpen.actions.openShortcuts", keywords: ["快捷键设置", "快捷键", "键盘", "键位", "shortcut", "shortcuts", "keymap", "keyboard", "hotkey"] },
+  { id: "open-driver-store", command: "/drivers", labelKey: "quickOpen.actions.openDriverStore", keywords: ["驱动管理", "驱动", "driver manager", "driver", "jdbc", "agent"] },
+  { id: "open-history", command: "/history", labelKey: "quickOpen.actions.openHistory", keywords: ["查询历史", "历史", "query history", "sql history", "history"] },
+  { id: "open-sql-library", command: "/sql-library", labelKey: "quickOpen.actions.openSqlLibrary", keywords: ["sql 库", "sql库", "代码库", "sql library", "library", "saved sql", "snippets"] },
+  { id: "open-sql-files", command: "/sql-files", labelKey: "quickOpen.actions.openSqlFiles", keywords: ["sql 文件", "sql文件", "文件夹", "sql files", "external files", "folder"] },
+  { id: "toggle-sidebar", command: "/sidebar", labelKey: "quickOpen.actions.toggleSidebar", keywords: ["显示侧边栏", "隐藏侧边栏", "侧边栏", "切换", "sidebar", "toggle sidebar", "navigator"] },
+  { id: "open-data-transfer", command: "/transfer", labelKey: "quickOpen.actions.openDataTransfer", keywords: ["数据传输", "导入", "导出", "迁移", "data transfer", "import", "export", "migration"] },
+  { id: "refresh-current", command: "/refresh", labelKey: "quickOpen.actions.refreshCurrent", keywords: ["刷新当前页面", "刷新", "当前页面", "重新加载", "refresh", "reload", "current view"] },
+  { id: "execute-sql", command: "/execute", labelKey: "quickOpen.actions.executeSql", keywords: ["执行 sql", "运行 sql", "执行查询", "execute sql", "run sql", "run query"] },
+  { id: "format-sql", command: "/format", labelKey: "quickOpen.actions.formatSql", keywords: ["格式化 sql", "美化 sql", "format sql", "reformat sql", "beautify sql"] },
+  { id: "save-sql", command: "/save-sql", labelKey: "quickOpen.actions.saveSql", keywords: ["保存 sql", "保存查询", "save sql", "save query"] },
+  { id: "close-tab", command: "/close-tab", labelKey: "quickOpen.actions.closeTab", keywords: ["关闭标签页", "关闭当前页", "close tab", "close current tab"] },
+  { id: "focus-table-where", command: "/focus-where", labelKey: "quickOpen.actions.focusTableWhere", keywords: ["聚焦 where", "where 查询", "筛选条件", "focus where", "where query", "table filter"] },
+  { id: "toggle-transpose", command: "/transpose", labelKey: "quickOpen.actions.toggleTranspose", keywords: ["转置表格", "切换转置", "transpose", "transpose grid", "vertical record"] },
+  { id: "show-ddl", command: "/show-ddl", labelKey: "quickOpen.actions.showDdl", keywords: ["查看 ddl", "表结构", "建表语句", "show ddl", "table ddl", "create table"] },
+  { id: "toggle-ai", command: "/ai", labelKey: "quickOpen.actions.toggleAi", keywords: ["打开 ai", "关闭 ai", "ai 助手", "toggle ai", "ai assistant"] },
+];
+const ACTION_DEFINITION_ORDER = new Map(ACTION_DEFINITIONS.map((action, index) => [action.id, index]));
+
+interface QuickOpenActionUsage {
+  count: number;
+  lastUsedAt: number;
+}
+
+function loadActionUsage(): Partial<Record<QuickOpenActionId, QuickOpenActionUsage>> {
+  try {
+    const parsed = JSON.parse(safeLocalStorageGet(QUICK_OPEN_ACTION_USAGE_STORAGE_KEY) || "{}") as Record<string, unknown>;
+    const usage: Partial<Record<QuickOpenActionId, QuickOpenActionUsage>> = {};
+    for (const action of ACTION_DEFINITIONS) {
+      const value = parsed[action.id];
+      if (!value || typeof value !== "object") continue;
+      const count = Number((value as Record<string, unknown>).count);
+      const lastUsedAt = Number((value as Record<string, unknown>).lastUsedAt);
+      if (!Number.isFinite(count) || count < 0 || !Number.isFinite(lastUsedAt) || lastUsedAt < 0) continue;
+      usage[action.id] = { count: Math.floor(count), lastUsedAt };
+    }
+    return usage;
+  } catch {
+    return {};
+  }
+}
 
 function identifierWords(text: string): IdentifierWord[] {
   const words: IdentifierWord[] = [];
@@ -222,6 +294,7 @@ export function useQuickOpen() {
   const remoteItems = ref<QuickOpenItem[]>([]);
   const cachedRemoteItems = ref<QuickOpenItem[]>([]);
   const sqlFileItems = ref<QuickOpenItem[]>([]);
+  const actionUsage = ref(loadActionUsage());
   let remoteSearchGeneration = 0;
   let remoteSearchTimer: ReturnType<typeof setTimeout> | undefined;
   let activeRemoteRequests = 0;
@@ -253,8 +326,7 @@ export function useQuickOpen() {
     if (selectedCategory.value === "database") return DATABASE_ITEM_TYPES.has(item.type);
     if (selectedCategory.value === "file") return FILE_ITEM_TYPES.has(item.type);
     if (selectedCategory.value === "code") return CODE_ITEM_TYPES.has(item.type);
-    // Code, action, and text are reserved filters for the Search Everywhere shell.
-    return false;
+    return ACTION_ITEM_TYPES.has(item.type);
   }
 
   function itemMatchesDatabaseScope(item: QuickOpenItem): boolean {
@@ -296,6 +368,43 @@ export function useQuickOpen() {
       })
       .slice(0, INITIAL_SQL_LIBRARY_LIMIT);
   });
+
+  const actionItems = computed<QuickOpenItem[]>(() =>
+    ACTION_DEFINITIONS.map((action) => {
+      const actionLabel = i18n.global.t(action.labelKey);
+      const usage = actionUsage.value[action.id];
+      return {
+        id: `action-${action.id}`,
+        type: "action" as const,
+        actionId: action.id,
+        label: action.command,
+        description: actionLabel,
+        connectionId: "",
+        searchText: action.command,
+        searchKeywords: [actionLabel, ...action.keywords],
+        usageCount: usage?.count ?? 0,
+        lastUsedAt: usage?.lastUsedAt ?? 0,
+      };
+    }).sort((left, right) => {
+      const countDifference = (right.usageCount ?? 0) - (left.usageCount ?? 0);
+      if (countDifference !== 0) return countDifference;
+      const recencyDifference = (right.lastUsedAt ?? 0) - (left.lastUsedAt ?? 0);
+      if (recencyDifference !== 0) return recencyDifference;
+      return (ACTION_DEFINITION_ORDER.get(left.actionId!) ?? 0) - (ACTION_DEFINITION_ORDER.get(right.actionId!) ?? 0);
+    }),
+  );
+
+  function recordActionUsage(actionId: QuickOpenActionId): void {
+    const previous = actionUsage.value[actionId];
+    actionUsage.value = {
+      ...actionUsage.value,
+      [actionId]: {
+        count: (previous?.count ?? 0) + 1,
+        lastUsedAt: Date.now(),
+      },
+    };
+    safeLocalStorageSet(QUICK_OPEN_ACTION_USAGE_STORAGE_KEY, JSON.stringify(actionUsage.value));
+  }
 
   async function loadExternalSqlFiles(): Promise<void> {
     if (sqlFilesLoaded || sqlFilesLoadingPromise) return sqlFilesLoadingPromise ?? undefined;
@@ -808,7 +917,7 @@ export function useQuickOpen() {
   const filteredItems = computed((): MatchedItem[] => {
     if (!searchQuery.value.trim()) {
       // Show all tree items plus a limited set of recent SQL library files and external SQL files
-      return [...allItems.value, ...sqlLibraryRecentItems.value, ...sqlFileRecentItems.value].filter(itemMatchesActiveFilters).map((item) => ({
+      return [...allItems.value, ...sqlLibraryRecentItems.value, ...sqlFileRecentItems.value, ...actionItems.value].filter(itemMatchesActiveFilters).map((item) => ({
         ...item,
         matchScore: Infinity,
         matchIndices: [],
@@ -819,18 +928,33 @@ export function useQuickOpen() {
 
     const seen = new Set<string>();
     // When searching, include ALL SQL library files and external SQL files
-    for (const item of [...allItems.value, ...sqlLibraryAllItems.value, ...sqlFileItems.value, ...cachedRemoteItems.value, ...remoteItems.value]) {
+    for (const item of [...allItems.value, ...sqlLibraryAllItems.value, ...sqlFileItems.value, ...actionItems.value, ...cachedRemoteItems.value, ...remoteItems.value]) {
       if (!itemMatchesActiveFilters(item)) continue;
       const key = quickOpenItemKey(item);
       if (seen.has(key)) continue;
       seen.add(key);
-      const labelMatch = matchQuickOpenText(searchQuery.value, item.label);
-      const metadataMatch = labelMatch ? null : matchQuickOpenText(searchQuery.value, item.searchText);
-      const result = labelMatch ?? metadataMatch;
+      const rawLabelMatch = matchQuickOpenText(searchQuery.value, item.label);
+      const labelMatch = item.type === "action" && rawLabelMatch?.kind === "fuzzy" ? null : rawLabelMatch;
+      const keywordMatches =
+        item.type === "action" ? (item.searchKeywords ?? []).map((keyword) => matchQuickOpenText(searchQuery.value, keyword)).filter((match): match is QuickOpenMatch => !!match && match.kind !== "fuzzy" && (match.kind !== "substring" || searchQuery.value.trim().length >= 3)) : [];
+      const keywordMatch = keywordMatches.sort((left, right) => left.score - right.score)[0] ?? null;
+      const metadataMatch = labelMatch || keywordMatch || item.type === "action" ? null : matchQuickOpenText(searchQuery.value, item.searchText);
+      const result = labelMatch ?? keywordMatch ?? metadataMatch;
       if (result) {
+        const actionMatchScore =
+          item.type === "action"
+            ? {
+                exact: 1,
+                initials: 100,
+                prefix: 200,
+                "word-prefix": 300,
+                substring: 400,
+                fuzzy: 500,
+              }[result.kind]
+            : result.score;
         matched.push({
           ...item,
-          matchScore: result.score + (labelMatch ? 0 : 1000),
+          matchScore: actionMatchScore + (labelMatch ? 0 : 1000),
           matchIndices: labelMatch ? result.indices : [],
         });
       }
@@ -843,22 +967,32 @@ export function useQuickOpen() {
       }
 
       const typeOrder = {
-        connection: 0,
-        database: 1,
-        schema: 2,
-        table: 3,
-        view: 4,
-        materialized_view: 5,
-        procedure: 6,
-        function: 7,
-        sequence: 8,
-        package: 9,
-        "package-body": 10,
-        sql_library_file: 11,
-        sql_file: 12,
+        action: 0,
+        connection: 1,
+        database: 2,
+        schema: 3,
+        table: 4,
+        view: 5,
+        materialized_view: 6,
+        procedure: 7,
+        function: 8,
+        trigger: 9,
+        sequence: 10,
+        package: 11,
+        "package-body": 12,
+        type: 13,
+        "type-body": 14,
+        sql_library_file: 15,
+        sql_file: 16,
       };
       const typeDifference = typeOrder[a.type] - typeOrder[b.type];
       if (typeDifference !== 0) return typeDifference;
+      if (a.type === "action" && b.type === "action") {
+        const countDifference = (b.usageCount ?? 0) - (a.usageCount ?? 0);
+        if (countDifference !== 0) return countDifference;
+        const recencyDifference = (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0);
+        if (recencyDifference !== 0) return recencyDifference;
+      }
       const lengthDifference = a.label.length - b.label.length;
       if (lengthDifference !== 0) return lengthDifference;
       return a.label.localeCompare(b.label);
@@ -908,5 +1042,6 @@ export function useQuickOpen() {
     resetSelection,
     setQuery,
     loadExternalSqlFiles,
+    recordActionUsage,
   };
 }

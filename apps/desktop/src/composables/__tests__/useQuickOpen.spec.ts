@@ -188,8 +188,8 @@ describe("useQuickOpen", () => {
 
       setQuery("");
 
-      // Empty query should return all items (2 connections + 0 SQL library files)
-      expect(filteredItems.value.length).toBe(2);
+      // Empty "All" search includes connections and the local action palette.
+      expect(filteredItems.value.length).toBe(20);
       filteredItems.value.forEach((item) => {
         expect(item.matchScore).toBe(Infinity);
       });
@@ -271,6 +271,130 @@ describe("useQuickOpen", () => {
 
       expect(filteredItems.value.map((item) => item.type)).toEqual(["database"]);
       expect(filteredItems.value[0]?.label).toBe("UserDB");
+    });
+
+    it("shows local application commands in Action and All without leaking into other categories", () => {
+      vi.mocked(useConnectionStore).mockReturnValue({
+        connections: [{ id: "conn1", name: "ProdConnection", db_type: "mysql" }],
+        treeNodes: [],
+      } as any);
+
+      const { filteredItems, selectedCategory, setQuery } = useQuickOpen();
+      selectedCategory.value = "action";
+      setQuery("");
+
+      expect(filteredItems.value).toHaveLength(18);
+      expect(filteredItems.value.every((item) => item.type === "action")).toBe(true);
+      expect(filteredItems.value.map((item) => item.label)).toEqual([
+        "/new-query",
+        "/settings",
+        "/shortcuts",
+        "/drivers",
+        "/history",
+        "/sql-library",
+        "/sql-files",
+        "/sidebar",
+        "/transfer",
+        "/refresh",
+        "/execute",
+        "/format",
+        "/save-sql",
+        "/close-tab",
+        "/focus-where",
+        "/transpose",
+        "/show-ddl",
+        "/ai",
+      ]);
+      expect(filteredItems.value.map((item) => item.actionId)).toEqual([
+        "new-query",
+        "open-settings",
+        "open-shortcuts",
+        "open-driver-store",
+        "open-history",
+        "open-sql-library",
+        "open-sql-files",
+        "toggle-sidebar",
+        "open-data-transfer",
+        "refresh-current",
+        "execute-sql",
+        "format-sql",
+        "save-sql",
+        "close-tab",
+        "focus-table-where",
+        "toggle-transpose",
+        "show-ddl",
+        "toggle-ai",
+      ]);
+
+      selectedCategory.value = "all";
+      expect(filteredItems.value.some((item) => item.type === "action")).toBe(true);
+
+      selectedCategory.value = "database";
+      expect(filteredItems.value.some((item) => item.type === "action")).toBe(false);
+    });
+
+    it("finds actions through Chinese and English aliases", () => {
+      vi.mocked(useConnectionStore).mockReturnValue({ connections: [], treeNodes: [] } as any);
+
+      const { filteredItems, selectedCategory, setQuery } = useQuickOpen();
+      selectedCategory.value = "action";
+
+      setQuery("keymap");
+      expect(filteredItems.value.map((item) => item.actionId)).toEqual(["open-shortcuts"]);
+
+      setQuery("数据传输");
+      expect(filteredItems.value.map((item) => item.actionId)).toEqual(["open-data-transfer"]);
+
+      setQuery("refresh");
+      expect(filteredItems.value.map((item) => item.actionId)).toEqual(["refresh-current"]);
+
+      setQuery("/");
+      expect(filteredItems.value).toHaveLength(18);
+      expect(filteredItems.value.every((item) => item.label.startsWith("/"))).toBe(true);
+
+      setQuery("/short");
+      expect(filteredItems.value.map((item) => item.actionId)).toEqual(["open-shortcuts"]);
+
+      setQuery("格式化 sql");
+      expect(filteredItems.value.map((item) => item.actionId)).toEqual(["format-sql"]);
+
+      setQuery("table ddl");
+      expect(filteredItems.value.map((item) => item.actionId)).toEqual(["show-ddl"]);
+    });
+
+    it("sorts actions by usage count and recency, then restores the order from local storage", () => {
+      const storage = new Map<string, string>();
+      vi.stubGlobal("localStorage", {
+        getItem: (key: string) => storage.get(key) ?? null,
+        setItem: (key: string, value: string) => storage.set(key, value),
+        removeItem: (key: string) => storage.delete(key),
+      });
+      vi.mocked(useConnectionStore).mockReturnValue({ connections: [], treeNodes: [] } as any);
+      const now = vi.spyOn(Date, "now").mockReturnValue(100);
+
+      try {
+        const first = useQuickOpen();
+        first.selectedCategory.value = "action";
+        first.recordActionUsage("open-history");
+        now.mockReturnValue(200);
+        first.recordActionUsage("refresh-current");
+
+        expect(first.filteredItems.value.slice(0, 2).map((item) => item.actionId)).toEqual(["refresh-current", "open-history"]);
+
+        now.mockReturnValue(300);
+        first.recordActionUsage("open-history");
+        expect(first.filteredItems.value[0]?.actionId).toBe("open-history");
+
+        const persisted = JSON.parse(storage.get("dbx-quick-open-action-usage") || "{}");
+        expect(persisted["open-history"]).toMatchObject({ count: 2, lastUsedAt: 300 });
+
+        const restored = useQuickOpen();
+        restored.selectedCategory.value = "action";
+        expect(restored.filteredItems.value[0]?.actionId).toBe("open-history");
+      } finally {
+        now.mockRestore();
+        vi.unstubAllGlobals();
+      }
     });
 
     it("filters database results to connected data sources", () => {
@@ -660,8 +784,9 @@ describe("useQuickOpen", () => {
       };
       vi.mocked(useConnectionStore).mockReturnValue(mockStore as any);
 
-      const { selectNext, selectedIndex, setQuery } = useQuickOpen();
+      const { selectNext, selectedIndex, selectedCategory, setQuery } = useQuickOpen();
 
+      selectedCategory.value = "database";
       setQuery("");
 
       expect(selectedIndex.value).toBe(0);
@@ -676,8 +801,9 @@ describe("useQuickOpen", () => {
       };
       vi.mocked(useConnectionStore).mockReturnValue(mockStore as any);
 
-      const { selectNext, selectedIndex, setQuery } = useQuickOpen();
+      const { selectNext, selectedIndex, selectedCategory, setQuery } = useQuickOpen();
 
+      selectedCategory.value = "database";
       setQuery("");
 
       selectNext();
@@ -952,8 +1078,8 @@ describe("useQuickOpen", () => {
       const { filteredItems, setQuery } = useQuickOpen();
       setQuery("");
 
-      // Should show 1 connection + 20 recent SQL library files = 21
-      expect(filteredItems.value.length).toBe(21);
+      // All also includes the 18 local application actions.
+      expect(filteredItems.value.length).toBe(39);
       const sqlItems = filteredItems.value.filter((item) => item.type === "sql_library_file");
       expect(sqlItems.length).toBe(20);
     });
@@ -1341,7 +1467,13 @@ describe("useQuickOpen", () => {
 
       await flushAsyncWork();
       expect(listCompletionTables).toHaveBeenCalledTimes(8);
-      expect(filteredItems.value).toHaveLength(100);
+      expect(filteredItems.value.filter((item) => item.type === "table")).toHaveLength(100);
+      expect(
+        filteredItems.value
+          .filter((item) => item.type === "action")
+          .map((item) => item.actionId)
+          .sort(),
+      ).toEqual(["focus-table-where", "show-ddl"]);
     });
 
     it("limits remote database metadata search to the selected connection scope", async () => {

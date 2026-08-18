@@ -148,7 +148,7 @@ import { applyColumnFormatter, buildColumnFormatterKey, getSupportedTimeZoneOpti
 import { temporalCellEditorConfig, type TemporalCellEditorConfig } from "@/lib/dataGrid/dataGridTemporalEditor";
 import { BOOLEAN_CELL_EDITOR_VALUES, booleanCellEditorValue, isBooleanCellValue, isBooleanColumnType, isPointInBooleanCheckbox, nextBooleanCellValue, normalizeBooleanCellValue, parseBooleanCellEditorValue } from "@/lib/dataGrid/dataGridBooleanColumn";
 import { resolveDataGridColumnNullability, resolveDataGridColumnsByResultIndex } from "@/lib/dataGrid/dataGridColumnMetadata";
-import { isCancelSearchShortcut, isCopyCurrentRowShortcut, isDeleteCurrentRowShortcut, isFocusSearchShortcut, isModRShortcut, isSaveShortcut, isToggleTransposeShortcut } from "@/lib/editor/keyboardShortcuts";
+import { isCancelSearchShortcut, isCopyCurrentRowShortcut, isDeleteCurrentRowShortcut, isFocusSearchShortcut, isFocusTableWhereShortcut, isModRShortcut, isSaveShortcut, isToggleTransposeShortcut } from "@/lib/editor/keyboardShortcuts";
 import { dataGridHeaderContentWidth, scrollbarGutterWidth } from "@/lib/dataGrid/dataGridScrollGutter";
 import { canFetchNextDataGridSegment, canGoNextDataGridPage, dataGridTotalRowCountLabelKey, dataGridTruncationHintKey, hasCompleteLocalDataGridResult, resolveDataGridPaginationTotal, type DataGridInexactTotalRowCountMode } from "@/lib/dataGrid/dataGridPagination";
 import { dataGridCountQueryOptions } from "@/lib/dataGrid/dataGridQueryOptions";
@@ -736,6 +736,7 @@ const transposeScrollLeft = ref(0);
 const transposeViewportWidth = ref(0);
 const { sortColumn: sortCol, sortColumnIndex: sortColIndex, sortDirection: sortDir, sortMode, setSort, clearSort } = useDataGridSort();
 const searchBarRef = ref<{ focus: (select?: boolean) => void } | null>(null);
+const queryControlsRef = ref<InstanceType<typeof DataGridQueryControls>>();
 const dataGridSearch = useDataGridSearch({
   columns: () => props.result.columns,
   suggestionColumns: () => props.tableMeta?.columns.map((column) => column.name) ?? props.result.columns,
@@ -1709,6 +1710,10 @@ function focusSearch(): boolean {
     searchBarRef.value?.focus(true);
   });
   return true;
+}
+
+function focusWhere(): boolean {
+  return queryControlsRef.value?.focusWhere() ?? false;
 }
 
 function closeSearch() {
@@ -7562,8 +7567,15 @@ function openCellDetailSearch(): boolean {
 async function onGridKeydown(event: KeyboardEvent) {
   if (event.defaultPrevented) return;
 
-  if (isFocusSearchShortcut(event)) {
+  if (isFocusTableWhereShortcut(event, settingsStore.editorSettings.shortcuts)) {
     event.preventDefault();
+    event.stopPropagation();
+    focusWhere();
+    return;
+  }
+  if (isFocusSearchShortcut(event, settingsStore.editorSettings.shortcuts)) {
+    event.preventDefault();
+    event.stopPropagation();
     focusSearch();
     return;
   }
@@ -8935,6 +8947,13 @@ async function toggleTableInfo(tab?: TableInfoTab) {
   await selectTableInfoTab(nextTab);
 }
 
+async function openDdl(): Promise<boolean> {
+  if (!props.tableMeta || !props.connectionId) return false;
+  showTableInfo.value = true;
+  await selectTableInfoTab("ddl");
+  return activeTableInfoTab.value === "ddl";
+}
+
 async function selectTableInfoTab(tab: TableInfoTab) {
   const tabSupported = tableInfoTabs.value.some((item) => item.id === tab);
   const nextTab = tabSupported ? tab : tableInfoTabs.value[0]?.id;
@@ -9621,7 +9640,10 @@ defineExpose({
   multiRowTranspose,
   setMultiRowTranspose,
   toggleMultiRowTranspose,
+  toggleKeyboardTranspose,
   focusSearch,
+  focusWhere,
+  openDdl,
   visibleColumnCount,
   displayableColumnCount,
   hiddenColumnCount,
@@ -10015,6 +10037,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
               </template>
               <template v-if="canShowWhereSearch">
                 <DataGridQueryControls
+                  ref="queryControlsRef"
                   v-model:where-input="whereFilterInput"
                   v-model:order-by-input="orderByInput"
                   v-model:filter-builder-open="filterBuilderOpen"

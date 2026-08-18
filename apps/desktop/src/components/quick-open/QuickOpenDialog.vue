@@ -18,16 +18,16 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
-const { searchQuery, selectedCategory, databaseScope, connectionOptions, filteredItems, selectedIndex, selectedItem, selectNext, selectPrevious, setQuery, loadExternalSqlFiles } = useQuickOpen();
+const { searchQuery, selectedCategory, databaseScope, connectionOptions, filteredItems, selectedIndex, selectedItem, selectNext, selectPrevious, resetSelection, loadExternalSqlFiles, recordActionUsage } = useQuickOpen();
 const inputRef = ref<HTMLInputElement | null>(null);
+const resultsListRef = ref<HTMLElement | null>(null);
 
 const categories: Array<{ id: QuickOpenCategory; labelKey: string }> = [
   { id: "all", labelKey: "quickOpen.categoryAll" },
   { id: "database", labelKey: "quickOpen.categoryDatabase" },
+  { id: "action", labelKey: "quickOpen.categoryAction" },
   { id: "file", labelKey: "quickOpen.categoryFile" },
   { id: "code", labelKey: "quickOpen.categoryCode" },
-  { id: "action", labelKey: "quickOpen.categoryAction" },
-  { id: "text", labelKey: "quickOpen.categoryText" },
 ];
 
 const dialogOpen = computed({
@@ -59,13 +59,21 @@ function handleDatabaseScopeCloseAutoFocus(e: Event): void {
   focusSearchInput();
 }
 
+function scrollSelectedItemIntoView(): void {
+  nextTick(() => {
+    resultsListRef.value?.querySelector<HTMLElement>(`[data-quick-open-index="${selectedIndex.value}"]`)?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  });
+}
+
 function handleKeyDown(e: KeyboardEvent): void {
   if (e.key === "ArrowDown") {
     e.preventDefault();
     selectNext();
+    scrollSelectedItemIntoView();
   } else if (e.key === "ArrowUp") {
     e.preventDefault();
     selectPrevious();
+    scrollSelectedItemIntoView();
   } else if (e.key === "Tab") {
     e.preventDefault();
     const currentIndex = categories.findIndex((category) => category.id === selectedCategory.value);
@@ -82,6 +90,7 @@ function handleKeyDown(e: KeyboardEvent): void {
 }
 
 function handleSelect(item: QuickOpenItem): void {
+  if (item.type === "action" && item.actionId) recordActionUsage(item.actionId);
   emit("select", item);
   dialogOpen.value = false;
 }
@@ -181,6 +190,8 @@ function getTypeLabel(type: string): string {
       return t("quickOpen.sqlFile");
     case "sql_library_file":
       return t("quickOpen.sqlLibraryFile");
+    case "action":
+      return t("quickOpen.categoryAction");
     default:
       return type;
   }
@@ -189,6 +200,7 @@ function getTypeLabel(type: string): string {
 function getItemIcon(type: string) {
   if (type === "sql_file") return FileCode;
   if (type === "sql_library_file") return FileText;
+  if (type === "action") return Command;
   return null;
 }
 
@@ -196,7 +208,7 @@ watch(
   () => props.open,
   (newOpen) => {
     if (newOpen) {
-      setQuery("");
+      resetSelection();
       // Eagerly load external SQL files so they appear in the initial list
       void loadExternalSqlFiles();
       focusSearchInput();
@@ -262,14 +274,14 @@ watch(
         </div>
 
         <!-- Results List -->
-        <div class="max-h-[400px] overflow-y-auto">
+        <div ref="resultsListRef" class="max-h-[400px] overflow-y-auto">
           <div v-if="filteredItems.length === 0" class="px-4 py-8 text-center text-muted-foreground">
             <p v-if="!searchQuery.trim()">{{ t("quickOpen.emptyPlaceholder") }}</p>
             <p v-else>{{ t("quickOpen.noResults") }}</p>
           </div>
 
           <div v-else class="divide-y">
-            <div v-for="(item, index) in filteredItems" :key="item.id" :class="['px-4 py-2 cursor-pointer', index === selectedIndex ? 'bg-accent' : 'hover:bg-muted']" @click="handleSelect(item)" @mouseenter="selectedIndex = index">
+            <div v-for="(item, index) in filteredItems" :key="item.id" :data-quick-open-index="index" :class="['px-4 py-2 cursor-pointer', index === selectedIndex ? 'bg-accent' : 'hover:bg-muted']" @click="handleSelect(item)" @mouseenter="selectedIndex = index">
               <div class="flex items-center justify-between gap-3">
                 <div class="flex items-center gap-2 flex-1 min-w-0">
                   <component v-if="getItemIcon(item.type)" :is="getItemIcon(item.type)" class="h-4 w-4 shrink-0 text-muted-foreground" />

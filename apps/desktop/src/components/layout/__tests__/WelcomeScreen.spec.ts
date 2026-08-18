@@ -9,7 +9,8 @@ describe("WelcomeScreen keyboard shortcuts module", () => {
     expect(welcomeScreenSource).toContain("shortcuts: Partial<ShortcutSettings>;");
     expect(welcomeScreenSource).toContain("const normalizedShortcuts = computed(() => normalizeShortcutSettings(props.shortcuts));");
     expect(welcomeScreenSource).toContain('title: t("welcome.shortcutQuickOpen")');
-    expect(welcomeScreenSource).toContain('shortcuts: [{ id: "double-shift", strokes: shortcutStrokeLabels("Shift Shift") }');
+    expect(welcomeScreenSource).toContain("normalizedShortcuts.value.focusTableWhere");
+    expect(welcomeScreenSource).toMatch(/shortcuts:\s*\[\s*\{ id: "double-shift", strokes: shortcutStrokeLabels\("Shift Shift"\) \}/);
     expect(welcomeScreenSource).toContain('t("welcome.keyboardShortcuts")');
     expect(welcomeScreenSource).toContain('t("welcome.shortcutThen")');
   });

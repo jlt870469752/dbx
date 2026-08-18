@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { formatError } from "@/lib/backend/errorUtils";
-import { ref, computed, onMounted, watch } from "vue";
+import { ref, computed, nextTick, onMounted, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import type { MqAdminConfig, MqClusterInfo, MqSystemKind, NamespaceRef, TopicInfo } from "@/types/mq";
 import { mqCreateNamespace, mqListNamespaces, mqTestConnection } from "@/lib/backend/api";
@@ -90,6 +90,23 @@ const clusterInfo = ref<MqClusterInfo>();
 const loading = ref(false);
 const error = ref<string>();
 const preferDlqTopic = ref(props.initialTab === "dlq");
+const rootRef = ref<HTMLElement | null>(null);
+
+function focusSearch(): boolean {
+  const root = rootRef.value;
+  if (!root) return false;
+  const input = root.querySelector<HTMLInputElement>('.mq-content input[type="search"]:not(:disabled), .mq-content input[type="text"]:not(:disabled), .mq-content textarea:not(:disabled)');
+  if (input) {
+    input.focus();
+    input.select();
+    return true;
+  }
+  const topicTrigger = root.querySelector<HTMLButtonElement>(".mq-content .topic-combobox-trigger:not(:disabled)");
+  if (!topicTrigger) return false;
+  topicTrigger.click();
+  void nextTick(() => root.querySelector<HTMLInputElement>(".mq-content .topic-combobox-input:not(:disabled)")?.focus());
+  return true;
+}
 
 // RabbitMQ vhost switcher (tab-bar namespace dropdown).
 const CREATE_NAMESPACE_VALUE = "__create_namespace__";
@@ -386,10 +403,12 @@ onMounted(async () => {
   }
   loadClusterInfo();
 });
+
+defineExpose({ focusSearch });
 </script>
 
 <template>
-  <div class="mq-admin-console">
+  <div ref="rootRef" class="mq-admin-console">
     <!-- Top Toolbar -->
     <div class="mq-toolbar">
       <div class="mq-breadcrumb">

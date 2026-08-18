@@ -714,6 +714,36 @@ describe("DataGridFilterBuilder", () => {
 });
 
 describe("DataGridQueryControls", () => {
+  it("focuses the WHERE condition editor through its public shortcut target", () => {
+    const mounted = mountComponent(DataGridQueryControls, {
+      whereInput: "",
+      orderByInput: "",
+      columns: ["id"],
+      conditionColumns: ["id"],
+      historyScope: {},
+      canUseWhereSearch: true,
+      compact: false,
+      leadingBorder: false,
+      filterBuilderOpen: false,
+      filterButtonActive: false,
+      filterButtonCount: 0,
+      hasLocalColumnFilters: false,
+      localFilterCount: 0,
+      localFilterSummaries: [],
+      rules: [],
+      filteredColumns: ["id"],
+      modeOptions: [{ value: "equals", labelKey: "equals" }],
+      columnSearch: "",
+      applyWhere: vi.fn(),
+      applyOrderBy: vi.fn(),
+      clearOrderBy: vi.fn(),
+    });
+    const whereInput = findAll(mounted.root, (node) => node.type === "textarea")[0];
+
+    expect(mounted.exposed.value.focusWhere()).toBe(true);
+    expect(whereInput.focused).toBe(true);
+  });
+
   it("opens column search when the filter button creates the first rule", async () => {
     let mounted: ReturnType<typeof mountComponent>;
     const firstRule = { id: "r1", columnName: "", mode: "equals" as const, rawValue: "", rawEndValue: "", conjunction: "AND" as const };

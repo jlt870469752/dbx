@@ -142,6 +142,7 @@ import { productionContextForDatabase } from "@/lib/database/productionSafety";
 type DataGridHandle = DataGridColumnLayoutHandle & {
   onToolbarRefresh: () => Promise<void> | void;
   focusSearch: () => boolean;
+  focusWhere: () => boolean;
   openCellDetailSearch: () => boolean;
   nullColumnsHidden: boolean;
   allNullColumnCount: number;
@@ -154,6 +155,8 @@ type DataGridHandle = DataGridColumnLayoutHandle & {
   openExtractorConfiguration: () => void;
   showDdl: boolean;
   toggleDdl: (tab?: TableInfoTab) => void;
+  openDdl: () => Promise<boolean>;
+  toggleKeyboardTranspose: () => boolean;
   multiRowTranspose: boolean;
   setMultiRowTranspose: (value: boolean) => void;
   exportCsv: () => Promise<void>;
@@ -282,6 +285,9 @@ const etcdDashboardRef = ref<{ refresh?: () => boolean }>();
 const zookeeperKeyBrowserRef = ref<SearchableBrowserHandle>();
 const consulOverviewRef = ref<{ refresh?: () => boolean }>();
 const consulWorkspaceRef = ref<SearchableBrowserHandle>();
+const mqAdminConsoleRef = ref<SearchableBrowserHandle>();
+const mqttAdminConsoleRef = ref<SearchableBrowserHandle>();
+const nacosAdminConsoleRef = ref<SearchableBrowserHandle>();
 const databaseBrowserRef = ref<SearchableBrowserHandle>();
 const objectBrowserRef = ref<SearchableBrowserHandle>();
 const activeTableMeta = computed(() => props.activeTab.tableMeta);
@@ -823,10 +829,28 @@ function focusSearch(): boolean {
   if (props.activeTab.mode === "etcd") return etcdKeyBrowserRef.value?.focusSearch() ?? false;
   if (props.activeTab.mode === "zookeeper") return zookeeperKeyBrowserRef.value?.focusSearch() ?? false;
   if (props.activeTab.mode === "consul") return consulWorkspaceRef.value?.focusSearch() ?? false;
+  if (props.activeTab.mode === "mq") return mqAdminConsoleRef.value?.focusSearch() ?? false;
+  if (props.activeTab.mode === "mqtt") return mqttAdminConsoleRef.value?.focusSearch() ?? false;
+  if (props.activeTab.mode === "nacos") return nacosAdminConsoleRef.value?.focusSearch() ?? false;
   if (props.activeTab.mode === "databases") return databaseBrowserRef.value?.focusSearch() ?? false;
   if (props.activeTab.mode === "objects") return objectBrowserRef.value?.focusSearch() ?? false;
   if (props.activeTab.mode === "query") return queryEditorRef.value?.openSearch() ?? false;
   return dataGridRef.value?.focusSearch() ?? false;
+}
+
+function focusTableWhere(): boolean {
+  if (props.activeTab.mode !== "data") return false;
+  return dataGridRef.value?.focusWhere() ?? false;
+}
+
+function toggleDataGridTranspose(): boolean {
+  return dataGridRef.value?.toggleKeyboardTranspose() ?? false;
+}
+
+function showDataGridDdl(): boolean {
+  if (!dataGridRef.value) return false;
+  void dataGridRef.value.openDdl();
+  return true;
 }
 
 function refreshQueryEditorCompletionCache(): boolean {
@@ -1017,7 +1041,21 @@ async function executeRedisCommand(command: string): Promise<boolean> {
   return (await redisKeyBrowserRef.value?.executeCommand?.(command)) ?? false;
 }
 
-defineExpose({ focusSearch, refreshData, refreshQueryEditorCompletionCache, handleModRTarget, requestQueryEditorExecute, requestQueryEditorExecuteInNewResultTab, pasteClipboardAsSqlInCondition, applyTableStructureChanges, insertRedisCommand, executeRedisCommand });
+defineExpose({
+  focusSearch,
+  focusTableWhere,
+  toggleDataGridTranspose,
+  showDataGridDdl,
+  refreshData,
+  refreshQueryEditorCompletionCache,
+  handleModRTarget,
+  requestQueryEditorExecute,
+  requestQueryEditorExecuteInNewResultTab,
+  pasteClipboardAsSqlInCondition,
+  applyTableStructureChanges,
+  insertRedisCommand,
+  executeRedisCommand,
+});
 </script>
 
 <template>
@@ -2084,19 +2122,20 @@ defineExpose({ focusSearch, refreshData, refreshQueryEditorCompletionCache, hand
 
     <template v-else-if="activeTab.mode === 'mq'">
       <div class="flex-1 min-h-0">
-        <MqAdminConsole :key="activeTab.id" :connection-id="activeTab.connectionId" :initial-tenant="activeTab.mqTenant" :initial-tab="activeTab.mqInitialTab" :read-only="activeConnection?.read_only ?? false" />
+        <MqAdminConsole ref="mqAdminConsoleRef" :key="activeTab.id" :connection-id="activeTab.connectionId" :initial-tenant="activeTab.mqTenant" :initial-tab="activeTab.mqInitialTab" :read-only="activeConnection?.read_only ?? false" />
       </div>
     </template>
 
     <template v-else-if="activeTab.mode === 'mqtt'">
       <div class="flex-1 min-h-0">
-        <MqttAdminConsole :key="activeTab.id" :connection-id="activeTab.connectionId" :initial-topic="activeTab.mqttInitialTopic" />
+        <MqttAdminConsole ref="mqttAdminConsoleRef" :key="activeTab.id" :connection-id="activeTab.connectionId" :initial-topic="activeTab.mqttInitialTopic" />
       </div>
     </template>
 
     <template v-else-if="activeTab.mode === 'nacos'">
       <div class="flex-1 min-h-0">
         <NacosAdminConsole
+          ref="nacosAdminConsoleRef"
           :key="activeTab.id"
           :connection-id="activeTab.connectionId"
           :namespace="activeTab.nacosNamespace"
