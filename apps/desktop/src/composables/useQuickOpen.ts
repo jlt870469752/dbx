@@ -86,6 +86,12 @@ interface IdentifierWord {
   start: number;
 }
 
+interface QuickOpenParsedQuery {
+  sourceMode: boolean;
+  sourceQuery: string;
+  itemQuery: string;
+}
+
 const IDENTIFIER_SEPARATOR_RE = /[_\-. /\\]/;
 const DATABASE_ITEM_TYPES = new Set<QuickOpenItem["type"]>(["connection", "database", "schema", "table", "view", "materialized_view", "procedure", "function", "trigger", "sequence", "package", "package-body", "type", "type-body"]);
 const FILE_ITEM_TYPES = new Set<QuickOpenItem["type"]>(["sql_file"]);
@@ -169,6 +175,19 @@ function identifierWords(text: string): IdentifierWord[] {
 
 function rangeIndices(start: number, length: number): number[] {
   return Array.from({ length }, (_, index) => start + index);
+}
+
+function parseQuickOpenQuery(query: string): QuickOpenParsedQuery {
+  const trimmed = query.trim();
+  if (!trimmed.startsWith("@")) return { sourceMode: false, sourceQuery: "", itemQuery: trimmed };
+  const scoped = trimmed.slice(1).trimStart();
+  const separatorIndex = scoped.search(/\s/);
+  if (separatorIndex < 0) return { sourceMode: true, sourceQuery: scoped, itemQuery: "" };
+  return {
+    sourceMode: true,
+    sourceQuery: scoped.slice(0, separatorIndex).trim(),
+    itemQuery: scoped.slice(separatorIndex).trim(),
+  };
 }
 
 function matchWordPrefixes(words: IdentifierWord[], query: string): number[] | null {
@@ -303,18 +322,30 @@ export function useQuickOpen() {
   let sqlFilesLoadingPromise: Promise<void> | null = null;
   let sqlFilesLoadGeneration = 0;
 
+  function configuredConnections(): ConnectionConfig[] {
+    return Array.isArray(connectionStore.connections) ? connectionStore.connections : [];
+  }
+
+  function configuredTreeNodes(): any[] {
+    return Array.isArray(connectionStore.treeNodes) ? connectionStore.treeNodes : [];
+  }
+
+  function savedSqlFiles(): typeof savedSqlStore.allFiles {
+    return Array.isArray(savedSqlStore.allFiles) ? savedSqlStore.allFiles : [];
+  }
+
   function isConnectionConnected(connectionId: string): boolean {
     return !!connectionStore.connectedIds?.has(connectionId);
   }
 
   function getConnectionLabel(connectionId: string): string {
     if (!connectionId) return i18n.global.t("sqlLibrary.unassociated");
-    const conn = connectionStore.connections.find((c) => c.id === connectionId);
+    const conn = configuredConnections().find((c) => c.id === connectionId);
     return conn?.name || i18n.global.t("sqlLibrary.deletedConnection");
   }
 
   const connectionOptions = computed<QuickOpenConnectionOption[]>(() =>
-    connectionStore.connections.map((conn) => ({
+    configuredConnections().map((conn) => ({
       id: conn.id,
       name: conn.name,
       connected: isConnectionConnected(conn.id),
@@ -332,11 +363,11 @@ export function useQuickOpen() {
   function itemMatchesDatabaseScope(item: QuickOpenItem): boolean {
     if (!DATABASE_ITEM_TYPES.has(item.type)) return true;
     if (selectedCategory.value !== "database") return true;
-    if (!connectionStore.connections.some((conn) => conn.id === item.connectionId)) return false;
+    if (!configuredConnections().some((conn) => conn.id === item.connectionId)) return false;
     if (databaseScope.value === "all") return true;
     if (databaseScope.value === "connected") return isConnectionConnected(item.connectionId);
     if (databaseScope.value.startsWith("connection:")) return item.connectionId === databaseScope.value.slice("connection:".length);
-    const contextConnectionId = connectionStore.activeConnectionId || connectionStore.connections[0]?.id;
+    const contextConnectionId = connectionStore.activeConnectionId || configuredConnections()[0]?.id;
     return !!contextConnectionId && item.connectionId === contextConnectionId;
   }
 
@@ -344,8 +375,15 @@ export function useQuickOpen() {
     return itemMatchesCategory(item) && itemMatchesDatabaseScope(item);
   }
 
+  function itemSourceText(item: QuickOpenItem): string {
+    if (item.type === "action") return "";
+    const connectionName = item.connectionName || getConnectionLabel(item.connectionId);
+    const visibleConnectionLabel = item.type === "connection" ? item.label : "";
+    return [item.description, connectionName, item.database, item.schema, item.filePath, visibleConnectionLabel].filter(Boolean).join(" ");
+  }
+
   const sqlLibraryAllItems = computed<QuickOpenItem[]>(() => {
-    return savedSqlStore.allFiles.map((file) => ({
+    return savedSqlFiles().map((file) => ({
       id: `sqllib-${file.id}`,
       type: "sql_library_file" as const,
       label: file.name,
@@ -471,8 +509,8 @@ export function useQuickOpen() {
 
   const allItems = computed((): QuickOpenItem[] => {
     const items: QuickOpenItem[] = [];
-    const connections = connectionStore.connections;
-    const treeNodes = connectionStore.treeNodes;
+    const connections = configuredConnections();
+    const treeNodes = configuredTreeNodes();
 
     // Add connections
     for (const conn of connections) {
@@ -697,7 +735,7 @@ export function useQuickOpen() {
 
   function cacheRemoteMetadata(items: QuickOpenItem[]): void {
     if (items.length === 0) return;
-    const knownConnectionIds = new Set(connectionStore.connections.map((conn) => conn.id));
+    const knownConnectionIds = new Set(configuredConnections().map((conn) => conn.id));
     const merged = new Map<string, QuickOpenItem>();
     const order: string[] = [];
 
@@ -754,22 +792,28 @@ export function useQuickOpen() {
   }
 
   function scopedConnections(): ConnectionConfig[] {
-    if (selectedCategory.value !== "database") return connectionStore.connections;
+    const connections = configuredConnections();
+    if (selectedCategory.value !== "database") return connections;
     if (databaseScope.value === "connected") {
-      return connectionStore.connections.filter((conn) => isConnectionConnected(conn.id));
+      return connections.filter((conn) => isConnectionConnected(conn.id));
     }
     if (databaseScope.value.startsWith("connection:")) {
       const connectionId = databaseScope.value.slice("connection:".length);
-      return connectionStore.connections.filter((conn) => conn.id === connectionId);
+      return connections.filter((conn) => conn.id === connectionId);
     }
     if (databaseScope.value === "context") {
-      const contextConnectionId = connectionStore.activeConnectionId || connectionStore.connections[0]?.id;
-      return contextConnectionId ? connectionStore.connections.filter((conn) => conn.id === contextConnectionId) : [];
+      const contextConnectionId = connectionStore.activeConnectionId || connections[0]?.id;
+      return contextConnectionId ? connections.filter((conn) => conn.id === contextConnectionId) : [];
     }
-    return connectionStore.connections;
+    return connections;
   }
 
-  function remoteSearchContexts(): Array<{ conn: ConnectionConfig; database: string }> {
+  function sourceMatchesRemoteContext(conn: ConnectionConfig, database: string, sourceQuery: string): boolean {
+    if (!sourceQuery) return true;
+    return !!matchQuickOpenText(sourceQuery, `${conn.name} ${database}`);
+  }
+
+  function remoteSearchContexts(sourceQuery = ""): Array<{ conn: ConnectionConfig; database: string }> {
     if (typeof connectionStore.listCompletionTables !== "function") return [];
     if (selectedCategory.value !== "all" && selectedCategory.value !== "database") return [];
 
@@ -787,7 +831,7 @@ export function useQuickOpen() {
       // out here makes quick-open blind to unloaded tables after a cold start.
       if (REMOTE_SEARCH_UNSUPPORTED_TYPES.has(conn.db_type)) continue;
       const databases = new Set<string>();
-      collectConnectionDatabases(connectionStore.treeNodes, conn.id, databases);
+      collectConnectionDatabases(configuredTreeNodes(), conn.id, databases);
       if (conn.database?.trim()) databases.add(conn.database.trim());
       for (const database of conn.visible_databases ?? []) {
         if (database.trim()) databases.add(database.trim());
@@ -797,7 +841,8 @@ export function useQuickOpen() {
       }
       const defaultDatabase = resolveDefaultDatabase(conn, [...databases]);
       if (defaultDatabase) databases.add(defaultDatabase);
-      if (databases.size > 0) databasesByConnection.push({ conn, databases: [...databases] });
+      const scopedDatabases = [...databases].filter((database) => sourceMatchesRemoteContext(conn, database, sourceQuery));
+      if (scopedDatabases.length > 0) databasesByConnection.push({ conn, databases: scopedDatabases });
     }
 
     const contexts: Array<{ conn: ConnectionConfig; database: string }> = [];
@@ -878,9 +923,9 @@ export function useQuickOpen() {
   });
 
   watch(
-    () => connectionStore.connections.map((conn) => conn.id),
+    () => configuredConnections().map((conn) => conn.id),
     () => {
-      const knownConnectionIds = new Set(connectionStore.connections.map((conn) => conn.id));
+      const knownConnectionIds = new Set(configuredConnections().map((conn) => conn.id));
       cachedRemoteItems.value = cachedRemoteItems.value.filter((item) => knownConnectionIds.has(item.connectionId));
     },
     { flush: "sync" },
@@ -895,15 +940,17 @@ export function useQuickOpen() {
       if (remoteSearchTimer) clearTimeout(remoteSearchTimer);
       remoteItems.value = [];
 
-      const normalizedQuery = query.trim();
+      const parsedQuery = parseQuickOpenQuery(query);
+      const normalizedQuery = parsedQuery.itemQuery;
+      const hasSearchText = parsedQuery.sourceMode ? !!parsedQuery.sourceQuery || !!parsedQuery.itemQuery : query.trim().length > 0;
 
       // Ensure external SQL files are loaded when the user starts searching
-      if ((selectedCategory.value === "all" || selectedCategory.value === "file") && normalizedQuery.length > 0 && !sqlFilesLoaded && !sqlFilesLoadingPromise) {
+      if ((selectedCategory.value === "all" || selectedCategory.value === "file") && hasSearchText && !sqlFilesLoaded && !sqlFilesLoadingPromise) {
         void loadExternalSqlFiles();
       }
 
       if (normalizedQuery.length < REMOTE_SEARCH_MIN_QUERY_LENGTH) return;
-      const contexts = remoteSearchContexts();
+      const contexts = remoteSearchContexts(parsedQuery.sourceMode ? parsedQuery.sourceQuery : "");
       if (contexts.length === 0) return;
 
       remoteSearchTimer = setTimeout(() => {
@@ -924,6 +971,7 @@ export function useQuickOpen() {
       }));
     }
 
+    const parsedQuery = parseQuickOpenQuery(searchQuery.value);
     const matched: MatchedItem[] = [];
 
     const seen = new Set<string>();
@@ -933,12 +981,27 @@ export function useQuickOpen() {
       const key = quickOpenItemKey(item);
       if (seen.has(key)) continue;
       seen.add(key);
-      const rawLabelMatch = matchQuickOpenText(searchQuery.value, item.label);
+
+      if (parsedQuery.sourceMode) {
+        const sourceMatch = parsedQuery.sourceQuery ? matchQuickOpenText(parsedQuery.sourceQuery, itemSourceText(item)) : { kind: "exact" as const, score: 1, indices: [] };
+        if (!sourceMatch) continue;
+        const labelTargetMatch = parsedQuery.itemQuery ? matchQuickOpenText(parsedQuery.itemQuery, item.label) : null;
+        const metadataTargetMatch = parsedQuery.itemQuery && !labelTargetMatch ? matchQuickOpenText(parsedQuery.itemQuery, item.searchText) : null;
+        if (parsedQuery.itemQuery && !labelTargetMatch && !metadataTargetMatch) continue;
+        matched.push({
+          ...item,
+          matchScore: (labelTargetMatch?.score ?? metadataTargetMatch?.score ?? 900) + Math.min(sourceMatch.score, 999) / 1000,
+          matchIndices: labelTargetMatch?.indices ?? [],
+        });
+        continue;
+      }
+
+      const rawLabelMatch = matchQuickOpenText(parsedQuery.itemQuery, item.label);
       const labelMatch = item.type === "action" && rawLabelMatch?.kind === "fuzzy" ? null : rawLabelMatch;
       const keywordMatches =
-        item.type === "action" ? (item.searchKeywords ?? []).map((keyword) => matchQuickOpenText(searchQuery.value, keyword)).filter((match): match is QuickOpenMatch => !!match && match.kind !== "fuzzy" && (match.kind !== "substring" || searchQuery.value.trim().length >= 3)) : [];
+        item.type === "action" ? (item.searchKeywords ?? []).map((keyword) => matchQuickOpenText(parsedQuery.itemQuery, keyword)).filter((match): match is QuickOpenMatch => !!match && match.kind !== "fuzzy" && (match.kind !== "substring" || parsedQuery.itemQuery.length >= 3)) : [];
       const keywordMatch = keywordMatches.sort((left, right) => left.score - right.score)[0] ?? null;
-      const metadataMatch = labelMatch || keywordMatch || item.type === "action" ? null : matchQuickOpenText(searchQuery.value, item.searchText);
+      const metadataMatch = labelMatch || keywordMatch || item.type === "action" ? null : matchQuickOpenText(parsedQuery.itemQuery, item.searchText);
       const result = labelMatch ?? keywordMatch ?? metadataMatch;
       if (result) {
         const actionMatchScore =

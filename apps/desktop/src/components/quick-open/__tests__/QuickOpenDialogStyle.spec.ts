@@ -27,6 +27,8 @@ describe("QuickOpenDialog theme styles", () => {
     expect(quickOpenDialogSource).toContain('?.scrollIntoView({ block: "nearest", inline: "nearest" });');
     expect(quickOpenDialogSource).toMatch(/selectNext\(\);\s*scrollSelectedItemIntoView\(\);/);
     expect(quickOpenDialogSource).toMatch(/selectPrevious\(\);\s*scrollSelectedItemIntoView\(\);/);
+    expect(quickOpenDialogSource).toContain('class="flex min-w-0 flex-1 items-center gap-2 whitespace-nowrap"');
+    expect(quickOpenDialogSource).toContain('class="max-w-[42%] truncate text-xs text-muted-foreground"');
     expect(quickOpenDialogSource).toContain("<DropdownMenu v-if=\"selectedCategory === 'database'\">");
     expect(quickOpenDialogSource).toContain('if (type === "action") return Command;');
     expect(quickOpenDialogSource).toContain("recordActionUsage(item.actionId)");

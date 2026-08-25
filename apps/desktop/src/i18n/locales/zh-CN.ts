@@ -2024,7 +2024,7 @@ export default withEnglishFallback({
     outOfRange: "日期和时间超出允许范围",
   },
   quickOpen: {
-    placeholder: "搜索连接、数据库、表、SQL文件和其他对象...",
+    placeholder: "搜索对象，或用 {'@'}来源 对象，例如 {'@'}prod1 orders...",
     emptyPlaceholder: "开始输入进行搜索",
     noResults: "未找到结果",
     results: "个结果",

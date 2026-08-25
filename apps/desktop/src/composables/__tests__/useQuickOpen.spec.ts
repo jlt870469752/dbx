@@ -542,6 +542,42 @@ describe("useQuickOpen", () => {
       expect(table?.matchIndices).toEqual([0, 8, 14, 22]);
     });
 
+    it("uses @source to filter by connection, database, or schema before searching object names", () => {
+      vi.mocked(useConnectionStore).mockReturnValue({
+        connections: [{ id: "conn1", name: "Main MySQL", db_type: "mysql" }],
+        treeNodes: [
+          {
+            id: "conn1:prod-xxx1",
+            connectionId: "conn1",
+            type: "database",
+            database: "prod-xxx1",
+            label: "prod-xxx1",
+            children: [
+              { id: "prod-users", connectionId: "conn1", type: "table", database: "prod-xxx1", label: "users" },
+              { id: "prod-orders", connectionId: "conn1", type: "table", database: "prod-xxx1", label: "orders" },
+            ],
+          },
+          {
+            id: "conn1:test-xxx1",
+            connectionId: "conn1",
+            type: "database",
+            database: "test-xxx1",
+            label: "test-xxx1",
+            children: [{ id: "test-orders", connectionId: "conn1", type: "table", database: "test-xxx1", label: "orders" }],
+          },
+        ],
+      } as any);
+
+      const { filteredItems, setQuery } = useQuickOpen();
+
+      setQuery("@prod1");
+      expect(filteredItems.value.map((item) => `${item.database ?? item.label}:${item.label}`)).toEqual(["prod-xxx1:prod-xxx1", "prod-xxx1:users", "prod-xxx1:orders"]);
+
+      setQuery("@prodx orders");
+      expect(filteredItems.value.map((item) => `${item.database}:${item.label}`)).toEqual(["prod-xxx1:orders"]);
+      expect(filteredItems.value[0]?.matchIndices).toEqual([0, 1, 2, 3, 4, 5]);
+    });
+
     it("does not highlight the label when only connection metadata matches", () => {
       vi.mocked(useConnectionStore).mockReturnValue({
         connections: [{ id: "conn1", name: "ProdConnection", db_type: "mysql" }],
@@ -1498,6 +1534,25 @@ describe("useQuickOpen", () => {
 
       expect(mockStore.listCompletionTables).toHaveBeenCalledTimes(1);
       expect(mockStore.listCompletionTables).toHaveBeenCalledWith("conn2", "archive", "orders", 25, undefined, true, undefined, undefined, { activateConnection: false });
+    });
+
+    it("uses @source to limit remote metadata search to matching databases", async () => {
+      const mockStore = remoteSearchStore({
+        treeNodes: [
+          { id: "conn1:prod-xxx1", connectionId: "conn1", type: "database", database: "prod-xxx1", label: "prod-xxx1" },
+          { id: "conn1:test-xxx1", connectionId: "conn1", type: "database", database: "test-xxx1", label: "test-xxx1" },
+        ],
+        listCompletionTables: vi.fn().mockResolvedValue([{ name: "orders", type: "table" }]),
+      });
+      vi.mocked(useConnectionStore).mockReturnValue(mockStore as any);
+
+      const { filteredItems, setQuery } = useQuickOpen();
+      setQuery("@prod1 orders");
+      await runDebouncedSearch();
+
+      expect(mockStore.listCompletionTables).toHaveBeenCalledTimes(1);
+      expect(mockStore.listCompletionTables).toHaveBeenCalledWith("conn1", "prod-xxx1", "orders", 25, undefined, true, undefined, undefined, { activateConnection: false });
+      expect(filteredItems.value).toEqual(expect.arrayContaining([expect.objectContaining({ label: "orders", database: "prod-xxx1" })]));
     });
   });
 });

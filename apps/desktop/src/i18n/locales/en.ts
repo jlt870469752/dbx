@@ -2100,7 +2100,7 @@ export default {
     outOfRange: "Date and time is outside the allowed range",
   },
   quickOpen: {
-    placeholder: "Search connections, databases, tables, SQL files, and other objects...",
+    placeholder: "Search objects, or use {'@'}source object, e.g. {'@'}prod1 orders...",
     emptyPlaceholder: "Start typing to search",
     noResults: "No results found",
     results: "results",

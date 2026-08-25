@@ -2297,29 +2297,12 @@ async function handleKeydown(e: KeyboardEvent) {
   const shortcuts = settingsStore.editorSettings.shortcuts;
   const switchTabIndex = switchToTabIndexFromShortcut(e, shortcuts);
 
-  if (isPlainShiftTapShortcut(e)) {
-    const now = performance.now();
-    if (now - lastPlainShiftTapAt <= DOUBLE_SHIFT_QUICK_OPEN_INTERVAL_MS) {
-      lastPlainShiftTapAt = 0;
-      e.preventDefault();
-      e.stopPropagation();
-      showQuickOpen.value = true;
-      return;
-    }
-    lastPlainShiftTapAt = now;
-    return;
-  }
+  if (showQuickOpen.value) return;
 
   if (isOpenSettingsShortcut(e, shortcuts)) {
     e.preventDefault();
     e.stopPropagation();
     openSettings();
-    return;
-  }
-  if (isQuickOpenShortcut(e, shortcuts)) {
-    e.preventDefault();
-    e.stopPropagation();
-    showQuickOpen.value = true;
     return;
   }
   if (isFocusTableWhereShortcut(e, shortcuts)) {
@@ -2450,6 +2433,32 @@ async function handleKeydown(e: KeyboardEvent) {
   if (isDesktop && isBrowserReloadShortcut(e)) {
     e.preventDefault();
     e.stopPropagation();
+  }
+}
+
+function handleQuickOpenKeydown(e: KeyboardEvent) {
+  if (e.defaultPrevented) return;
+
+  const shortcuts = settingsStore.editorSettings.shortcuts;
+
+  if (isPlainShiftTapShortcut(e)) {
+    const now = performance.now();
+    if (now - lastPlainShiftTapAt <= DOUBLE_SHIFT_QUICK_OPEN_INTERVAL_MS) {
+      lastPlainShiftTapAt = 0;
+      e.preventDefault();
+      e.stopPropagation();
+      showQuickOpen.value = true;
+      return;
+    }
+    lastPlainShiftTapAt = now;
+    return;
+  }
+  lastPlainShiftTapAt = 0;
+
+  if (isQuickOpenShortcut(e, shortcuts)) {
+    e.preventDefault();
+    e.stopPropagation();
+    showQuickOpen.value = true;
   }
 }
 
@@ -2584,6 +2593,7 @@ onMounted(async () => {
   applyTheme();
   void applyUiScale(settingsStore.editorSettings.uiScale);
   window.addEventListener("keydown", handleNativeSelectAll, true);
+  window.addEventListener("keydown", handleQuickOpenKeydown, true);
   window.addEventListener("keydown", handleKeydown);
   window.addEventListener("dbx-open-driver-store", openDriverStoreFromEvent);
   window.addEventListener("dbx-mcp-status-changed", handleMcpStatusChanged);
@@ -2652,6 +2662,7 @@ onUnmounted(() => {
     clearInterval(updateCheckTimer);
   }
   window.removeEventListener("keydown", handleNativeSelectAll, true);
+  window.removeEventListener("keydown", handleQuickOpenKeydown, true);
   window.removeEventListener("keydown", handleKeydown);
   window.removeEventListener("dbx-open-driver-store", openDriverStoreFromEvent);
   window.removeEventListener("dbx-mcp-status-changed", handleMcpStatusChanged);

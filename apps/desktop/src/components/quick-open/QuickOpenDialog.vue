@@ -285,8 +285,8 @@ watch(
               <div class="flex items-center justify-between gap-3">
                 <div class="flex items-center gap-2 flex-1 min-w-0">
                   <component v-if="getItemIcon(item.type)" :is="getItemIcon(item.type)" class="h-4 w-4 shrink-0 text-muted-foreground" />
-                  <div class="flex-1 min-w-0">
-                    <div class="text-sm font-medium truncate">
+                  <div class="flex min-w-0 flex-1 items-center gap-2 whitespace-nowrap">
+                    <div class="min-w-0 flex-1 truncate text-sm font-medium">
                       <template v-for="(part, i) in getHighlightedLabel(item)" :key="i">
                         <span v-if="typeof part === 'object'" :class="{ 'bg-yellow-200 dark:bg-yellow-800 font-semibold': part.highlight }">
                           {{ part.text }}
@@ -294,12 +294,13 @@ watch(
                         <span v-else>{{ part }}</span>
                       </template>
                     </div>
-                    <div v-if="item.description" class="text-xs text-muted-foreground truncate">
+                    <span v-if="item.description" class="shrink-0 text-xs text-muted-foreground">·</span>
+                    <div v-if="item.description" class="max-w-[42%] truncate text-xs text-muted-foreground">
                       {{ item.description }}
                     </div>
                   </div>
                 </div>
-                <div class="text-xs px-2 py-1 rounded bg-muted text-muted-foreground whitespace-nowrap">
+                <div class="shrink-0 rounded bg-muted px-2 py-1 text-xs whitespace-nowrap text-muted-foreground">
                   {{ getTypeLabel(item.type) }}
                 </div>
               </div>
