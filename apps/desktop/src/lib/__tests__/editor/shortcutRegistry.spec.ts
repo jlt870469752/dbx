@@ -59,7 +59,7 @@ describe("shortcutRegistry editor actions", () => {
     const shortcuts = normalizeShortcutSettings({ goToFirstPage: "Alt+F1", goToPreviousPage: "Alt+F1" });
 
     expect(findShortcutConflict("goToFirstPage", shortcuts.goToFirstPage, shortcuts)).toBe("goToPreviousPage");
-    expect(findShortcutConflict("goToFirstPage", "Mod+F", shortcuts)).toBeNull();
+    expect(findShortcutConflict("goToFirstPage", "Mod+F", shortcuts)).toBe("focusTableWhere");
   });
 
   it("registers go to column as an unassigned grid shortcut", () => {
@@ -84,7 +84,7 @@ describe("shortcutRegistry editor actions", () => {
     const shortcuts = normalizeShortcutSettings({ goToColumn: "Mod+D" });
 
     expect(findShortcutConflict("goToColumn", shortcuts.goToColumn, shortcuts)).toBe("editTableStructure");
-    expect(findShortcutConflict("goToColumn", "Mod+F", shortcuts)).toBeNull();
+    expect(findShortcutConflict("goToColumn", "Mod+F", shortcuts)).toBe("focusTableWhere");
   });
 
   it("registers edit table structure as the conflict-free default Mod+D grid action", () => {
