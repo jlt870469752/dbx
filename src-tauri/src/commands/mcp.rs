@@ -11,6 +11,8 @@ const MCP_PACKAGE_NAME: &str = "@dbx-app/mcp-server";
 const MCP_LATEST_URL: &str = "https://registry.npmjs.org/@dbx-app%2fmcp-server/latest";
 const MCP_INSTALL_COMMAND: &str = "npm install -g @dbx-app/mcp-server@latest";
 const MCP_PNPM_UPDATE_COMMAND: &str = "pnpm update -g @dbx-app/mcp-server";
+const MCP_UNINSTALL_COMMAND: &str = "npm uninstall -g @dbx-app/mcp-server";
+const MCP_PNPM_UNINSTALL_COMMAND: &str = "pnpm remove -g @dbx-app/mcp-server";
 const MCP_MIN_NODE_VERSION: NodeVersion = NodeVersion { major: 18, minor: 18, patch: 0 };
 const MCP_MIN_NODE_VERSION_REQUIREMENT: &str = ">=18.18.0";
 const SHELL_COMMAND_MARKER: &str = "__DBX_MCP_COMMAND_OUTPUT_START__";
@@ -30,6 +32,7 @@ pub struct McpServerStatus {
     pub data_dir: Option<String>,
     pub install_command: String,
     pub update_command: String,
+    pub uninstall_command: String,
     pub error: Option<String>,
 }
 
@@ -155,12 +158,28 @@ impl NodeRuntime {
         }
     }
 
+    fn uninstall_command(&self) -> &'static str {
+        match &self.package_manager {
+            McpPackageManager::Npm => MCP_UNINSTALL_COMMAND,
+            McpPackageManager::Pnpm { .. } => MCP_PNPM_UNINSTALL_COMMAND,
+        }
+    }
+
     fn install_or_update(&self) -> Result<CommandOutput, String> {
         match &self.package_manager {
             McpPackageManager::Pnpm { command_path } if self.has_mcp_package() => {
                 run_package_manager_command(command_path, &["update", "-g", MCP_PACKAGE_NAME], &self.node_launcher_path)
             }
             _ => self.npm_output(&["install", "-g", "@dbx-app/mcp-server@latest"]),
+        }
+    }
+
+    fn uninstall(&self) -> Result<CommandOutput, String> {
+        match &self.package_manager {
+            McpPackageManager::Pnpm { command_path } => {
+                run_package_manager_command(command_path, &["remove", "-g", MCP_PACKAGE_NAME], &self.node_launcher_path)
+            }
+            McpPackageManager::Npm => self.npm_output(&["uninstall", "-g", MCP_PACKAGE_NAME]),
         }
     }
 }
@@ -221,6 +240,11 @@ pub async fn check_mcp_server_status(app: AppHandle) -> Result<McpServerStatus, 
         data_dir,
         install_command: MCP_INSTALL_COMMAND.to_string(),
         update_command: runtime.as_ref().map(NodeRuntime::update_command).unwrap_or(MCP_INSTALL_COMMAND).to_string(),
+        uninstall_command: runtime
+            .as_ref()
+            .map(NodeRuntime::uninstall_command)
+            .unwrap_or(MCP_UNINSTALL_COMMAND)
+            .to_string(),
         error,
     })
 }
@@ -261,6 +285,31 @@ pub async fn install_mcp_server() -> Result<String, String> {
     .map_err(|e| e.to_string())?
 }
 
+#[tauri::command]
+pub async fn uninstall_mcp_server() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let runtime = resolve_node_runtime().ok_or_else(|| {
+            format!("Unable to resolve a compatible Node.js ({}) and npm runtime.", MCP_MIN_NODE_VERSION_REQUIREMENT)
+        })?;
+        if !runtime.has_mcp_package() {
+            return Err(format!("{} is not installed in the detected Node.js runtime.", MCP_PACKAGE_NAME));
+        }
+
+        let output = runtime.uninstall()?;
+        if !output.success {
+            let error_msg = if !output.stderr.is_empty() { output.stderr } else { output.stdout };
+            return Err(format!("Uninstallation failed: {}", error_msg));
+        }
+
+        if runtime.refresh().is_some_and(|refreshed| refreshed.has_mcp_package()) {
+            return Err(format!("Uninstallation completed, but {} is still installed.", MCP_PACKAGE_NAME));
+        }
+        Ok(format!("Successfully uninstalled {}", MCP_PACKAGE_NAME))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 async fn fetch_latest_mcp_version() -> Result<String, String> {
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10)).user_agent("dbx-mcp-status-checker");
     let proxy_url =
@@ -291,7 +340,68 @@ pub(crate) async fn resolve_mcp_server_command() -> Result<(String, Vec<String>)
 
 fn resolve_mcp_server_command_sync() -> Option<(String, Vec<String>)> {
     let runtime = resolve_node_runtime();
-    resolve_managed_mcp_command(runtime.as_ref(), locate_mcp_bin)
+    if let Some(command) = runtime.as_ref().and_then(mcp_command_for_runtime) {
+        return Some(command);
+    }
+
+    let path_shim = locate_mcp_bin();
+    resolve_mise_mcp_command_from_path(runtime.as_ref(), path_shim.as_deref())
+        .or_else(|| resolve_managed_mcp_command(runtime.as_ref(), || path_shim))
+}
+
+fn resolve_mise_mcp_command_from_path(
+    runtime: Option<&NodeRuntime>,
+    shim_path: Option<&Path>,
+) -> Option<(String, Vec<String>)> {
+    let shim_path = shim_path?;
+    if !is_shims_command_path(shim_path) {
+        return None;
+    }
+    let mise_path = locate_command("mise").map(PathBuf::from).and_then(|path| canonical_runtime_path(&path))?;
+    resolve_mise_mcp_command(runtime, Some(shim_path), |command| mise_which_path(&mise_path, command))
+}
+
+fn resolve_mise_mcp_command(
+    runtime: Option<&NodeRuntime>,
+    shim_path: Option<&Path>,
+    mut resolve_mise_command: impl FnMut(&str) -> Option<PathBuf>,
+) -> Option<(String, Vec<String>)> {
+    let runtime = runtime?;
+    if !is_mcp_compatible_node_version(&runtime.node_version) {
+        return None;
+    }
+    let shim_path = shim_path?;
+    if !is_shims_command_path(shim_path) {
+        return None;
+    }
+
+    let runtime_node = canonical_runtime_path(&runtime.node_path)?;
+    let mise_node = resolve_mise_command("node").and_then(|path| canonical_runtime_path(&path))?;
+    if runtime_node != mise_node {
+        return None;
+    }
+
+    let shim_path = canonical_runtime_path(shim_path)?;
+    let script_path = resolve_mise_command("dbx-mcp-server").and_then(|path| canonical_runtime_path(&path))?;
+    if script_path == shim_path {
+        return None;
+    }
+    let (_, package) = mcp_package_from_script(&script_path)?;
+    let node_version = parse_node_version(&runtime.node_version)?;
+    if !mcp_package_supports_node(&package, node_version) {
+        return None;
+    }
+
+    Some((path_string(&runtime_node), vec![path_string(&package.script_path)]))
+}
+
+fn is_shims_command_path(path: &Path) -> bool {
+    path.is_file() && path.parent().and_then(Path::file_name).is_some_and(|name| name.eq_ignore_ascii_case("shims"))
+}
+
+fn mise_which_path(mise_path: &Path, command: &str) -> Option<PathBuf> {
+    let output = direct_command_stdout(mise_path, &["which", command]).ok()?;
+    first_non_empty_line(output).and_then(|path| canonical_runtime_path(Path::new(&path)))
 }
 
 fn resolve_managed_mcp_command(
@@ -1085,8 +1195,9 @@ mod tests {
     use super::{
         canonical_runtime_path, is_mcp_compatible_node_version, mcp_command_for_runtime, mcp_native_binary_path_for,
         mcp_package, normalized_reported_path, npm_cli_candidates, parse_minimum_node_version, parse_node_version,
-        prefer_runtime, require_managed_mcp_command, resolve_managed_mcp_command, stdout_after_shell_marker,
-        NodeRuntime, NodeVersion, MCP_MIN_NODE_VERSION_REQUIREMENT, MCP_PACKAGE_NAME, SHELL_COMMAND_MARKER,
+        prefer_runtime, require_managed_mcp_command, resolve_managed_mcp_command, resolve_mise_mcp_command,
+        stdout_after_shell_marker, NodeRuntime, NodeVersion, MCP_MIN_NODE_VERSION_REQUIREMENT, MCP_PACKAGE_NAME,
+        SHELL_COMMAND_MARKER,
     };
     #[cfg(not(windows))]
     use super::{shell_command_script, shell_quote};
@@ -1341,6 +1452,116 @@ mod tests {
     }
 
     #[test]
+    fn mcp_command_resolves_native_mise_shim_to_declared_package_entry() {
+        use std::cell::Cell;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("dbx mise shim test {} {nonce}", std::process::id()));
+        let shim_dir = dir.join("mise").join("shims");
+        let shim_path = shim_dir.join("dbx-mcp-server.exe");
+        let node_path = dir.join("mise").join("installs").join("node").join("22.23.1").join("node.exe");
+        let package_root = dir
+            .join("mise")
+            .join("installs")
+            .join("npm-db-server")
+            .join("node_modules")
+            .join("@dbx-app")
+            .join("mcp-server");
+        let script_path = package_root.join("bin").join("dbx-mcp-server.js");
+
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(node_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(script_path.parent().unwrap()).unwrap();
+        std::fs::write(&shim_path, "native mise shim\n").unwrap();
+        std::fs::write(&node_path, "real node runtime\n").unwrap();
+        std::fs::write(&script_path, "// declared MCP entry\n").unwrap();
+        std::fs::write(
+            package_root.join("package.json"),
+            r#"{"name":"@dbx-app/mcp-server","version":"0.4.44","bin":{"dbx-mcp-server":"bin/dbx-mcp-server.js"},"engines":{"node":">=18.18.0"}}"#,
+        )
+        .unwrap();
+
+        assert!(super::node_script_from_launcher(&shim_path).is_none());
+        let node_path = canonical_runtime_path(&node_path).unwrap();
+        let script_path = canonical_runtime_path(&script_path).unwrap();
+        let compatible_runtime = runtime_with_version_and_root(
+            node_path.to_string_lossy().as_ref(),
+            dir.join("npm-root").to_string_lossy().as_ref(),
+            None,
+            "v22.23.1",
+        );
+
+        let command = resolve_mise_mcp_command(Some(&compatible_runtime), Some(&shim_path), |command| match command {
+            "node" => Some(node_path.clone()),
+            "dbx-mcp-server" => Some(script_path.clone()),
+            _ => None,
+        })
+        .unwrap();
+
+        assert_eq!(command.0, node_path.to_string_lossy());
+        assert_eq!(command.1, vec![script_path.to_string_lossy()]);
+
+        let wrong_node = dir.join("other-node.exe");
+        std::fs::write(&wrong_node, "wrong node runtime\n").unwrap();
+        assert!(resolve_mise_mcp_command(Some(&compatible_runtime), Some(&shim_path), |command| match command {
+            "node" => Some(wrong_node.clone()),
+            "dbx-mcp-server" => Some(script_path.clone()),
+            _ => None,
+        })
+        .is_none());
+
+        let old_runtime = runtime_with_version_and_root(
+            node_path.to_string_lossy().as_ref(),
+            dir.join("old-npm-root").to_string_lossy().as_ref(),
+            None,
+            "v18.17.1",
+        );
+        assert!(resolve_mise_mcp_command(Some(&old_runtime), Some(&shim_path), |command| match command {
+            "node" => Some(node_path.clone()),
+            "dbx-mcp-server" => Some(script_path.clone()),
+            _ => None,
+        })
+        .is_none());
+
+        assert!(resolve_mise_mcp_command(Some(&compatible_runtime), Some(&shim_path), |_| None).is_none());
+        let unrelated_script = package_root.join("bin").join("other.js");
+        std::fs::write(&unrelated_script, "// not the declared entry\n").unwrap();
+        assert!(resolve_mise_mcp_command(Some(&compatible_runtime), Some(&shim_path), |command| match command {
+            "node" => Some(node_path.clone()),
+            "dbx-mcp-server" => Some(unrelated_script.clone()),
+            _ => None,
+        })
+        .is_none());
+
+        let ordinary_bin = dir.join("bin");
+        let ordinary_shim = ordinary_bin.join("dbx-mcp-server.exe");
+        std::fs::create_dir_all(&ordinary_bin).unwrap();
+        std::fs::write(&ordinary_shim, "ordinary native shim\n").unwrap();
+        let resolver_calls = Cell::new(0);
+        assert!(resolve_mise_mcp_command(Some(&compatible_runtime), Some(&ordinary_shim), |_| {
+            resolver_calls.set(resolver_calls.get() + 1);
+            None
+        })
+        .is_none());
+        assert_eq!(resolver_calls.get(), 0);
+
+        std::fs::write(
+            package_root.join("package.json"),
+            r#"{"name":"@dbx-app/mcp-server","version":"0.4.44","bin":{"dbx-mcp-server":"bin/dbx-mcp-server.js"},"engines":{"node":">=23.0.0"}}"#,
+        )
+        .unwrap();
+        assert!(resolve_mise_mcp_command(Some(&compatible_runtime), Some(&shim_path), |command| match command {
+            "node" => Some(node_path.clone()),
+            "dbx-mcp-server" => Some(script_path.clone()),
+            _ => None,
+        })
+        .is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn incompatible_runtime_does_not_fall_back_to_available_mcp_shim() {
         let incompatible = runtime_with_version_and_root(
             "/runtime/node-18",
@@ -1509,15 +1730,23 @@ mod tests {
         assert_eq!(probed.mcp_script_path, canonical_runtime_path(&script_path));
         assert_eq!(probed.mcp_version.as_deref(), Some("0.4.44"));
         assert_eq!(probed.update_command(), super::MCP_PNPM_UPDATE_COMMAND);
+        assert_eq!(probed.uninstall_command(), super::MCP_PNPM_UNINSTALL_COMMAND);
         assert!(matches!(
             probed.package_manager,
             super::McpPackageManager::Pnpm { ref command_path } if command_path == &pnpm_path
         ));
         let update_output = probed.install_or_update().unwrap();
         assert!(update_output.success);
-        let pnpm_log = std::fs::read_to_string(pnpm_log_path).unwrap();
+        let pnpm_log = std::fs::read_to_string(&pnpm_log_path).unwrap();
         assert!(pnpm_log.contains("ARGS=update -g @dbx-app/mcp-server\n"));
         assert!(!pnpm_log.contains("--registry"));
+        assert!(pnpm_log.contains(&format!("PNPM_HOME={}", dir.display())));
+        assert!(pnpm_log.contains(&format!("PATH={}", bin_dir.display())));
+
+        let uninstall_output = probed.uninstall().unwrap();
+        assert!(uninstall_output.success);
+        let pnpm_log = std::fs::read_to_string(&pnpm_log_path).unwrap();
+        assert!(pnpm_log.contains("ARGS=remove -g @dbx-app/mcp-server"));
         assert!(pnpm_log.contains(&format!("PNPM_HOME={}", dir.display())));
         assert!(pnpm_log.contains(&format!("PATH={}", bin_dir.display())));
 

@@ -272,7 +272,6 @@ jobs:
             ["linux-aarch64"]="linux/arm64"
             ["linux-x64"]="linux/amd64"
             ["windows-aarch64"]="windows/arm64"
-            ["windows-x64"]="windows/amd64"
           )
           for platform in "${!TARGETS[@]}"; do
             IFS=/ read -r goos goarch <<< "${TARGETS[$platform]}"
@@ -284,6 +283,20 @@ jobs:
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" -o "$output" .
           done
           ls -lh ../../../release-native
+      # Go 1.20 is the last release that supports Windows 7; keep other targets on Go 1.22.
+      - name: Set up Go for Windows 7-compatible RabbitMQ agent
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.20.14"
+          cache-dependency-path: agents/drivers/rabbitmq/go.sum
+      - name: Build Windows 7-compatible RabbitMQ agent
+        shell: bash
+        working-directory: agents/drivers/rabbitmq
+        run: |
+          output="../../../release-native/dbx-agent-rabbitmq-windows-x64.exe"
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "$output" .
+          go version -m "$output" | tee /tmp/rabbitmq-windows-x64-build-info.txt
+          grep -q ': go1\.20\.14$' /tmp/rabbitmq-windows-x64-build-info.txt
       - uses: actions/upload-artifact@v4
         with:
           name: rabbitmq-native
@@ -969,6 +982,11 @@ jobs:
         with:
           token: ${{ steps.release-token.outputs.token }}
           fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -1065,7 +1083,7 @@ jobs:
           native_only_label() {
             local name="$1"
             case "$name" in
-              kingbase) echo "人大金仓 KingbaseES" ;;
+              kingbase) echo "金仓KingbaseES" ;;
               vastbase) echo "Vastbase" ;;
               duckdb) echo "DuckDB" ;;
               xugu) echo "虚谷 XuguDB" ;;
@@ -1172,8 +1190,21 @@ jobs:
           echo "=== agent-registry.json ==="
           cat release/agent-registry.json
 
+      - name: Build managed JDBC offline payload
+        shell: bash
+        run: |
+          ./plugins/jdbc/package.sh
+          JDBC_VERSION="$(sed -nE "s/^version[[:space:]]*=[[:space:]]*'([^']+)'.*/\1/p" plugins/jdbc/build.gradle | head -n 1)"
+          node agents/scripts/build_offline_jdbc_payload.mjs \
+            release \
+            "plugins/jdbc/dist/dbx-jdbc-plugin-${JDBC_VERSION}.zip" \
+            "plugins/jdbc/dist/dbx-jdbc-plugin-${JDBC_VERSION}/bin/dbx-maven-resolver"
+
       - name: Build offline ZIP bundles
         run: bash agents/scripts/build_offline_zip.sh release
+
+      - name: Verify managed JDBC assets in all offline ZIPs
+        run: node agents/scripts/verify_offline_jdbc_release.mjs release
 
       - name: Build single-driver packages
         run: |
@@ -1204,7 +1235,7 @@ jobs:
           native_only_label() {
             local name="$1"
             case "$name" in
-              kingbase) echo "人大金仓 KingbaseES" ;;
+              kingbase) echo "金仓KingbaseES" ;;
               vastbase) echo "Vastbase" ;;
               duckdb) echo "DuckDB" ;;
               oracle) echo "Oracle" ;;

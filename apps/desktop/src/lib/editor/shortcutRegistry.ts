@@ -6,11 +6,14 @@ export type ShortcutActionId =
   | "formatSql"
   | "expandSelectStar"
   | "toggleLineComment"
+  | "toggleBlockComment"
   | "saveSql"
   | "acceptCompletion"
+  | "triggerCompletion"
   | "indentMore"
   | "indentLess"
   | "insertLineBelow"
+  | "joinLines"
   | "duplicateLine"
   | "deleteLine"
   | "moveLineUp"
@@ -25,8 +28,14 @@ export type ShortcutActionId =
   | "lowercaseSelection"
   | "exPasteSqlInCondition"
   | "toggleFold"
+  | "editTableStructure"
   | "copyCurrentRow"
   | "deleteCurrentRow"
+  | "goToColumn"
+  | "goToFirstPage"
+  | "goToPreviousPage"
+  | "goToNextPage"
+  | "goToLastPage"
   | "newQuery"
   | "openSettings"
   | "closeTab"
@@ -34,6 +43,9 @@ export type ShortcutActionId =
   | "focusSearch"
   | "focusTableWhere"
   | "quickOpen"
+  | "navigateTabHistoryBack"
+  | "navigateTabHistoryForward"
+  | "tabSwitcher"
   | "switchToPreviousTab"
   | "switchToNextTab"
   | "switchToTab1"
@@ -51,6 +63,7 @@ export type ShortcutActionId =
   | "find"
   | "replace"
   | "refreshData"
+  | "toggleResultsPane"
   | "toggleTranspose"
   | "cancelSearch"
   | "toggleSidebar"
@@ -85,8 +98,20 @@ export function closeOtherTabsDefaultShortcut(platform = globalThis.navigator?.p
   return isMacShortcutPlatform(platform) ? "Alt+Mod+W" : "Shift+Alt+W";
 }
 
-const CLOSE_OTHER_TABS_PLATFORM_DEFAULTS = new Set(["Alt+Mod+W", "Shift+Alt+W"]);
+export function tabNavigationHistoryDefaultShortcut(direction: "back" | "forward", platform = globalThis.navigator?.platform || ""): string {
+  const modifier = isMacShortcutPlatform(platform) ? "Ctrl" : "Mod";
+  const key = direction === "back" ? "ArrowLeft" : "ArrowRight";
+  return `${modifier}+Alt+${key}`;
+}
+
+const PLATFORM_DEFAULT_SHORTCUTS: Partial<Record<ShortcutActionId, ReadonlySet<string>>> = {
+  closeOtherTabs: new Set(["Alt+Mod+W", "Shift+Alt+W"]),
+  navigateTabHistoryBack: new Set(["Ctrl+Alt+ArrowLeft", "Mod+Alt+ArrowLeft"]),
+  navigateTabHistoryForward: new Set(["Ctrl+Alt+ArrowRight", "Mod+Alt+ArrowRight"]),
+};
 const LEGACY_CLOSE_TAB_DEFAULT = "Meta+W";
+const LEGACY_COPY_CURRENT_ROW_DEFAULT = "Mod+D";
+const TAB_NAVIGATION_HISTORY_ACTIONS: ShortcutActionId[] = ["navigateTabHistoryBack", "navigateTabHistoryForward"];
 
 export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
   {
@@ -120,6 +145,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Mod+/",
   },
   {
+    id: "toggleBlockComment",
+    labelKey: "settings.shortcutToggleBlockComment",
+    scope: "editor",
+    defaultShortcut: "Shift+Alt+A",
+  },
+  {
     id: "saveSql",
     labelKey: "settings.shortcutSaveSql",
     scope: "editor",
@@ -130,6 +161,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutAcceptCompletion",
     scope: "editor",
     defaultShortcut: "Tab",
+  },
+  {
+    id: "triggerCompletion",
+    labelKey: "settings.shortcutTriggerCompletion",
+    scope: "editor",
+    defaultShortcut: "Alt+/",
   },
   {
     id: "indentMore",
@@ -148,6 +185,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutInsertLineBelow",
     scope: "editor",
     defaultShortcut: "Shift+Enter",
+  },
+  {
+    id: "joinLines",
+    labelKey: "settings.shortcutJoinLines",
+    scope: "editor",
+    defaultShortcut: "Mod+J",
   },
   {
     id: "duplicateLine",
@@ -234,16 +277,52 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Mod+.",
   },
   {
+    id: "editTableStructure",
+    labelKey: "settings.shortcutEditTableStructure",
+    scope: "grid",
+    defaultShortcut: "Mod+D",
+  },
+  {
     id: "copyCurrentRow",
     labelKey: "settings.shortcutCopyCurrentRow",
     scope: "grid",
-    defaultShortcut: "Mod+D",
+    defaultShortcut: "",
   },
   {
     id: "deleteCurrentRow",
     labelKey: "settings.shortcutDeleteCurrentRow",
     scope: "grid",
     defaultShortcut: "Delete",
+  },
+  {
+    id: "goToColumn",
+    labelKey: "settings.shortcutGoToColumn",
+    scope: "grid",
+    defaultShortcut: "",
+  },
+  {
+    id: "goToFirstPage",
+    labelKey: "settings.shortcutGoToFirstPage",
+    scope: "grid",
+    defaultShortcut: "",
+  },
+  {
+    id: "goToPreviousPage",
+    labelKey: "settings.shortcutGoToPreviousPage",
+    scope: "grid",
+    defaultShortcut: "",
+  },
+  {
+    id: "goToNextPage",
+    labelKey: "settings.shortcutGoToNextPage",
+    scope: "grid",
+    defaultShortcut: "",
+  },
+  {
+    id: "goToLastPage",
+    labelKey: "settings.shortcutGoToLastPage",
+    scope: "grid",
+    defaultShortcut: "",
   },
   {
     id: "newQuery",
@@ -286,6 +365,24 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutQuickOpen",
     scope: "global",
     defaultShortcut: "Mod+P",
+  },
+  {
+    id: "navigateTabHistoryBack",
+    labelKey: "settings.shortcutNavigateTabHistoryBack",
+    scope: "global",
+    defaultShortcut: tabNavigationHistoryDefaultShortcut("back"),
+  },
+  {
+    id: "navigateTabHistoryForward",
+    labelKey: "settings.shortcutNavigateTabHistoryForward",
+    scope: "global",
+    defaultShortcut: tabNavigationHistoryDefaultShortcut("forward"),
+  },
+  {
+    id: "tabSwitcher",
+    labelKey: "settings.shortcutTabSwitcher",
+    scope: "global",
+    defaultShortcut: "Ctrl+Tab",
   },
   {
     id: "switchToPreviousTab",
@@ -390,6 +487,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "F5",
   },
   {
+    id: "toggleResultsPane",
+    labelKey: "settings.shortcutToggleResultsPane",
+    scope: "global",
+    defaultShortcut: "",
+  },
+  {
     id: "toggleTranspose",
     labelKey: "settings.shortcutToggleTranspose",
     scope: "grid",
@@ -462,16 +565,36 @@ export function normalizeModifierOnlyShortcut(shortcut: string, fallback = ""): 
   return modifierOnlyShortcuts.has(normalized) ? normalized : fallback;
 }
 
-export function normalizeShortcutSettings(settings?: Partial<ShortcutSettings>): ShortcutSettings {
-  return Object.fromEntries(
+function hasExplicitShortcut(settings: Partial<ShortcutSettings> | undefined, actionId: ShortcutActionId): boolean {
+  return !!settings && Object.prototype.hasOwnProperty.call(settings, actionId) && typeof settings[actionId] === "string";
+}
+
+function shortcutsUseSameKeys(first: string, second: string, platform = globalThis.navigator?.platform || ""): boolean {
+  return !!first && !!second && formatShortcut(first, platform).toLowerCase() === formatShortcut(second, platform).toLowerCase();
+}
+
+function shortcutDefaultForPlatform(definition: ShortcutDefinition, platform: string): string {
+  if (definition.id === "closeOtherTabs") return closeOtherTabsDefaultShortcut(platform);
+  if (definition.id === "navigateTabHistoryBack") return tabNavigationHistoryDefaultShortcut("back", platform);
+  if (definition.id === "navigateTabHistoryForward") return tabNavigationHistoryDefaultShortcut("forward", platform);
+  return definition.defaultShortcut;
+}
+
+export function needsTabNavigationHistoryShortcutMigration(settings?: Partial<ShortcutSettings>): boolean {
+  return !!settings && TAB_NAVIGATION_HISTORY_ACTIONS.some((actionId) => !hasExplicitShortcut(settings, actionId));
+}
+
+export function normalizeShortcutSettings(settings?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): ShortcutSettings {
+  const normalized = Object.fromEntries(
     SHORTCUT_DEFINITIONS.map((definition) => {
       const configuredValue = settings?.[definition.id];
-      let configured = typeof configuredValue === "string" ? configuredValue : definition.defaultShortcut;
-      // 云同步会把另一平台的默认值当作显式配置带过来（macOS 的 Alt+Mod+W 到
-      // Windows 上会还原成 Ctrl+Alt+W）。凡是平台默认集合内的值都视为"未
-      // 自定义"，按本机平台重新解析；用户真正自定义的其他组合原样保留
-      if (definition.id === "closeOtherTabs" && CLOSE_OTHER_TABS_PLATFORM_DEFAULTS.has(configured)) {
-        configured = definition.defaultShortcut;
+      const platformDefault = shortcutDefaultForPlatform(definition, platform);
+      let configured = typeof configuredValue === "string" ? configuredValue : platformDefault;
+      // 云同步会把另一平台的默认值当作显式配置带过来。平台默认集合内的值视为
+      // 未自定义，按本机平台重新解析；用户真正自定义的其他组合原样保留
+      const platformDefaults = PLATFORM_DEFAULT_SHORTCUTS[definition.id];
+      if (platformDefaults?.has(configured)) {
+        configured = platformDefault;
       }
       // Meta+W was the old macOS-only default. Treat that exact value as a
       // legacy default so existing Windows/Linux settings adopt Ctrl+W.
@@ -490,6 +613,22 @@ export function normalizeShortcutSettings(settings?: Partial<ShortcutSettings>):
       return [definition.id, normalized];
     }),
   ) as ShortcutSettings;
+
+  if (!hasExplicitShortcut(settings, "editTableStructure") && settings?.copyCurrentRow === LEGACY_COPY_CURRENT_ROW_DEFAULT) {
+    normalized.editTableStructure = LEGACY_COPY_CURRENT_ROW_DEFAULT;
+    normalized.copyCurrentRow = "";
+  }
+
+  for (const actionId of TAB_NAVIGATION_HISTORY_ACTIONS) {
+    if (hasExplicitShortcut(settings, actionId)) continue;
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === actionId);
+    if (!definition) continue;
+    const defaultShortcut = normalized[actionId];
+    const occupiedByExistingAction = SHORTCUT_DEFINITIONS.some((item) => item.id !== actionId && item.scope === definition.scope && hasExplicitShortcut(settings, item.id) && shortcutsUseSameKeys(normalized[item.id], defaultShortcut, platform));
+    if (occupiedByExistingAction) normalized[actionId] = "";
+  }
+
+  return normalized;
 }
 
 export function shortcutToCodeMirrorKey(shortcut: string): string {
@@ -515,11 +654,11 @@ export function formatShortcut(shortcut: string, platform = globalThis.navigator
     .join("+");
 }
 
-export function findShortcutConflict(actionId: ShortcutActionId, shortcut: string, shortcuts: ShortcutSettings): ShortcutActionId | null {
+export function findShortcutConflict(actionId: ShortcutActionId, shortcut: string, shortcuts: ShortcutSettings, platform = globalThis.navigator?.platform || ""): ShortcutActionId | null {
   if (!shortcut) return null;
   const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === actionId);
   if (!definition) return null;
 
-  const conflict = SHORTCUT_DEFINITIONS.find((item) => item.id !== actionId && item.scope === definition.scope && shortcuts[item.id] === shortcut);
+  const conflict = SHORTCUT_DEFINITIONS.find((item) => item.id !== actionId && item.scope === definition.scope && shortcutsUseSameKeys(shortcuts[item.id], shortcut, platform));
   return conflict?.id ?? null;
 }

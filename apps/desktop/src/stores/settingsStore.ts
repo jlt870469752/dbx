@@ -7,10 +7,12 @@ import { setDebugLoggingEnabled } from "@/lib/backend/debugLog";
 import { safeLocalStorageGet, safeLocalStorageRemove } from "@/lib/backend/safeStorage";
 import { type ColumnFormatterConfig, type CustomColumnFormatterConfig, normalizeColumnFormatter, normalizeCustomColumnFormatter, normalizeGlobalDateTimePattern } from "@/lib/dataGrid/columnFormatter";
 import { type DataGridCopyPreference, type DataGridExtractorOptions, DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS, normalizeDataGridCopyPreference, normalizeDataGridExtractorOptions } from "@/lib/dataGrid/dataGridCopyExtractor";
+import { DATA_GRID_TEXT_FILTER_PANEL_HEIGHT_DEFAULT, normalizeDataGridTextFilterPanelHeight } from "@/lib/dataGrid/dataGridTextFilterPanel";
+import { DATA_GRID_TYPE_COLOR_SCHEME_AUTO_ID, type DataGridTypeColorScheme, normalizeActiveDataGridTypeColorSchemeId, normalizeDataGridTypeColorSchemes } from "@/lib/dataGrid/dataGridTypeColorScheme";
 import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
 import { DEFAULT_QUERY_RESULT_MAX_ROWS, normalizeQueryResultMaxRows } from "@/lib/dataGrid/queryResultRowLimit";
 import { normalizeConnectTimeoutSecs, normalizeQueryTimeoutSecs } from "@/lib/connection/timeoutLimits";
-import { normalizeShortcutSettings, type ShortcutSettings } from "@/lib/editor/shortcutRegistry";
+import { needsTabNavigationHistoryShortcutMigration, normalizeShortcutSettings, type ShortcutSettings } from "@/lib/editor/shortcutRegistry";
 import type { SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTarget";
 import type { ConnectionListSortMode } from "@/lib/sidebar/connectionListSort";
 import { normalizeSidebarHiddenTablePrefixes } from "@/lib/sidebar/sidebarTableNameDisplay";
@@ -21,6 +23,7 @@ import { normalizeSqlVariableSyntaxOverrides, type SqlVariableSyntaxOverrides } 
 import { DEFAULT_TABLE_COLUMN_TEMPLATE_FIELDS, normalizeTableColumnTemplateFields } from "@/lib/table/tableColumnTemplates";
 import { type DataTabReuseMode, DEFAULT_DATA_TAB_REUSE_MODE, normalizeDataTabReuseMode } from "@/lib/tabs/dataTabReuseMode";
 import { normalizeCompletionTriggerMode, type SqlCompletionTriggerMode } from "@/lib/sql/sqlCompletionTriggerPolicy";
+import { configureMetadataRuntimeCache, METADATA_CACHE_DEFAULT_MEMORY_MB, normalizeMetadataCacheMemoryMb } from "@/lib/metadata/metadataRuntimeCache";
 import type { AiApiStyle, AiAssistantMode, AiAuthMethod, AiChatSelectionState, AiConfig, AiConfigItem, AiConfiguredModel, AiEffortLevel, AiEffortSelection, AiModelEffortPreference, AiProvider, AiReasoningLevel, AiTestConnectionResult } from "@/types/ai";
 import type { SqlSnippet, TableInfoTab } from "@/types/database";
 
@@ -32,6 +35,7 @@ export interface DesktopSettings {
   quit_on_close: boolean;
   close_action_prompted: boolean;
   debug_logging_enabled: boolean;
+  metadata_cache_max_memory_mb: number;
   duckdb_worker_process_isolation: boolean;
   duckdb_worker_max_processes: number;
   saved_sql_sync_dir?: string | null;
@@ -55,6 +59,7 @@ export type InterfaceLayout = "separated" | "classic";
 export type UpdateDownloadSource = "official" | "cnb";
 export type SqlSemanticDiagnosticsMode = "auto" | "enabled" | "disabled";
 export type OpenTabsRestoreMode = "all" | "pinned" | "none";
+export type AppCloseUnsavedTabsMode = "prompt" | "keep-drafts";
 
 export const DEFAULT_SIDEBAR_TABLE_PAGE_SIZE = 1000;
 export const DUCKDB_WORKER_MAX_PROCESSES_MIN = 1;
@@ -68,6 +73,7 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   quit_on_close: false,
   close_action_prompted: false,
   debug_logging_enabled: false,
+  metadata_cache_max_memory_mb: METADATA_CACHE_DEFAULT_MEMORY_MB,
   duckdb_worker_process_isolation: false,
   duckdb_worker_max_processes: DUCKDB_WORKER_MAX_PROCESSES_DEFAULT,
   saved_sql_sync_dir: null,
@@ -103,6 +109,7 @@ export function normalizeDesktopSettings(settings: Partial<DesktopSettings> | nu
     quit_on_close: settings?.quit_on_close ?? DEFAULT_DESKTOP_SETTINGS.quit_on_close,
     close_action_prompted: settings?.close_action_prompted ?? DEFAULT_DESKTOP_SETTINGS.close_action_prompted,
     debug_logging_enabled: settings?.debug_logging_enabled ?? DEFAULT_DESKTOP_SETTINGS.debug_logging_enabled,
+    metadata_cache_max_memory_mb: normalizeMetadataCacheMemoryMb(settings?.metadata_cache_max_memory_mb),
     duckdb_worker_process_isolation: settings?.duckdb_worker_process_isolation ?? DEFAULT_DESKTOP_SETTINGS.duckdb_worker_process_isolation,
     duckdb_worker_max_processes: normalizeDuckDbWorkerMaxProcesses(settings?.duckdb_worker_max_processes),
     saved_sql_sync_dir: settings?.saved_sql_sync_dir?.trim() || DEFAULT_DESKTOP_SETTINGS.saved_sql_sync_dir,
@@ -413,11 +420,18 @@ const DATA_GRID_RENDER_MODES = ["dom", "canvas"] as const;
 export type DataGridRenderMode = (typeof DATA_GRID_RENDER_MODES)[number];
 const DATA_GRID_SEARCH_MODES = ["filter", "highlight"] as const;
 export type DataGridSearchMode = (typeof DATA_GRID_SEARCH_MODES)[number];
+export type DataGridFilterEditorView = "quick" | "conditions" | "text";
 const RESULT_RUN_DISPLAY_MODES = ["tabs", "list"] as const;
 export type ResultRunDisplayMode = (typeof RESULT_RUN_DISPLAY_MODES)[number];
 export const TABLE_FONT_SIZE_MIN = 8;
 export const TABLE_FONT_SIZE_MAX = 16;
 export const TABLE_FONT_SIZE_DEFAULT = 13;
+export const SIDEBAR_FONT_SIZE_MIN = 9;
+export const SIDEBAR_FONT_SIZE_MAX = 24;
+export const SIDEBAR_FONT_SIZE_DEFAULT = 14;
+export const SIDEBAR_INDENT_MIN = 4;
+export const SIDEBAR_INDENT_MAX = 32;
+export const SIDEBAR_INDENT_DEFAULT = 16;
 const DISCONNECT_TAB_HANDLING_MODES = ["close-tabs", "keep-tabs-clear-results", "keep-tabs-keep-results"] as const;
 export type DisconnectTabHandlingMode = (typeof DISCONNECT_TAB_HANDLING_MODES)[number];
 
@@ -511,6 +525,7 @@ export interface EditorSettings {
   timeoutInheritanceMigrationVersion: number;
   showExecutionTargetPicker: boolean;
   showStatementRunButtons: boolean;
+  showLineNumbers: boolean;
   showCurrentStatementFrame: boolean;
   showInsertValueHints: boolean;
   autoAliasTables: boolean;
@@ -524,6 +539,7 @@ export interface EditorSettings {
   sqlSemanticDiagnosticsEnabled: boolean;
   confirmDangerousSqlExecution: boolean;
   confirmUnsavedSqlClose: boolean;
+  appCloseUnsavedTabsMode: AppCloseUnsavedTabsMode;
   savedSqlOpenTargetMode: SavedSqlOpenTargetMode;
   compactTabTitle: boolean;
   tabLayout: TabLayoutMode;
@@ -543,16 +559,21 @@ export interface EditorSettings {
   showColumnTypesInHeader: boolean;
   dataGridShowTransposeFieldMetadata: boolean;
   colorizeDataGridCellTypes: boolean;
+  dataGridTypeColorSchemes: DataGridTypeColorScheme[];
+  activeDataGridTypeColorSchemeId: string;
   showIndexIndicatorsInHeader: boolean;
   compactColumnHeaderActions: boolean;
   columnWidthDensity: ColumnWidthDensity;
   dataGridQuickEntry: boolean;
+  dataGridFilterEditorView: DataGridFilterEditorView;
+  dataGridTextFilterPanelHeight: number;
   dataGridRenderMode: DataGridRenderMode;
   dataGridSearchMode: DataGridSearchMode;
   dataGridCopyExtractor: DataGridCopyPreference;
   dataGridExtractorOptions: DataGridExtractorOptions;
   resultRunDisplayMode: ResultRunDisplayMode;
   dataGridAutoTransposeSingleRow: boolean;
+  dataGridCellDetailButtonVisible: boolean;
   dataGridMultiRowTranspose: boolean;
   dataGridHideNullColumns: boolean;
   dataGridBooleanDisplayMode: "dropdown" | "checkbox";
@@ -580,12 +601,16 @@ export interface EditorSettings {
   openTabsRestoreMode: OpenTabsRestoreMode;
   disconnectTabHandlingMode: DisconnectTabHandlingMode;
   dataTabReuseMode: DataTabReuseMode;
+  openDataTabsNextToActive: boolean;
   prefillNewQueryWithSelect: boolean;
+  generateSqlIncludeDatabaseName: boolean;
   updateNotificationsEnabled: boolean;
   sidebarHiddenTablePrefixes: string[];
   sidebarObjectInfoMode: SidebarObjectInfoMode;
   sidebarShowConnectionNotes: boolean;
   sidebarAllowHorizontalScroll: boolean;
+  sidebarIndent: number;
+  sidebarFontSize: number;
   columnFormatters: Record<string, ColumnFormatterConfig>;
   customColumnFormatters: Record<string, CustomColumnFormatterConfig>;
   globalDateTimeDisplayFormat: string;
@@ -602,6 +627,7 @@ export interface EditorSettings {
   toolbarItems: ToolbarItems;
   objectBrowserShowCheckbox: boolean;
   objectBrowserViewMode: "list" | "grid";
+  sqlVariableSubstitutionEnabled: boolean;
   sqlVariableSyntaxOverrides: SqlVariableSyntaxOverrides;
   continueOnErrorOnBatch: boolean;
   clickTableNavigationTarget: ClickTableNavigationTarget;
@@ -709,6 +735,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   timeoutInheritanceMigrationVersion: 2,
   showExecutionTargetPicker: false,
   showStatementRunButtons: true,
+  showLineNumbers: true,
   showCurrentStatementFrame: true,
   showInsertValueHints: true,
   autoAliasTables: true,
@@ -722,6 +749,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   sqlSemanticDiagnosticsEnabled: SQL_SEMANTIC_DIAGNOSTICS_AUTO_ENABLED,
   confirmDangerousSqlExecution: true,
   confirmUnsavedSqlClose: true,
+  appCloseUnsavedTabsMode: "prompt",
   savedSqlOpenTargetMode: "saved",
   compactTabTitle: false,
   tabLayout: "scroll",
@@ -740,16 +768,21 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   showColumnTypesInHeader: true,
   dataGridShowTransposeFieldMetadata: false,
   colorizeDataGridCellTypes: false,
+  dataGridTypeColorSchemes: [],
+  activeDataGridTypeColorSchemeId: DATA_GRID_TYPE_COLOR_SCHEME_AUTO_ID,
   showIndexIndicatorsInHeader: true,
   compactColumnHeaderActions: true,
   columnWidthDensity: "standard",
   dataGridQuickEntry: false,
+  dataGridFilterEditorView: "quick",
+  dataGridTextFilterPanelHeight: DATA_GRID_TEXT_FILTER_PANEL_HEIGHT_DEFAULT,
   dataGridRenderMode: "canvas",
   dataGridSearchMode: "filter",
   dataGridCopyExtractor: "smart",
   dataGridExtractorOptions: normalizeDataGridExtractorOptions(DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS),
   resultRunDisplayMode: "tabs",
   dataGridAutoTransposeSingleRow: false,
+  dataGridCellDetailButtonVisible: true,
   dataGridMultiRowTranspose: false,
   dataGridHideNullColumns: false,
   dataGridBooleanDisplayMode: "dropdown",
@@ -777,12 +810,16 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   openTabsRestoreMode: "all",
   disconnectTabHandlingMode: "close-tabs",
   dataTabReuseMode: DEFAULT_DATA_TAB_REUSE_MODE,
+  openDataTabsNextToActive: false,
   prefillNewQueryWithSelect: true,
+  generateSqlIncludeDatabaseName: false,
   updateNotificationsEnabled: true,
   sidebarHiddenTablePrefixes: [],
   sidebarObjectInfoMode: "comment-inline",
   sidebarShowConnectionNotes: false,
   sidebarAllowHorizontalScroll: false,
+  sidebarIndent: SIDEBAR_INDENT_DEFAULT,
+  sidebarFontSize: SIDEBAR_FONT_SIZE_DEFAULT,
   columnFormatters: {},
   customColumnFormatters: {},
   globalDateTimeDisplayFormat: "",
@@ -799,6 +836,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   toolbarItems: { ...DEFAULT_TOOLBAR_ITEMS },
   objectBrowserShowCheckbox: false,
   objectBrowserViewMode: "list",
+  sqlVariableSubstitutionEnabled: true,
   sqlVariableSyntaxOverrides: {},
   continueOnErrorOnBatch: false,
   clickTableNavigationTarget: "data",
@@ -859,6 +897,10 @@ function normalizeDataGridSearchMode(value: unknown): DataGridSearchMode {
   return DATA_GRID_SEARCH_MODES.includes(value as DataGridSearchMode) ? (value as DataGridSearchMode) : DEFAULT_EDITOR_SETTINGS.dataGridSearchMode;
 }
 
+function normalizeDataGridFilterEditorView(value: unknown): DataGridFilterEditorView {
+  return value === "conditions" || value === "text" ? value : DEFAULT_EDITOR_SETTINGS.dataGridFilterEditorView;
+}
+
 function normalizeResultRunDisplayMode(value: unknown): ResultRunDisplayMode {
   return RESULT_RUN_DISPLAY_MODES.includes(value as ResultRunDisplayMode) ? (value as ResultRunDisplayMode) : DEFAULT_EDITOR_SETTINGS.resultRunDisplayMode;
 }
@@ -866,6 +908,16 @@ function normalizeResultRunDisplayMode(value: unknown): ResultRunDisplayMode {
 function normalizeTableFontSize(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return TABLE_FONT_SIZE_DEFAULT;
   return Math.min(TABLE_FONT_SIZE_MAX, Math.max(TABLE_FONT_SIZE_MIN, Math.round(value)));
+}
+
+function normalizeSidebarFontSize(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return SIDEBAR_FONT_SIZE_DEFAULT;
+  return Math.min(SIDEBAR_FONT_SIZE_MAX, Math.max(SIDEBAR_FONT_SIZE_MIN, Math.round(value)));
+}
+
+function normalizeSidebarIndent(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return SIDEBAR_INDENT_DEFAULT;
+  return Math.min(SIDEBAR_INDENT_MAX, Math.max(SIDEBAR_INDENT_MIN, Math.round(value)));
 }
 
 function normalizeUpdateDownloadSource(value: unknown): UpdateDownloadSource {
@@ -906,6 +958,10 @@ function normalizeOpenTabsRestoreMode(value: unknown, legacyRestoreOpenTabsOnLau
   if (value === "all" || value === "pinned" || value === "none") return value;
   if (typeof legacyRestoreOpenTabsOnLaunch === "boolean") return legacyRestoreOpenTabsOnLaunch ? "all" : "none";
   return DEFAULT_EDITOR_SETTINGS.openTabsRestoreMode;
+}
+
+function normalizeAppCloseUnsavedTabsMode(value: unknown): AppCloseUnsavedTabsMode {
+  return value === "prompt" || value === "keep-drafts" ? value : DEFAULT_EDITOR_SETTINGS.appCloseUnsavedTabsMode;
 }
 
 function normalizeConnectionListSortMode(value: unknown): ConnectionListSortMode {
@@ -985,7 +1041,7 @@ function normalizeToolbarItems(items: Partial<ToolbarItems> | undefined): Toolba
   };
 }
 
-const TABLE_INFO_TABS = new Set<TableInfoTab>(["ddl", "columns", "indexes", "foreignKeys", "triggers"]);
+const TABLE_INFO_TABS = new Set<TableInfoTab>(["ddl", "columns", "indexes", "foreignKeys", "constraints", "triggers"]);
 
 function normalizeTableInfoTab(value: unknown): TableInfoTab {
   return typeof value === "string" && TABLE_INFO_TABS.has(value as TableInfoTab) ? (value as TableInfoTab) : DEFAULT_EDITOR_SETTINGS.tableInfoActiveTab;
@@ -997,6 +1053,8 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
   const savedExecuteModeDefaultVersion = settings.executeModeDefaultVersion;
   const executeModeDefaultVersion = typeof savedExecuteModeDefaultVersion === "number" && savedExecuteModeDefaultVersion >= EXECUTE_MODE_CURRENT_DEFAULT_VERSION ? savedExecuteModeDefaultVersion : EXECUTE_MODE_CURRENT_DEFAULT_VERSION;
   const hasCurrentExecuteModeDefault = executeModeDefaultVersion === savedExecuteModeDefaultVersion;
+  // The active id can only be validated once the scheme list it points into is known.
+  const dataGridTypeColorSchemes = normalizeDataGridTypeColorSchemes(settings.dataGridTypeColorSchemes);
   return {
     fontFamily: normalizeFontFamily(settings.fontFamily, DEFAULT_EDITOR_SETTINGS.fontFamily),
     fontSize: settings.fontSize ?? DEFAULT_EDITOR_SETTINGS.fontSize,
@@ -1051,6 +1109,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
           : 0,
     showExecutionTargetPicker: settings.showExecutionTargetPicker ?? DEFAULT_EDITOR_SETTINGS.showExecutionTargetPicker,
     showStatementRunButtons: typeof settings.showStatementRunButtons === "boolean" ? settings.showStatementRunButtons : DEFAULT_EDITOR_SETTINGS.showStatementRunButtons,
+    showLineNumbers: typeof settings.showLineNumbers === "boolean" ? settings.showLineNumbers : DEFAULT_EDITOR_SETTINGS.showLineNumbers,
     showCurrentStatementFrame: typeof settings.showCurrentStatementFrame === "boolean" ? settings.showCurrentStatementFrame : DEFAULT_EDITOR_SETTINGS.showCurrentStatementFrame,
     showInsertValueHints: typeof settings.showInsertValueHints === "boolean" ? settings.showInsertValueHints : DEFAULT_EDITOR_SETTINGS.showInsertValueHints,
     autoAliasTables: settings.autoAliasTables ?? DEFAULT_EDITOR_SETTINGS.autoAliasTables,
@@ -1064,6 +1123,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     sqlSemanticDiagnosticsEnabled: sqlSemanticDiagnosticsEnabledForMode(sqlSemanticDiagnosticsMode),
     confirmDangerousSqlExecution: settings.confirmDangerousSqlExecution ?? DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution,
     confirmUnsavedSqlClose: settings.confirmUnsavedSqlClose ?? DEFAULT_EDITOR_SETTINGS.confirmUnsavedSqlClose,
+    appCloseUnsavedTabsMode: normalizeAppCloseUnsavedTabsMode(settings.appCloseUnsavedTabsMode),
     savedSqlOpenTargetMode: settings.savedSqlOpenTargetMode === "current" ? "current" : DEFAULT_EDITOR_SETTINGS.savedSqlOpenTargetMode,
     compactTabTitle: settings.compactTabTitle ?? DEFAULT_EDITOR_SETTINGS.compactTabTitle,
     tabLayout: normalizeTabLayout(settings.tabLayout),
@@ -1082,16 +1142,21 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     showColumnTypesInHeader: settings.showColumnTypesInHeader ?? DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader,
     dataGridShowTransposeFieldMetadata: settings.dataGridShowTransposeFieldMetadata === true,
     colorizeDataGridCellTypes: settings.colorizeDataGridCellTypes ?? DEFAULT_EDITOR_SETTINGS.colorizeDataGridCellTypes,
+    dataGridTypeColorSchemes,
+    activeDataGridTypeColorSchemeId: normalizeActiveDataGridTypeColorSchemeId(dataGridTypeColorSchemes, settings.activeDataGridTypeColorSchemeId),
     showIndexIndicatorsInHeader: settings.showIndexIndicatorsInHeader ?? DEFAULT_EDITOR_SETTINGS.showIndexIndicatorsInHeader,
     compactColumnHeaderActions: settings.compactColumnHeaderActions ?? DEFAULT_EDITOR_SETTINGS.compactColumnHeaderActions,
     columnWidthDensity: normalizeColumnWidthDensity(settings.columnWidthDensity),
     dataGridQuickEntry: settings.dataGridQuickEntry ?? DEFAULT_EDITOR_SETTINGS.dataGridQuickEntry,
+    dataGridFilterEditorView: normalizeDataGridFilterEditorView(settings.dataGridFilterEditorView),
+    dataGridTextFilterPanelHeight: normalizeDataGridTextFilterPanelHeight(settings.dataGridTextFilterPanelHeight),
     dataGridRenderMode: normalizeDataGridRenderMode(settings.dataGridRenderMode),
     dataGridSearchMode: normalizeDataGridSearchMode(settings.dataGridSearchMode),
     dataGridCopyExtractor: normalizeDataGridCopyPreference(settings.dataGridCopyExtractor),
     dataGridExtractorOptions: normalizeDataGridExtractorOptions(settings.dataGridExtractorOptions),
     resultRunDisplayMode: normalizeResultRunDisplayMode(settings.resultRunDisplayMode),
     dataGridAutoTransposeSingleRow: settings.dataGridAutoTransposeSingleRow === true,
+    dataGridCellDetailButtonVisible: typeof settings.dataGridCellDetailButtonVisible === "boolean" ? settings.dataGridCellDetailButtonVisible : DEFAULT_EDITOR_SETTINGS.dataGridCellDetailButtonVisible,
     dataGridMultiRowTranspose: settings.dataGridMultiRowTranspose === true,
     dataGridHideNullColumns: settings.dataGridHideNullColumns === true,
     dataGridBooleanDisplayMode: settings.dataGridBooleanDisplayMode === "checkbox" ? "checkbox" : "dropdown",
@@ -1140,7 +1205,9 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
         }
       ).reuseDataTab,
     ),
+    openDataTabsNextToActive: typeof settings.openDataTabsNextToActive === "boolean" ? settings.openDataTabsNextToActive : DEFAULT_EDITOR_SETTINGS.openDataTabsNextToActive,
     prefillNewQueryWithSelect: typeof settings.prefillNewQueryWithSelect === "boolean" ? settings.prefillNewQueryWithSelect : DEFAULT_EDITOR_SETTINGS.prefillNewQueryWithSelect,
+    generateSqlIncludeDatabaseName: settings.generateSqlIncludeDatabaseName === true,
     updateNotificationsEnabled: settings.updateNotificationsEnabled ?? DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled,
     sidebarHiddenTablePrefixes: normalizeSidebarHiddenTablePrefixes(settings.sidebarHiddenTablePrefixes),
     sidebarObjectInfoMode: normalizeSidebarObjectInfoMode(
@@ -1163,6 +1230,8 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     ),
     sidebarShowConnectionNotes: settings.sidebarShowConnectionNotes === true,
     sidebarAllowHorizontalScroll: settings.sidebarAllowHorizontalScroll ?? DEFAULT_EDITOR_SETTINGS.sidebarAllowHorizontalScroll,
+    sidebarIndent: normalizeSidebarIndent(settings.sidebarIndent),
+    sidebarFontSize: normalizeSidebarFontSize(settings.sidebarFontSize),
     columnFormatters: normalizeColumnFormatters(settings.columnFormatters),
     customColumnFormatters: normalizeCustomColumnFormatters(settings.customColumnFormatters),
     globalDateTimeDisplayFormat: normalizeGlobalDateTimePattern(settings.globalDateTimeDisplayFormat),
@@ -1179,6 +1248,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     toolbarItems: normalizeToolbarItems(settings.toolbarItems),
     objectBrowserShowCheckbox: typeof settings.objectBrowserShowCheckbox === "boolean" ? settings.objectBrowserShowCheckbox : DEFAULT_EDITOR_SETTINGS.objectBrowserShowCheckbox,
     objectBrowserViewMode: settings.objectBrowserViewMode === "grid" ? "grid" : DEFAULT_EDITOR_SETTINGS.objectBrowserViewMode,
+    sqlVariableSubstitutionEnabled: typeof settings.sqlVariableSubstitutionEnabled === "boolean" ? settings.sqlVariableSubstitutionEnabled : DEFAULT_EDITOR_SETTINGS.sqlVariableSubstitutionEnabled,
     sqlVariableSyntaxOverrides: normalizeSqlVariableSyntaxOverrides(settings.sqlVariableSyntaxOverrides),
     continueOnErrorOnBatch: settings.continueOnErrorOnBatch === true,
     clickTableNavigationTarget: normalizeClickTableNavigationTarget(settings.clickTableNavigationTarget),
@@ -1243,23 +1313,34 @@ export const useSettingsStore = defineStore("settings", () => {
   const isEditorSettingsLoaded = ref(false);
   let initEditorSettingsPromise: Promise<void> | null = null;
   let pendingEditorSettingsPatches: Partial<EditorSettings>[] = [];
-  let editorSettingsSaveQueue: Promise<void> | null = null;
-  let editorSettingsAtomicUpdateQueue: Promise<void> = Promise.resolve();
+  let editorSettingsOperationQueue: Promise<void> | null = null;
   let editorSettingsPatchRevision = 0;
   const editorSettingsFieldRevisions = new Map<keyof EditorSettings, number>();
+  const customColumnFormatterDeleteVersions = new Map<string, number>();
   let pendingAiChatSelection: AiChatSelectionState | null = null;
   let aiChatSelectionSaveRunning = false;
 
   const editorSettings = ref<EditorSettings>(normalizeEditorSettings({}));
 
-  function enqueueEditorSettingsSave(): Promise<void> {
-    const saveCurrentSettings = () => api.saveEditorSettings(editorSettingsSnapshot(editorSettings.value));
-    const save = editorSettingsSaveQueue ? editorSettingsSaveQueue.catch(() => {}).then(saveCurrentSettings) : saveCurrentSettings();
-    const trackedSave = save.finally(() => {
-      if (editorSettingsSaveQueue === trackedSave) editorSettingsSaveQueue = null;
+  function enqueueEditorSettingsOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const queuedOperation = editorSettingsOperationQueue ? editorSettingsOperationQueue.then(operation) : operation();
+    const trackedOperation = queuedOperation.then(
+      () => undefined,
+      () => undefined,
+    );
+    editorSettingsOperationQueue = trackedOperation;
+    void trackedOperation.finally(() => {
+      if (editorSettingsOperationQueue === trackedOperation) editorSettingsOperationQueue = null;
     });
-    editorSettingsSaveQueue = trackedSave;
-    return trackedSave;
+    return queuedOperation;
+  }
+
+  function persistCurrentEditorSettings(): Promise<void> {
+    return api.saveEditorSettings(editorSettingsSnapshot(editorSettings.value));
+  }
+
+  function enqueueEditorSettingsSave(): Promise<void> {
+    return enqueueEditorSettingsOperation(persistCurrentEditorSettings);
   }
 
   function saveEditorSettings() {
@@ -1307,8 +1388,9 @@ export const useSettingsStore = defineStore("settings", () => {
           const normalized = normalizeEditorSettings(savedSettings);
           editorSettings.value = normalized;
           const needsExecuteModeDefaultMigration = typeof savedSettings.executeModeDefaultVersion !== "number" || savedSettings.executeModeDefaultVersion < EXECUTE_MODE_CURRENT_DEFAULT_VERSION;
+          const needsTabNavigationShortcutMigration = needsTabNavigationHistoryShortcutMigration(savedSettings.shortcuts);
           const savedUpdateDownloadSource = (saved as { updateDownloadSource?: unknown }).updateDownloadSource;
-          if (savedUpdateDownloadSource === "atomgit" || needsExecuteModeDefaultMigration) {
+          if (savedUpdateDownloadSource === "atomgit" || needsExecuteModeDefaultMigration || needsTabNavigationShortcutMigration) {
             // Persist one-time migrations so removed or unsafe defaults cannot reappear.
             await enqueueEditorSettingsSave().catch(() => {});
           }
@@ -1340,6 +1422,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (isDesktopSettingsLoaded.value) return;
     desktopSettings.value = normalizeDesktopSettings(await api.loadDesktopSettings().catch(() => null));
     setDebugLoggingEnabled(desktopSettings.value.debug_logging_enabled);
+    configureMetadataRuntimeCache(desktopSettings.value.metadata_cache_max_memory_mb);
     isDesktopSettingsLoaded.value = true;
   }
 
@@ -1351,11 +1434,13 @@ export const useSettingsStore = defineStore("settings", () => {
     };
     desktopSettings.value = normalizeDesktopSettings(next);
     setDebugLoggingEnabled(desktopSettings.value.debug_logging_enabled);
+    configureMetadataRuntimeCache(desktopSettings.value.metadata_cache_max_memory_mb);
     try {
       await api.saveDesktopSettings(desktopSettings.value);
     } catch (error) {
       desktopSettings.value = previous;
       setDebugLoggingEnabled(previous.debug_logging_enabled);
+      configureMetadataRuntimeCache(previous.metadata_cache_max_memory_mb);
       throw error;
     }
   }
@@ -1626,6 +1711,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.timeoutInheritanceMigrationVersion !== undefined) editorSettings.value.timeoutInheritanceMigrationVersion = Math.max(0, Math.floor(partial.timeoutInheritanceMigrationVersion));
     if (partial.showExecutionTargetPicker !== undefined) editorSettings.value.showExecutionTargetPicker = partial.showExecutionTargetPicker;
     if (partial.showStatementRunButtons !== undefined) editorSettings.value.showStatementRunButtons = partial.showStatementRunButtons === true;
+    if (partial.showLineNumbers !== undefined) editorSettings.value.showLineNumbers = partial.showLineNumbers === true;
     if (partial.showCurrentStatementFrame !== undefined) editorSettings.value.showCurrentStatementFrame = partial.showCurrentStatementFrame === true;
     if (partial.showInsertValueHints !== undefined) editorSettings.value.showInsertValueHints = partial.showInsertValueHints === true;
     if (partial.autoAliasTables !== undefined) editorSettings.value.autoAliasTables = partial.autoAliasTables;
@@ -1642,6 +1728,7 @@ export const useSettingsStore = defineStore("settings", () => {
     }
     if (partial.confirmDangerousSqlExecution !== undefined) editorSettings.value.confirmDangerousSqlExecution = partial.confirmDangerousSqlExecution;
     if (partial.confirmUnsavedSqlClose !== undefined) editorSettings.value.confirmUnsavedSqlClose = partial.confirmUnsavedSqlClose;
+    if (partial.appCloseUnsavedTabsMode !== undefined) editorSettings.value.appCloseUnsavedTabsMode = normalizeAppCloseUnsavedTabsMode(partial.appCloseUnsavedTabsMode);
     if (partial.savedSqlOpenTargetMode !== undefined) editorSettings.value.savedSqlOpenTargetMode = partial.savedSqlOpenTargetMode === "current" ? "current" : "saved";
     if (partial.compactTabTitle !== undefined) editorSettings.value.compactTabTitle = partial.compactTabTitle;
     if (partial.tabLayout !== undefined) editorSettings.value.tabLayout = normalizeTabLayout(partial.tabLayout);
@@ -1662,16 +1749,27 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.showColumnTypesInHeader !== undefined) editorSettings.value.showColumnTypesInHeader = partial.showColumnTypesInHeader;
     if (partial.dataGridShowTransposeFieldMetadata !== undefined) editorSettings.value.dataGridShowTransposeFieldMetadata = partial.dataGridShowTransposeFieldMetadata === true;
     if (partial.colorizeDataGridCellTypes !== undefined) editorSettings.value.colorizeDataGridCellTypes = partial.colorizeDataGridCellTypes === true;
+    if (partial.dataGridTypeColorSchemes !== undefined) {
+      editorSettings.value.dataGridTypeColorSchemes = normalizeDataGridTypeColorSchemes(partial.dataGridTypeColorSchemes);
+      // Dropping the scheme the grid is painting with has to fall back to the theme defaults.
+      editorSettings.value.activeDataGridTypeColorSchemeId = normalizeActiveDataGridTypeColorSchemeId(editorSettings.value.dataGridTypeColorSchemes, editorSettings.value.activeDataGridTypeColorSchemeId);
+    }
+    if (partial.activeDataGridTypeColorSchemeId !== undefined) {
+      editorSettings.value.activeDataGridTypeColorSchemeId = normalizeActiveDataGridTypeColorSchemeId(editorSettings.value.dataGridTypeColorSchemes, partial.activeDataGridTypeColorSchemeId);
+    }
     if (partial.showIndexIndicatorsInHeader !== undefined) editorSettings.value.showIndexIndicatorsInHeader = partial.showIndexIndicatorsInHeader;
     if (partial.compactColumnHeaderActions !== undefined) editorSettings.value.compactColumnHeaderActions = partial.compactColumnHeaderActions;
     if (partial.columnWidthDensity !== undefined) editorSettings.value.columnWidthDensity = normalizeColumnWidthDensity(partial.columnWidthDensity);
     if (partial.dataGridQuickEntry !== undefined) editorSettings.value.dataGridQuickEntry = partial.dataGridQuickEntry;
+    if (partial.dataGridFilterEditorView !== undefined) editorSettings.value.dataGridFilterEditorView = normalizeDataGridFilterEditorView(partial.dataGridFilterEditorView);
+    if (partial.dataGridTextFilterPanelHeight !== undefined) editorSettings.value.dataGridTextFilterPanelHeight = normalizeDataGridTextFilterPanelHeight(partial.dataGridTextFilterPanelHeight);
     if (partial.dataGridRenderMode !== undefined) editorSettings.value.dataGridRenderMode = normalizeDataGridRenderMode(partial.dataGridRenderMode);
     if (partial.dataGridSearchMode !== undefined) editorSettings.value.dataGridSearchMode = normalizeDataGridSearchMode(partial.dataGridSearchMode);
     if (partial.dataGridCopyExtractor !== undefined) editorSettings.value.dataGridCopyExtractor = normalizeDataGridCopyPreference(partial.dataGridCopyExtractor);
     if (partial.dataGridExtractorOptions !== undefined) editorSettings.value.dataGridExtractorOptions = normalizeDataGridExtractorOptions(partial.dataGridExtractorOptions);
     if (partial.resultRunDisplayMode !== undefined) editorSettings.value.resultRunDisplayMode = normalizeResultRunDisplayMode(partial.resultRunDisplayMode);
     if (partial.dataGridAutoTransposeSingleRow !== undefined) editorSettings.value.dataGridAutoTransposeSingleRow = partial.dataGridAutoTransposeSingleRow === true;
+    if (partial.dataGridCellDetailButtonVisible !== undefined) editorSettings.value.dataGridCellDetailButtonVisible = typeof partial.dataGridCellDetailButtonVisible === "boolean" ? partial.dataGridCellDetailButtonVisible : DEFAULT_EDITOR_SETTINGS.dataGridCellDetailButtonVisible;
     if (partial.dataGridMultiRowTranspose !== undefined) editorSettings.value.dataGridMultiRowTranspose = partial.dataGridMultiRowTranspose === true;
     if (partial.dataGridHideNullColumns !== undefined) editorSettings.value.dataGridHideNullColumns = partial.dataGridHideNullColumns === true;
     if (partial.dataGridBooleanDisplayMode !== undefined) editorSettings.value.dataGridBooleanDisplayMode = partial.dataGridBooleanDisplayMode === "dropdown" ? "dropdown" : "checkbox";
@@ -1699,12 +1797,16 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.openTabsRestoreMode !== undefined) editorSettings.value.openTabsRestoreMode = normalizeOpenTabsRestoreMode(partial.openTabsRestoreMode);
     if (partial.disconnectTabHandlingMode !== undefined) editorSettings.value.disconnectTabHandlingMode = normalizeDisconnectTabHandlingMode(partial.disconnectTabHandlingMode);
     if (partial.dataTabReuseMode !== undefined) editorSettings.value.dataTabReuseMode = normalizeDataTabReuseMode(partial.dataTabReuseMode);
+    if (partial.openDataTabsNextToActive !== undefined) editorSettings.value.openDataTabsNextToActive = partial.openDataTabsNextToActive === true;
     if (partial.prefillNewQueryWithSelect !== undefined) editorSettings.value.prefillNewQueryWithSelect = partial.prefillNewQueryWithSelect;
+    if (partial.generateSqlIncludeDatabaseName !== undefined) editorSettings.value.generateSqlIncludeDatabaseName = partial.generateSqlIncludeDatabaseName === true;
     if (partial.updateNotificationsEnabled !== undefined) editorSettings.value.updateNotificationsEnabled = partial.updateNotificationsEnabled;
     if (partial.sidebarHiddenTablePrefixes !== undefined) editorSettings.value.sidebarHiddenTablePrefixes = normalizeSidebarHiddenTablePrefixes(partial.sidebarHiddenTablePrefixes);
     if (partial.sidebarObjectInfoMode !== undefined) editorSettings.value.sidebarObjectInfoMode = normalizeSidebarObjectInfoMode(partial.sidebarObjectInfoMode);
     if (partial.sidebarShowConnectionNotes !== undefined) editorSettings.value.sidebarShowConnectionNotes = partial.sidebarShowConnectionNotes === true;
     if (partial.sidebarAllowHorizontalScroll !== undefined) editorSettings.value.sidebarAllowHorizontalScroll = partial.sidebarAllowHorizontalScroll;
+    if (partial.sidebarIndent !== undefined) editorSettings.value.sidebarIndent = normalizeSidebarIndent(partial.sidebarIndent);
+    if (partial.sidebarFontSize !== undefined) editorSettings.value.sidebarFontSize = normalizeSidebarFontSize(partial.sidebarFontSize);
     if (partial.columnFormatters !== undefined) editorSettings.value.columnFormatters = partial.columnFormatters;
     if (partial.customColumnFormatters !== undefined) editorSettings.value.customColumnFormatters = partial.customColumnFormatters;
     if (partial.globalDateTimeDisplayFormat !== undefined) editorSettings.value.globalDateTimeDisplayFormat = normalizeGlobalDateTimePattern(partial.globalDateTimeDisplayFormat);
@@ -1721,6 +1823,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.toolbarItems !== undefined) editorSettings.value.toolbarItems = normalizeToolbarItems(partial.toolbarItems);
     if (partial.objectBrowserShowCheckbox !== undefined) editorSettings.value.objectBrowserShowCheckbox = partial.objectBrowserShowCheckbox === true;
     if (partial.objectBrowserViewMode !== undefined) editorSettings.value.objectBrowserViewMode = partial.objectBrowserViewMode === "grid" ? "grid" : "list";
+    if (partial.sqlVariableSubstitutionEnabled !== undefined) editorSettings.value.sqlVariableSubstitutionEnabled = partial.sqlVariableSubstitutionEnabled === true;
     if (partial.sqlVariableSyntaxOverrides !== undefined) editorSettings.value.sqlVariableSyntaxOverrides = normalizeSqlVariableSyntaxOverrides(partial.sqlVariableSyntaxOverrides);
     if (partial.continueOnErrorOnBatch !== undefined) editorSettings.value.continueOnErrorOnBatch = partial.continueOnErrorOnBatch === true;
     if (partial.clickTableNavigationTarget !== undefined) editorSettings.value.clickTableNavigationTarget = normalizeClickTableNavigationTarget(partial.clickTableNavigationTarget);
@@ -1743,32 +1846,33 @@ export const useSettingsStore = defineStore("settings", () => {
     await enqueueEditorSettingsSave();
   }
 
+  async function enqueueEditorSettingsAtomicMutation<T>(mutation: () => Promise<T>): Promise<T> {
+    await initEditorSettings();
+    return enqueueEditorSettingsOperation(mutation);
+  }
+
   function updateEditorSettingsAndPersist(partial: Partial<EditorSettings>): Promise<void> {
-    const update = editorSettingsAtomicUpdateQueue
-      .catch(() => {})
-      .then(async () => {
-        await initEditorSettings();
-        const previous = editorSettingsSnapshot(editorSettings.value);
-        applyEditorSettingsPatch(partial);
-        const revision = markEditorSettingsPatch(partial);
-        try {
-          await enqueueEditorSettingsSave();
-        } catch (error) {
-          const restored = editorSettingsSnapshot(editorSettings.value) as unknown as Record<string, unknown>;
-          const previousSettings = previous as unknown as Record<string, unknown>;
-          let changed = false;
-          for (const key of Object.keys(partial) as (keyof EditorSettings)[]) {
-            if (partial[key] === undefined || editorSettingsFieldRevisions.get(key) !== revision) continue;
-            restored[key] = previousSettings[key];
-            editorSettingsFieldRevisions.set(key, ++editorSettingsPatchRevision);
-            changed = true;
-          }
-          if (changed) editorSettings.value = normalizeEditorSettings(restored);
-          throw error;
+    return enqueueEditorSettingsAtomicMutation(async () => {
+      await initEditorSettings();
+      const previous = editorSettingsSnapshot(editorSettings.value);
+      applyEditorSettingsPatch(partial);
+      const revision = markEditorSettingsPatch(partial);
+      try {
+        await persistCurrentEditorSettings();
+      } catch (error) {
+        const restored = editorSettingsSnapshot(editorSettings.value) as unknown as Record<string, unknown>;
+        const previousSettings = previous as unknown as Record<string, unknown>;
+        let changed = false;
+        for (const key of Object.keys(partial) as (keyof EditorSettings)[]) {
+          if (partial[key] === undefined || editorSettingsFieldRevisions.get(key) !== revision) continue;
+          restored[key] = previousSettings[key];
+          editorSettingsFieldRevisions.set(key, ++editorSettingsPatchRevision);
+          changed = true;
         }
-      });
-    editorSettingsAtomicUpdateQueue = update.catch(() => {});
-    return update;
+        if (changed) editorSettings.value = normalizeEditorSettings(restored);
+        throw error;
+      }
+    });
   }
 
   function updateColumnFormatter(key: string, formatter: ColumnFormatterConfig | undefined) {
@@ -1782,29 +1886,101 @@ export const useSettingsStore = defineStore("settings", () => {
     updateEditorSettings({ columnFormatters });
   }
 
-  function upsertCustomColumnFormatter(formatter: CustomColumnFormatterConfig): CustomColumnFormatterConfig | undefined {
-    const normalized = normalizeCustomColumnFormatter(formatter);
-    if (!normalized) return undefined;
-    updateEditorSettings({
-      customColumnFormatters: {
-        ...editorSettings.value.customColumnFormatters,
-        [normalized.id]: normalized,
-      },
-    });
-    return normalized;
+  function customColumnFormatterDeleteVersion(id: string): number {
+    return customColumnFormatterDeleteVersions.get(id) ?? 0;
   }
 
-  function deleteCustomColumnFormatter(id: string) {
-    const customColumnFormatters = {
-      ...editorSettings.value.customColumnFormatters,
-    };
-    delete customColumnFormatters[id];
-    const columnFormatters = Object.fromEntries(
-      Object.entries(editorSettings.value.columnFormatters).filter(([, formatter]) => {
-        return formatter.kind !== "custom-ref" || formatter.formatterId !== id;
-      }),
-    );
-    updateEditorSettings({ customColumnFormatters, columnFormatters });
+  async function upsertCustomColumnFormatter(formatter: CustomColumnFormatterConfig, expectedDeleteVersion?: number): Promise<CustomColumnFormatterConfig | undefined> {
+    const normalized = normalizeCustomColumnFormatter(formatter);
+    if (!normalized) return undefined;
+    return enqueueEditorSettingsAtomicMutation(async () => {
+      await initEditorSettings();
+      if (expectedDeleteVersion !== undefined && customColumnFormatterDeleteVersion(normalized.id) !== expectedDeleteVersion) return undefined;
+      const previous = editorSettings.value.customColumnFormatters[normalized.id];
+      const partial = {
+        customColumnFormatters: {
+          ...editorSettings.value.customColumnFormatters,
+          [normalized.id]: normalized,
+        },
+      } satisfies Partial<EditorSettings>;
+      applyEditorSettingsPatch(partial);
+      markEditorSettingsPatch(partial);
+      try {
+        await persistCurrentEditorSettings();
+      } catch (error) {
+        const customColumnFormatters = {
+          ...editorSettings.value.customColumnFormatters,
+        };
+        const current = customColumnFormatters[normalized.id];
+        if (current?.name === normalized.name && current.template === normalized.template) {
+          if (previous) {
+            customColumnFormatters[normalized.id] = previous;
+          } else {
+            delete customColumnFormatters[normalized.id];
+          }
+          const rollback = { customColumnFormatters } satisfies Partial<EditorSettings>;
+          applyEditorSettingsPatch(rollback);
+          markEditorSettingsPatch(rollback);
+        }
+        throw error;
+      }
+      return normalized;
+    });
+  }
+
+  async function deleteCustomColumnFormatter(id: string): Promise<void> {
+    return enqueueEditorSettingsAtomicMutation(async () => {
+      await initEditorSettings();
+      const previousDeleteVersion = customColumnFormatterDeleteVersion(id);
+      const deleteVersion = previousDeleteVersion + 1;
+      customColumnFormatterDeleteVersions.set(id, deleteVersion);
+      const previousFormatter = editorSettings.value.customColumnFormatters[id];
+      const customColumnFormatters = {
+        ...editorSettings.value.customColumnFormatters,
+      };
+      delete customColumnFormatters[id];
+      const removedColumnFormatters = Object.fromEntries(
+        Object.entries(editorSettings.value.columnFormatters).filter(([, formatter]) => {
+          return formatter.kind === "custom-ref" && formatter.formatterId === id;
+        }),
+      );
+      const columnFormatters = Object.fromEntries(
+        Object.entries(editorSettings.value.columnFormatters).filter(([, formatter]) => {
+          return formatter.kind !== "custom-ref" || formatter.formatterId !== id;
+        }),
+      );
+      const partial = { customColumnFormatters, columnFormatters } satisfies Partial<EditorSettings>;
+      applyEditorSettingsPatch(partial);
+      markEditorSettingsPatch(partial);
+      try {
+        await persistCurrentEditorSettings();
+      } catch (error) {
+        if (customColumnFormatterDeleteVersion(id) === deleteVersion) {
+          if (previousDeleteVersion === 0) {
+            customColumnFormatterDeleteVersions.delete(id);
+          } else {
+            customColumnFormatterDeleteVersions.set(id, previousDeleteVersion);
+          }
+        }
+        const restoredCustomColumnFormatters = {
+          ...editorSettings.value.customColumnFormatters,
+        };
+        if (previousFormatter && !restoredCustomColumnFormatters[id]) restoredCustomColumnFormatters[id] = previousFormatter;
+        const restoredColumnFormatters = {
+          ...editorSettings.value.columnFormatters,
+        };
+        for (const [key, formatter] of Object.entries(removedColumnFormatters)) {
+          if (!restoredColumnFormatters[key]) restoredColumnFormatters[key] = formatter;
+        }
+        const rollback = {
+          customColumnFormatters: restoredCustomColumnFormatters,
+          columnFormatters: restoredColumnFormatters,
+        } satisfies Partial<EditorSettings>;
+        applyEditorSettingsPatch(rollback);
+        markEditorSettingsPatch(rollback);
+        throw error;
+      }
+    });
   }
 
   return {
@@ -1841,6 +2017,7 @@ export const useSettingsStore = defineStore("settings", () => {
     initMcpGlobalPolicy,
     updateMcpGlobalPolicy,
     updateColumnFormatter,
+    customColumnFormatterDeleteVersion,
     upsertCustomColumnFormatter,
     deleteCustomColumnFormatter,
   };

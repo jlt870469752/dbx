@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { customTypeCapabilities, databaseObjectCapabilities, normalizeSidebarObjectKind, sidebarObjectKindsForDatabase, supportsPackageMemberExpansion, supportsTypeObjectSource } from "@/lib/database/databaseObjectCapabilities";
+import { buildObjectGroupPlaceholderNodes } from "@/lib/table/tableTree";
 
 describe("databaseObjectCapabilities", () => {
   it("exposes supported programmable objects for Dameng", () => {
@@ -11,6 +12,39 @@ describe("databaseObjectCapabilities", () => {
     expect(sidebarObjectKindsForDatabase("xugu")).toContain("SYNONYM");
     expect(sidebarObjectKindsForDatabase("oceanbase-oracle")).not.toContain("SYNONYM");
     expect(sidebarObjectKindsForDatabase("postgres")).not.toContain("SYNONYM");
+  });
+
+  it("exposes OceanBase Oracle sequences without widening synonym support", () => {
+    const oceanBaseObjects = sidebarObjectKindsForDatabase("oceanbase-oracle");
+
+    expect(oceanBaseObjects).toEqual(["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "SEQUENCE", "PACKAGE", "PACKAGE_BODY"]);
+    expect(databaseObjectCapabilities("oceanbase-oracle").sourceReadable).toEqual(["VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "SEQUENCE", "PACKAGE", "PACKAGE_BODY"]);
+    expect(oceanBaseObjects).not.toContain("SYNONYM");
+    expect(
+      buildObjectGroupPlaceholderNodes({
+        nodeId: "connection:database:APP",
+        connectionId: "connection",
+        database: "database",
+        schema: "APP",
+        objectTypes: oceanBaseObjects,
+      }).map((node) => node.type),
+    ).toEqual(["group-tables", "group-views", "group-materialized-views", "group-procedures", "group-functions", "group-sequences", "group-packages"]);
+  });
+
+  it("exposes Oracle sequences through the existing grouped object path", () => {
+    const oracleObjects = sidebarObjectKindsForDatabase("oracle");
+
+    expect(oracleObjects).toEqual(["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "SEQUENCE", "SYNONYM", "PACKAGE", "PACKAGE_BODY"]);
+    expect(databaseObjectCapabilities("oracle").sourceReadable).toContain("SEQUENCE");
+    expect(
+      buildObjectGroupPlaceholderNodes({
+        nodeId: "connection:database:HR",
+        connectionId: "connection",
+        database: "database",
+        schema: "HR",
+        objectTypes: oracleObjects,
+      }).map((node) => node.type),
+    ).toContain("group-sequences");
   });
 
   it("expands package members only for implemented database paths", () => {
@@ -39,8 +73,8 @@ describe("databaseObjectCapabilities", () => {
   });
 
   it("exposes triggers only for native MySQL among MySQL-compatible paths", () => {
-    expect(sidebarObjectKindsForDatabase("mysql")).toEqual(["TABLE", "VIEW", "PROCEDURE", "FUNCTION", "TRIGGER"]);
-    expect(databaseObjectCapabilities("mysql").sourceReadable).toEqual(["VIEW", "PROCEDURE", "FUNCTION", "TRIGGER"]);
+    expect(sidebarObjectKindsForDatabase("mysql")).toEqual(["TABLE", "VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "EVENT"]);
+    expect(databaseObjectCapabilities("mysql").sourceReadable).toEqual(["VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "EVENT"]);
 
     expect(sidebarObjectKindsForDatabase("doris")).toEqual(["TABLE", "VIEW"]);
     expect(sidebarObjectKindsForDatabase("starrocks")).toEqual(["TABLE", "VIEW", "MATERIALIZED_VIEW"]);
@@ -60,6 +94,12 @@ describe("databaseObjectCapabilities", () => {
     for (const dbType of ["highgo", "uxdb", "redshift", "kwdb"] as const) {
       expect(sidebarObjectKindsForDatabase(dbType), dbType).not.toContain("TYPE");
     }
+  });
+
+  it("exposes schema triggers for Kingbase without widening Vastbase", () => {
+    expect(sidebarObjectKindsForDatabase("kingbase")).toContain("TRIGGER");
+    expect(databaseObjectCapabilities("kingbase").sourceReadable).toContain("TRIGGER");
+    expect(sidebarObjectKindsForDatabase("vastbase")).not.toContain("TRIGGER");
   });
 
   it("only Xugu TYPE nodes can open object source", () => {

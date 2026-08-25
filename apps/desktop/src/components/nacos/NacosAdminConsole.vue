@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, useId, watch } from "vue";
 import { Compartment, type Extension } from "@codemirror/state";
-import { StreamLanguage } from "@codemirror/language";
+import { StreamLanguage, ensureSyntaxTree } from "@codemirror/language";
 import type { EditorView } from "@codemirror/view";
 import { Archive, ArrowLeftRight, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, Clipboard, Columns3, Download, FileClock, FileInput, FileText, Loader2, Network, Plus, RefreshCw, Save, Search, Send, Server, Trash2, X } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
@@ -16,7 +16,7 @@ import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import EditorSearchPanel from "@/components/editor/EditorSearchPanel.vue";
 import NacosConfigDiffDialog from "@/components/nacos/NacosConfigDiffDialog.vue";
 import NacosConfigHistoryDialog from "@/components/nacos/NacosConfigHistoryDialog.vue";
-import NacosConfigBatchDialog, { type NacosBatchDialogMode, type NacosConfigTransferTarget } from "@/components/nacos/NacosConfigBatchDialog.vue";
+import NacosConfigBatchDialog, { type NacosBatchDialogMode, type NacosConfigTransferDialogPayload, type NacosConfigTransferTarget } from "@/components/nacos/NacosConfigBatchDialog.vue";
 import NacosContentSearchDialog from "@/components/nacos/NacosContentSearchDialog.vue";
 import { useToast } from "@/composables/useToast";
 import { useNacosConfigListColumnResize, type ToggleableNacosConfigListColumnKey } from "@/composables/useNacosConfigListColumnResize";
@@ -44,7 +44,7 @@ import {
 } from "@/lib/nacos/nacosAdmin";
 import { createNacosNamespaceRequestGuard, subscribeNacosNamespacesChanged, type NacosNamespacesChangedDetail } from "@/lib/nacos/nacosNamespaceCache";
 import { nacosInstanceMatchesPatch, nacosInstanceRefIdentity, nacosIpAddressIsValid, nacosServiceDetailMatches } from "@/lib/nacos/nacosServiceManagement";
-import { nacosNamespaceIdentity, normalizeNacosNamespacesForDisplay } from "@/lib/nacos/nacosNamespaceVisibility";
+import { loadReadableNacosNamespaces, nacosNamespaceIdentity } from "@/lib/nacos/nacosNamespaceVisibility";
 import { copyToClipboard, readTextFromClipboard } from "@/lib/common/clipboard";
 import { trimmedSelectionLayer } from "@/lib/editor/codemirrorTrimmedSelectionLayer";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
@@ -67,7 +67,6 @@ import type {
   NacosConnectionInfo,
   NacosContentMatch,
   NacosContentSearchResult,
-  NacosConflictPolicy,
   NacosInstanceInfo,
   NacosInstancePatch,
   NacosInstanceRef,
@@ -323,6 +322,7 @@ const updateServiceCapability = computed(() => operationCapability(serviceCapabi
 const deleteServiceCapability = computed(() => operationCapability(serviceCapabilities.value?.deleteService, createServiceCapability.value.supported));
 const listInstancesCapability = computed(() => operationCapability(serviceCapabilities.value?.listInstances, listServicesCapability.value.supported));
 const updateInstanceCapability = computed(() => operationCapability(serviceCapabilities.value?.updateInstance, legacyInstanceUpdateSupported.value));
+const updateInstanceHealthCapability = computed(() => operationCapability(serviceCapabilities.value?.updateInstanceHealth, updateInstanceCapability.value.supported));
 const registerInstanceCapability = computed(() => operationCapability(serviceCapabilities.value?.registerInstance, updateInstanceCapability.value.supported));
 const deregisterInstanceCapability = computed(() => operationCapability(serviceCapabilities.value?.deregisterInstance, updateInstanceCapability.value.supported));
 const supportsServiceManagement = computed(() => listServicesCapability.value.supported);
@@ -444,6 +444,8 @@ function selectedKeys(): NacosConfigKey[] {
   });
 }
 
+const selectedConfigTransferKeys = computed(() => selectedKeys());
+
 function isBatchDeleteSnapshotInScope(snapshot: NacosBatchDeleteSnapshot) {
   return snapshot.connectionId === props.connectionId && snapshot.namespace === namespace.value;
 }
@@ -528,69 +530,68 @@ async function mountConfigEditor() {
   configEditorFontSize.value = clampEditorFontSize(editorSettings.fontSize);
   const theme = await loadEditorTheme(editorSettings.theme, editorThemeAppearance(), currentCustomThemeColors(), themePalette.value);
   if (generation !== configEditorGeneration || editorSessionId !== configEditorSessionId || host !== configEditorHost.value || configEditorView.value || !selectedConfig.value) return;
-  const view = new EditorView({
-    parent: host,
-    state: EditorState.create({
-      doc: content,
-      extensions: [
-        cmSearch({
-          top: true,
-          createPanel: () => {
-            const dom = document.createElement("span");
-            dom.style.display = "none";
-            return { dom };
-          },
-        }),
-        basicSetup,
-        EditorState.allowMultipleSelections.of(true),
-        trimmedSelectionLayer(),
-        Prec.highest(keymap.of([{ key: "Mod-f", run: () => configSearchPanelRef.value?.openSearch() ?? false, preventDefault: true }, { key: "Mod-h", run: () => configSearchPanelRef.value?.openReplace() ?? false, preventDefault: true }, indentWithTab])),
-        keymap.of([...defaultKeymap, ...historyKeymap]),
-        EditorView.domEventHandlers({
-          wheel(event, eventView) {
-            if (!event.metaKey && !event.ctrlKey) return false;
-            event.preventDefault();
-            const next = fontSizeFromWheelDelta(configEditorFontSize.value, event.deltaY);
-            if (next !== configEditorFontSize.value) {
-              configEditorFontSize.value = next;
-              eventView.dispatch({
-                effects: configEditorFontTheme.reconfigure(editorFontTheme(EditorView, next, settingsStore.editorSettings.fontFamily, { fixedHeight: true, scrollable: true })),
-              });
-            }
-            configEditorZoomCommitScheduler.schedule(next);
-            return true;
-          },
-        }),
-        configEditorLanguage.of(language),
-        configEditorTheme.of(theme),
-        configEditorFontTheme.of(editorFontTheme(EditorView, editorSettings.fontSize, editorSettings.fontFamily, { fixedHeight: true, scrollable: true })),
-        configEditorWordWrap.of(editorSettings.wordWrap ? EditorView.lineWrapping : []),
-        EditorState.readOnly.of(!!props.readOnly),
-        EditorView.editable.of(!props.readOnly),
-        EditorView.updateListener.of((update) => {
-          if (!update.docChanged || generation !== configEditorGeneration || editorSessionId !== configEditorSessionId) return;
-          configContent.value = update.state.doc.toString();
-          configSaveNotice.value = "";
-        }),
-        EditorView.theme({
-          "&": {
-            height: "100%",
-          },
-          ".cm-scroller": {
-            overflow: "auto",
-          },
-          ".cm-content": {
-            minHeight: "100%",
-            userSelect: "text",
-            WebkitUserSelect: "text",
-          },
-          ".cm-lineNumbers .cm-gutterElement": {
-            padding: "0 10px 0 8px",
-          },
-        }),
-      ],
-    }),
+  const state = EditorState.create({
+    doc: content,
+    extensions: [
+      cmSearch({
+        top: true,
+        createPanel: () => {
+          const dom = document.createElement("span");
+          dom.style.display = "none";
+          return { dom };
+        },
+      }),
+      basicSetup,
+      EditorState.allowMultipleSelections.of(true),
+      trimmedSelectionLayer(),
+      Prec.highest(keymap.of([{ key: "Mod-f", run: () => configSearchPanelRef.value?.openSearch() ?? false, preventDefault: true }, { key: "Mod-h", run: () => configSearchPanelRef.value?.openReplace() ?? false, preventDefault: true }, indentWithTab])),
+      keymap.of([...defaultKeymap, ...historyKeymap]),
+      EditorView.domEventHandlers({
+        wheel(event, eventView) {
+          if (!event.metaKey && !event.ctrlKey) return false;
+          event.preventDefault();
+          const next = fontSizeFromWheelDelta(configEditorFontSize.value, event.deltaY);
+          if (next !== configEditorFontSize.value) {
+            configEditorFontSize.value = next;
+            eventView.dispatch({
+              effects: configEditorFontTheme.reconfigure(editorFontTheme(EditorView, next, settingsStore.editorSettings.fontFamily, { fixedHeight: true, scrollable: true })),
+            });
+          }
+          configEditorZoomCommitScheduler.schedule(next);
+          return true;
+        },
+      }),
+      configEditorLanguage.of(language),
+      configEditorTheme.of(theme),
+      configEditorFontTheme.of(editorFontTheme(EditorView, editorSettings.fontSize, editorSettings.fontFamily, { fixedHeight: true, scrollable: true })),
+      configEditorWordWrap.of(editorSettings.wordWrap ? EditorView.lineWrapping : []),
+      EditorState.readOnly.of(!!props.readOnly),
+      EditorView.editable.of(!props.readOnly),
+      EditorView.updateListener.of((update) => {
+        if (!update.docChanged || generation !== configEditorGeneration || editorSessionId !== configEditorSessionId) return;
+        configContent.value = update.state.doc.toString();
+        configSaveNotice.value = "";
+      }),
+      EditorView.theme({
+        "&": {
+          height: "100%",
+        },
+        ".cm-scroller": {
+          overflow: "auto",
+        },
+        ".cm-content": {
+          minHeight: "100%",
+          userSelect: "text",
+          WebkitUserSelect: "text",
+        },
+        ".cm-lineNumbers .cm-gutterElement": {
+          padding: "0 10px 0 8px",
+        },
+      }),
+    ],
   });
+  ensureSyntaxTree(state, content.length, 500);
+  const view = new EditorView({ parent: host, state });
   if (generation !== configEditorGeneration || editorSessionId !== configEditorSessionId || host !== configEditorHost.value) {
     view.destroy();
     return;
@@ -1123,9 +1124,9 @@ async function loadBatchNamespaces(options: { force?: boolean } = {}) {
   const connectionId = props.connectionId;
   const requestId = batchNamespacesRequestGuard.start(connectionId);
   try {
-    const namespaces = await api.nacosListNamespaces(connectionId);
+    const namespaces = await loadReadableNacosNamespaces(connectionId, api);
     if (!batchNamespacesRequestGuard.isCurrent(requestId, props.connectionId)) return;
-    batchNamespaces.value = normalizeNacosNamespacesForDisplay(namespaces);
+    batchNamespaces.value = namespaces;
   } catch (error) {
     if (!batchNamespacesRequestGuard.isCurrent(requestId, props.connectionId)) return;
     batchError.value = error instanceof Error ? error.message : String(error);
@@ -1137,9 +1138,9 @@ async function loadBatchTargetNamespaces(connectionId: string, options: { force?
   if (!options.force && batchTargetConnectionId.value === connectionId && batchTargetNamespaces.value.length) return;
   const requestId = batchTargetNamespacesRequestGuard.start(connectionId);
   try {
-    const namespaces = await api.nacosListNamespaces(connectionId);
+    const namespaces = await loadReadableNacosNamespaces(connectionId, api);
     if (!batchTargetNamespacesRequestGuard.isCurrent(requestId, connectionId) || batchTargetConnectionId.value !== connectionId) return;
-    batchTargetNamespaces.value = normalizeNacosNamespacesForDisplay(namespaces);
+    batchTargetNamespaces.value = namespaces;
   } catch (error) {
     if (!batchTargetNamespacesRequestGuard.isCurrent(requestId, connectionId) || batchTargetConnectionId.value !== connectionId) return;
     batchError.value = error instanceof Error ? error.message : String(error);
@@ -1255,7 +1256,7 @@ async function exportConfigArchive(scope: NacosConfigSelectionScope) {
 
 const batchTransferRequest = shallowRef<NacosConfigTransferRequest | null>(null);
 
-async function previewBatch(payload: { scope: NacosConfigSelectionScope; targetConnectionId: string; targetNamespace: string; policy: NacosConflictPolicy }) {
+async function previewBatch(payload: NacosConfigTransferDialogPayload) {
   batchLoading.value = true;
   batchError.value = "";
   batchPreview.value = null;
@@ -1271,6 +1272,8 @@ async function previewBatch(payload: { scope: NacosConfigSelectionScope; targetC
         targetConnectionId: payload.targetConnectionId,
         source: buildConfigSelector(payload.scope),
         targetNamespace: payload.targetNamespace,
+        targetGroup: payload.targetGroup || undefined,
+        dataIdMappings: payload.dataIdMappings,
         conflictPolicy: payload.policy,
       };
       batchTransferRequest.value = req;
@@ -1283,7 +1286,7 @@ async function previewBatch(payload: { scope: NacosConfigSelectionScope; targetC
   }
 }
 
-async function applyBatch(payload: { scope: NacosConfigSelectionScope; targetConnectionId: string; targetNamespace: string; policy: NacosConflictPolicy }) {
+async function applyBatch(payload: NacosConfigTransferDialogPayload) {
   if (batchLoading.value || batchReport.value || !batchPreview.value) return;
   if (payload.policy === "OVERWRITE" && !window.confirm(t("nacos.overwriteConfirm"))) return;
   const targetConnectionId = batchMode.value === "import" ? props.connectionId : payload.targetConnectionId;
@@ -2512,7 +2515,7 @@ defineExpose({ focusSearch });
             </Button>
           </div>
           <div v-if="configError" class="border-b px-3 py-2 text-xs text-destructive">{{ configError }}</div>
-          <div ref="configListViewport" class="min-h-0 flex-1 overflow-auto">
+          <div ref="configListViewport" class="nacos-config-list-viewport min-h-0 flex-1 overflow-auto">
             <div class="w-max min-w-full" :style="{ minWidth: configListMinWidth }">
               <div class="sticky top-0 z-20 grid border-b bg-muted px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground shadow-sm" :style="{ gridTemplateColumns: configListGridTemplate }">
                 <div v-for="(column, columnIndex) in configListColumns" :key="column" class="relative min-w-0" :class="column === 'dataId' ? 'pr-3' : columnIndex === configListColumns.length - 1 ? 'pl-3 pr-10' : 'px-3'">
@@ -2830,9 +2833,9 @@ defineExpose({ focusSearch });
       </Pane>
 
       <Pane :size="100 - nacosSplitSize" min-size="20">
-        <div class="flex h-full min-h-0 flex-col">
+        <div class="nacos-service-workbench flex h-full min-h-0 flex-col">
           <header class="shrink-0 border-b bg-background">
-            <div class="flex min-h-16 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-3">
+            <div class="nacos-service-heading flex min-h-16 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-3">
               <div class="min-w-0 flex-1">
                 <div class="truncate text-base font-semibold">{{ selectedService?.serviceName || t("nacos.instances") }}</div>
                 <div v-if="selectedService" class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
@@ -2847,9 +2850,9 @@ defineExpose({ focusSearch });
                 {{ t("nacos.refresh") }}
               </Button>
             </div>
-            <div v-if="selectedService" class="flex flex-wrap items-center gap-x-4 gap-y-2 border-t bg-muted/30 px-4 py-2">
-              <div class="flex shrink-0 items-center gap-1">
-                <Input v-model="serviceCluster" class="h-8 w-40" :placeholder="t('nacos.filterInstanceCluster')" @keyup.enter="loadInstances" />
+            <div v-if="selectedService" class="nacos-service-toolbar flex flex-wrap items-center gap-x-4 gap-y-2 border-t bg-muted/30 px-4 py-2">
+              <div class="nacos-service-filter-group flex min-w-0 items-center gap-1">
+                <Input v-model="serviceCluster" class="nacos-service-cluster-input h-8 min-w-0" :placeholder="t('nacos.filterInstanceCluster')" @keyup.enter="loadInstances" />
                 <Button size="sm" variant="secondary" class="h-8" :disabled="instancesLoading" @click="loadInstances">{{ t("nacos.filter") }}</Button>
                 <Button
                   size="sm"
@@ -2864,7 +2867,7 @@ defineExpose({ focusSearch });
                   >{{ t("nacos.clear") }}</Button
                 >
               </div>
-              <div class="ml-auto flex flex-wrap items-center gap-2">
+              <div class="nacos-service-management-actions flex flex-wrap items-center gap-2">
                 <div class="flex items-center gap-1 rounded-md border bg-background p-1">
                   <span class="px-1 text-xs text-muted-foreground">{{ t("nacos.serviceSettings") }}</span>
                   <Button
@@ -2888,9 +2891,7 @@ defineExpose({ focusSearch });
                 </div>
                 <div class="flex items-center gap-1 rounded-md border bg-background p-1">
                   <span class="px-1 text-xs text-muted-foreground">{{ t("nacos.instances") }}</span>
-                  <Button size="sm" class="h-7" :disabled="readOnly || !registerInstanceCapability.supported" :title="readOnly || !registerInstanceCapability.supported ? capabilityReason(registerInstanceCapability) : undefined" @click="registerInstanceOpen = true">{{
-                    t("nacos.registerInstance")
-                  }}</Button>
+                  <Button v-if="registerInstanceCapability.supported" size="sm" class="h-7" :disabled="readOnly" :title="readOnly ? capabilityReason(registerInstanceCapability) : undefined" @click="registerInstanceOpen = true">{{ t("nacos.registerInstance") }}</Button>
                 </div>
               </div>
             </div>
@@ -2906,7 +2907,7 @@ defineExpose({ focusSearch });
               <span class="text-xs font-medium">{{ t("nacos.serviceDetails") }}</span>
               <span class="text-xs text-muted-foreground">{{ serviceDetailExpanded ? t("nacos.collapse") : t("nacos.expand") }}</span>
             </button>
-            <div class="mt-2 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+            <div class="nacos-service-stat-grid mt-2 grid gap-2 text-xs">
               <div class="rounded border bg-muted/20 px-2 py-1.5">
                 <div class="text-muted-foreground">{{ t("nacos.instanceStat") }}</div>
                 <div class="mt-0.5 font-medium">{{ selectedService.ipCount ?? instances.length }}</div>
@@ -2924,7 +2925,7 @@ defineExpose({ focusSearch });
                 <div class="mt-0.5 font-medium">{{ selectedServiceDetail?.protectThreshold ?? "-" }}</div>
               </div>
             </div>
-            <div v-if="serviceDetailExpanded" class="mt-2 grid gap-2 text-xs lg:grid-cols-2">
+            <div v-if="serviceDetailExpanded" class="nacos-service-detail-grid mt-2 grid gap-2 text-xs">
               <div class="min-w-0 rounded border p-2">
                 <div class="mb-1 flex items-center justify-between text-muted-foreground">
                   <span>{{ t("nacos.metadataLabel") }}</span
@@ -2950,16 +2951,16 @@ defineExpose({ focusSearch });
           <div class="min-h-0 flex-1 overflow-auto bg-muted/20 p-3">
             <div v-if="instances.length" class="space-y-2">
               <article v-for="instance in instances" :key="instanceIdentity(instance)" class="rounded-lg border bg-background p-3 shadow-sm">
-                <div class="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
-                  <div class="min-w-0 flex-1">
+                <div class="nacos-instance-layout flex gap-3">
+                  <div class="nacos-instance-main min-w-0">
                     <div class="flex flex-wrap items-center gap-2">
-                      <span class="font-mono text-sm font-medium">{{ instance.ip }}:{{ instance.port }}</span>
+                      <span class="nacos-instance-address max-w-full font-mono text-sm font-medium">{{ instance.ip }}:{{ instance.port }}</span>
                       <Badge variant="outline">{{ instance.clusterName || "DEFAULT" }}</Badge>
                       <Badge variant="outline" :class="instance.healthy === false ? 'border-destructive/50 text-destructive' : 'border-emerald-500/50 text-emerald-700 dark:text-emerald-300'">{{ instance.healthy === false ? t("nacos.unhealthy") : t("nacos.healthy") }}</Badge>
                       <Badge :variant="instance.enabled === false ? 'outline' : 'secondary'" :class="instance.enabled === false ? 'border-muted-foreground/50 text-muted-foreground' : ''">{{ instance.enabled === false ? t("nacos.offline") : t("nacos.enabled") }}</Badge>
                       <Badge v-if="instance.ephemeral != null" variant="outline">{{ instance.ephemeral ? t("nacos.ephemeral") : t("nacos.persistent") }}</Badge>
                     </div>
-                    <div class="mt-3 grid gap-x-5 gap-y-3 text-xs sm:grid-cols-[auto_minmax(0,1fr)]">
+                    <div class="nacos-instance-detail-grid mt-3 grid gap-x-5 gap-y-3 text-xs">
                       <div class="flex items-end gap-1 self-start">
                         <label class="grid gap-1 text-muted-foreground">
                           <span>{{ t("nacos.weight") }}</span>
@@ -2985,7 +2986,7 @@ defineExpose({ focusSearch });
                       <span v-else class="self-start text-muted-foreground">{{ t("nacos.noMetadata") }}</span>
                     </div>
                   </div>
-                  <div class="flex shrink-0 flex-wrap items-center gap-2 xl:justify-end">
+                  <div class="nacos-instance-actions flex flex-wrap items-center gap-2">
                     <Button size="sm" variant="outline" class="h-7" :disabled="readOnly || !supportsInstanceUpdate || isInstanceUpdating(instance)" @click="openInstanceEditor(instance)">{{ t("nacos.edit") }}</Button>
                     <Button
                       size="sm"
@@ -2998,15 +2999,16 @@ defineExpose({ focusSearch });
                       <Loader2 v-if="isInstanceUpdating(instance)" class="h-3 w-3 animate-spin" />
                       {{ instance.enabled === false ? t("nacos.enable") : t("nacos.disable") }}
                     </Button>
-                    <Button size="sm" variant="outline" class="h-7" :disabled="readOnly || !supportsInstanceUpdate || isInstanceUpdating(instance)" @click="requestUpdateInstance(instance, { healthy: !instance.healthy })">
+                    <Button v-if="updateInstanceHealthCapability.supported" size="sm" variant="outline" class="h-7" :disabled="readOnly || isInstanceUpdating(instance)" @click="requestUpdateInstance(instance, { healthy: !instance.healthy })">
                       {{ instance.healthy === false ? t("nacos.markHealthy") : t("nacos.markUnhealthy") }}
                     </Button>
                     <Button
+                      v-if="deregisterInstanceCapability.supported"
                       size="sm"
                       variant="outline"
                       class="h-7 text-destructive"
-                      :disabled="readOnly || !deregisterInstanceCapability.supported || isInstanceUpdating(instance)"
-                      :title="readOnly || !deregisterInstanceCapability.supported ? capabilityReason(deregisterInstanceCapability) : undefined"
+                      :disabled="readOnly || isInstanceUpdating(instance)"
+                      :title="readOnly ? capabilityReason(deregisterInstanceCapability) : undefined"
                       @click="pendingInstanceDeregister = instance"
                       >{{ t("nacos.deregister") }}</Button
                     >
@@ -3042,6 +3044,7 @@ defineExpose({ focusSearch });
       :mode="batchMode"
       :loading="batchLoading"
       :selected-count="selectedConfigCount"
+      :selected-keys="selectedConfigTransferKeys"
       :filtered-count="configTotal"
       :target-connections="batchTargetConnections"
       :target-connection-id="batchTargetConnectionId"
@@ -3332,6 +3335,39 @@ defineExpose({ focusSearch });
   container-type: inline-size;
 }
 
+.nacos-service-workbench {
+  container: nacos-service-workbench / inline-size;
+}
+
+.nacos-service-cluster-input {
+  width: 10rem;
+}
+
+.nacos-service-management-actions {
+  margin-inline-start: auto;
+}
+
+.nacos-service-stat-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.nacos-service-detail-grid,
+.nacos-instance-detail-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.nacos-instance-layout {
+  flex-direction: column;
+}
+
+.nacos-instance-address {
+  overflow-wrap: anywhere;
+}
+
+.nacos-instance-actions {
+  min-width: 0;
+}
+
 .nacos-config-context-bar {
   display: flex;
   align-items: center;
@@ -3399,6 +3435,54 @@ defineExpose({ focusSearch });
   }
 }
 
+@container nacos-service-workbench (max-width: 480px) {
+  .nacos-service-filter-group,
+  .nacos-service-management-actions {
+    flex-basis: 100%;
+  }
+
+  .nacos-service-cluster-input {
+    width: auto;
+    flex: 1 1 auto;
+  }
+
+  .nacos-service-management-actions {
+    margin-inline-start: 0;
+  }
+}
+
+@container nacos-service-workbench (min-width: 620px) {
+  .nacos-service-stat-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .nacos-service-detail-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .nacos-instance-detail-grid {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+}
+
+@container nacos-service-workbench (min-width: 720px) {
+  .nacos-instance-layout {
+    flex-direction: row;
+    align-items: flex-start;
+    justify-content: space-between;
+  }
+
+  .nacos-instance-main {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .nacos-instance-actions {
+    flex: 0 1 auto;
+    justify-content: flex-end;
+  }
+}
+
 .nacos-admin-splitpanes :deep(.splitpanes--vertical > .splitpanes__splitter) {
   width: 4px !important;
   border-left: 1px solid var(--border);
@@ -3408,5 +3492,9 @@ defineExpose({ focusSearch });
 
 .nacos-admin-splitpanes :deep(.splitpanes__splitter:hover) {
   background: oklch(0.6 0.15 250) !important;
+}
+
+.nacos-config-list-viewport {
+  scrollbar-gutter: stable;
 }
 </style>

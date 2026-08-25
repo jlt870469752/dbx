@@ -16,6 +16,7 @@ import {
   Link,
   Link2,
   Zap,
+  Clock,
   ListTree,
   FileCode,
   Network,
@@ -34,6 +35,7 @@ import {
   Lock,
   Archive,
   Square,
+  Minus,
   X,
   CircleX,
   RefreshCw,
@@ -52,18 +54,22 @@ import LightTooltip from "@/components/ui/LightTooltip.vue";
 import type { ColumnInfo, ConnectionConfig, CustomTypeTreeMemberMeta, DatabaseType, TreeNode, TriggerInfo } from "@/types/database";
 import { alignedCommentLeadingWidth, canTreeNodePin, canTreeNodeShowExpander, sidebarTreeNodeComment, trailingCommentAvailableWidth, trailingCommentGapPx, treeItemPaddingLeft, treeLabelWidthClass, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
 import { clearActiveTableReferencePayload, createTableReferencePayload, createTableReferenceDropEvent, setActiveTableReferencePayload, type QueryEditorTableReferencePayload } from "@/lib/editor/queryEditorTableDrop";
+import { AI_ASSISTANT_TABLE_DROP_ROOT_SELECTOR } from "@/lib/ai/aiTableReferenceDrop";
 import { formatSidebarObjectStorage } from "@/lib/sidebar/sidebarDatabaseStorage";
 import { dataTabOpenModeFromTreeClick } from "@/lib/sidebar/dataTabOpenPolicy";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { connectionDisplayUrlScheme } from "@/lib/connection/connectionPresentation";
+import { encodeSpannerResourcePath } from "@/lib/connection/spannerResourcePath";
 import { hexToRgba } from "@/lib/common/color";
 import { sidebarDisplayTableName } from "@/lib/sidebar/sidebarTableNameDisplay";
 import { shouldMeasureSidebarLabelOverflow } from "@/lib/sidebar/sidebarLabelTooltip";
 import { filterSidebarModifierSelectionIds, supportsSidebarModifierSelection, treeSelectionRangeIdsByIndex, treeSelectionRangeIds } from "@/lib/sidebar/sidebarTreeSelection";
 import { applyConnectionMultiSelection, applyTreeNodeSelection, connectionMultiSelectionAfterToggle } from "@/lib/sidebar/sidebarConnectionMultiSelect";
+import { connectionBearingGroupIdsUnder, connectionIdsUnderGroup } from "@/lib/sidebar/sidebarLayout";
 import { isSidebarDatabaseOpenForVisual } from "@/lib/sidebar/sidebarDatabaseOpenState";
 import { sidebarTreeContextKey } from "@/lib/sidebar/sidebarTreeContext";
 import { connectionCanConfigureSidebarVisibleDatabases } from "@/lib/sidebar/sidebarVisibleFilterMenu";
+import { supportsSidebarObjectNameFilter } from "@/lib/sidebar/sidebarObjectNameFilter";
 import { isWindows } from "@/lib/backend/platform";
 import { flattenTree } from "@/composables/useFlatTree";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
@@ -165,10 +171,15 @@ const props = defineProps<{
   node: TreeNode;
   depth: number;
   reorderDisabled?: boolean;
+  moveToGroupOnly?: boolean;
   referenceDragDisabled?: boolean;
   pendingRename?: boolean;
   highlighted?: boolean;
   commentLabelWidth?: number;
+  /** Plain (non-virtualized) renderer: make database/schema container rows
+   * stick to the top of the tree scroller while their children scroll under
+   * them (mirrors the overlay sticky header of the virtual renderer). */
+  stickyHeader?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -201,6 +212,10 @@ const showProductionBadge = computed(() => {
 
 function currentDatabaseType(): DatabaseType | undefined {
   return activeNode.value.connectionId ? effectiveDatabaseTypeForConnection(connectionStore.getConfig(activeNode.value.connectionId)) : undefined;
+}
+
+function currentDriverProfile(): string | undefined {
+  return activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId)?.driver_profile : undefined;
 }
 
 function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
@@ -249,6 +264,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Link, colorClass: "text-blue-400" };
     case "group-triggers":
       return { icon: Zap, colorClass: "text-orange-400" };
+    case "group-events":
+      return { icon: Clock, colorClass: "text-orange-400" };
     case "group-constraints":
       return { icon: Key, colorClass: "text-amber-500" };
     case "group-table-partitions":
@@ -276,12 +293,16 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Link, colorClass: "text-blue-300" };
     case "trigger":
       return { icon: Zap, colorClass: "text-orange-300" };
+    case "event":
+      return { icon: Clock, colorClass: "text-orange-400" };
     case "redis-db":
       return { icon: Database, colorClass: "text-red-400" };
     case "mq-tenant":
       return { icon: FolderOpen, colorClass: "text-sky-400" };
     case "nacos-namespace":
       return { icon: FolderOpen, colorClass: "text-sky-500" };
+    case "nacos-access-control":
+      return { icon: ShieldCheck, colorClass: "text-sky-500" };
     case "etcd-root":
       return { icon: Database, colorClass: "text-sky-500" };
     case "etcd-dashboard":
@@ -302,10 +323,14 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Archive, colorClass: "text-cyan-400" };
     case "mongo-collection":
       return { icon: Table, colorClass: "text-green-400" };
+    case "dynamodb-table":
+      return { icon: Table, colorClass: "text-amber-500" };
     case "vector-collection":
       return { icon: TableProperties, colorClass: "text-cyan-400" };
     case "elasticsearch-index":
       return { icon: Table, colorClass: "text-emerald-400" };
+    case "meilisearch-system":
+      return { icon: Gauge, colorClass: "text-emerald-500" };
     case "procedure":
       return { icon: ScrollText, colorClass: "text-blue-500" };
     case "function":
@@ -326,6 +351,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Columns3, colorClass: "text-muted-foreground" };
     case "group-tables":
       return { icon: Table, colorClass: "text-green-500" };
+    case "group-dolt-system-tables":
+      return { icon: Table, colorClass: "text-slate-500" };
     case "group-views":
       return { icon: Eye, colorClass: "text-purple-500" };
     case "group-materialized-views":
@@ -362,7 +389,10 @@ function isGroupLabel(node: TreeNode): boolean {
 function displayLabel(node: TreeNode): string {
   if (node.type === "load-more") return t(node.label);
   if (node.type === "object-browser") return t(node.label, { count: node.objectCount ?? 0 });
-  if (node.type === "user-admin" || node.type === "dameng-users" || node.type === "dameng-roles" || node.type === "dameng-job-admin") return t(node.label);
+  // Use the canonical key for persisted trees created before this label was
+  // internationalized; those nodes may still contain the old Chinese text.
+  if (node.type === "nacos-access-control") return t("nacos.accessControlSidebarLabel");
+  if (node.type === "user-admin" || node.type === "dameng-users" || node.type === "dameng-roles" || node.type === "dameng-job-admin" || node.type === "meilisearch-system") return t(node.label);
   if (node.type === "linked-server-root") return t(node.label);
   if (node.type === "saved-sql-root") return t(node.label);
   if (node.type === "mqtt-topic" && node.id.endsWith(":mqtt-topic:__console__")) return t(node.label);
@@ -378,14 +408,14 @@ function treeNodeSecondaryValue(node: TreeNode): string | undefined {
 
 function visibleLabel(node: TreeNode): string {
   const withValidity = (label: string) => (node.valid === false ? `${label} · INVALID` : label);
-  if (node.type === "table" || node.type === "view" || node.type === "materialized_view" || node.type === "mongo-collection" || node.type === "vector-collection" || node.type === "elasticsearch-index") {
+  if (node.type === "table" || node.type === "view" || node.type === "materialized_view" || node.type === "mongo-collection" || node.type === "dynamodb-table" || node.type === "vector-collection" || node.type === "elasticsearch-index") {
     return withValidity(sidebarDisplayTableName(node.label, settingsStore.editorSettings.sidebarHiddenTablePrefixes));
   }
   return withValidity(displayLabel(node));
 }
 
-function hasActiveTableNameFilter(node: TreeNode): boolean {
-  if (node.type !== "group-tables" || !node.connectionId || !node.database) return false;
+function hasActiveObjectNameFilter(node: TreeNode): boolean {
+  if (!supportsSidebarObjectNameFilter(node) || !node.connectionId || !node.database) return false;
   const filter = connectionStore.tableNameFilterForScope({
     connectionId: node.connectionId,
     database: node.database,
@@ -441,7 +471,8 @@ function connectionTooltipUrl(config: ConnectionConfig): string {
   const user = cleanTooltipValue(config.username);
   const userInfo = user ? `${encodeURIComponent(user)}@` : "";
   const database = cleanTooltipValue(config.database);
-  const path = database ? `/${encodeURIComponent(database)}` : "";
+  const encodedDatabase = config.db_type === "spanner" ? encodeSpannerResourcePath(database) : encodeURIComponent(database);
+  const path = database ? `/${encodedDatabase}` : "";
   const params = cleanTooltipValue(config.url_params);
   const query = params ? (params.startsWith("?") ? params : `?${params}`) : "";
   return redactedConnectionString(`${scheme}://${userInfo}${hostForDisplay(host)}${port}${path}${query}`);
@@ -521,6 +552,14 @@ function visibleTreeNodes(): TreeNode[] {
   return flattenTree(connectionStore.treeNodes).map((item) => item.node);
 }
 
+function connectionIdsForSelection(): Set<string> {
+  return new Set(connectionStore.connections.map((connection) => connection.id));
+}
+
+function connectionGroupIdsForSelection(): Set<string> {
+  return new Set(connectionStore.sidebarLayout.groups.map((group) => group.id));
+}
+
 function selectSingleTreeNode(node: TreeNode) {
   // Re-clicking the selected row should not replace the selection array and
   // force visible tree rows to recompute.
@@ -549,7 +588,8 @@ function toggleTreeNodeSelection(node: TreeNode) {
       activeNodeId: node.id,
       anchorNodeId: node.id,
     },
-    new Set(connectionStore.connections.map((connection) => connection.id)),
+    connectionIdsForSelection(),
+    connectionGroupIdsForSelection(),
   );
 }
 
@@ -571,7 +611,8 @@ function selectTreeNodeRange(node: TreeNode) {
         activeNodeId: node.id,
         anchorNodeId: anchorId,
       },
-      new Set(connectionStore.connections.map((connection) => connection.id)),
+      connectionIdsForSelection(),
+      connectionGroupIdsForSelection(),
     );
     return;
   }
@@ -589,7 +630,8 @@ function selectTreeNodeRange(node: TreeNode) {
       activeNodeId: node.id,
       anchorNodeId: anchorId,
     },
-    new Set(connectionStore.connections.map((connection) => connection.id)),
+    connectionIdsForSelection(),
+    connectionGroupIdsForSelection(),
   );
 }
 
@@ -599,9 +641,19 @@ function selectedConnectionIdsForAction(): string[] {
 }
 
 const isConnectionSelectionChecked = computed(() => {
-  if (!connectionStore.connectionMultiSelectActive || activeNode.value.type !== "connection" || !activeNode.value.connectionId) return false;
+  if (!isConnectionMultiSelectActive() || activeNode.value.type !== "connection" || !activeNode.value.connectionId) return false;
   return connectionStore.selectedTreeNodeIds.includes(activeNode.value.connectionId);
 });
+
+function isConnectionGroupMultiSelectActive(): boolean {
+  if (!connectionStore.connectionMultiSelectActive) return false;
+  const firstSelectedId = connectionStore.selectedTreeNodeIds[0];
+  return !!firstSelectedId && connectionStore.sidebarLayout.groups.some((group) => group.id === firstSelectedId);
+}
+
+function isConnectionMultiSelectActive(): boolean {
+  return connectionStore.connectionMultiSelectActive && !isConnectionGroupMultiSelectActive();
+}
 
 function toggleConnectionMultiSelection(event: MouseEvent) {
   event.preventDefault();
@@ -612,6 +664,56 @@ function toggleConnectionMultiSelection(event: MouseEvent) {
   // runs when the checkbox is clicked, while the checked state updates often.
   const current = { connectionIds: selectedConnectionIdsForAction(), active: connectionStore.connectionMultiSelectActive };
   applyConnectionMultiSelection(connectionStore, connectionMultiSelectionAfterToggle(current, activeNode.value.connectionId));
+  rowRef.value?.focus({ preventScroll: true });
+}
+
+function connectionIdsForActiveGroupSelection(): string[] {
+  if (activeNode.value.type !== "connection-group") return [];
+  const groupConnectionIds = connectionIdsUnderGroup(connectionStore.sidebarLayout, activeNode.value.id);
+  const projectedConnectionIds = sidebarTreeContext?.getProjectedConnectionIds?.();
+  return projectedConnectionIds ? groupConnectionIds.filter((id) => projectedConnectionIds.has(id)) : groupConnectionIds;
+}
+
+const connectionGroupSelectionState = computed<"none" | "partial" | "all">(() => {
+  const groupConnectionIds = connectionIdsForActiveGroupSelection();
+  if (groupConnectionIds.length === 0) return "none";
+  const selectedIds = connectionStore.selectedTreeNodeIdsSet;
+  const selectedCount = groupConnectionIds.filter((id) => selectedIds.has(id)).length;
+  if (selectedCount === 0) return "none";
+  if (selectedCount === groupConnectionIds.length) return "all";
+  return "partial";
+});
+
+function toggleConnectionGroupMultiSelection(event: MouseEvent) {
+  event.preventDefault();
+  event.stopPropagation();
+  if (activeNode.value.type !== "connection-group") return;
+
+  const groupConnectionIds = connectionIdsForActiveGroupSelection();
+  if (groupConnectionIds.length === 0) return;
+
+  // 当前是分组多选（Ctrl/Shift 框选分组行）时，改为级联选中连接并重新开始
+  const baseConnectionIds = isConnectionMultiSelectActive() ? selectedConnectionIdsForAction() : [];
+  const next = new Set(baseConnectionIds);
+  const allSelected = groupConnectionIds.every((id) => next.has(id));
+  if (allSelected) {
+    // 分组下连接已全部勾选：取消勾选这些连接，保留其他已勾选的连接
+    for (const id of groupConnectionIds) next.delete(id);
+  } else {
+    // 分组下连接未全部勾选：级联勾选全部连接，并保留其他已勾选的连接
+    for (const id of groupConnectionIds) next.add(id);
+    // 自动展开该分组及含连接的子分组：折叠状态下选中的连接不可见，
+    // 会被树的选择修剪逻辑清空，展开后选择才能保留并可被右键操作
+    connectionStore.expandConnectionGroups(connectionBearingGroupIdsUnder(connectionStore.sidebarLayout, activeNode.value.id));
+  }
+
+  const connectionIds = [...next];
+  applyConnectionMultiSelection(connectionStore, {
+    connectionIds,
+    activeConnectionId: connectionIds[0] ?? null,
+    anchorConnectionId: connectionIds[0] ?? null,
+    active: connectionIds.length > 0,
+  });
   rowRef.value?.focus({ preventScroll: true });
 }
 
@@ -740,7 +842,7 @@ const labelWidthClass = computed(() => {
 
 watch(() => [isRightAlignedComment(), visibleLabel(activeNode.value), trailingComment.value, trailingCommentLayoutRef.value, trailingCommentLeadingRef.value], refreshTrailingCommentMeasurement, { flush: "post", immediate: true });
 
-const paddingLeft = computed(() => treeItemPaddingLeft(props.depth));
+const paddingLeft = computed(() => treeItemPaddingLeft(props.depth, settingsStore.editorSettings.sidebarIndent));
 
 const tableSearchParentId = computed(() => activeNode.value.tableSearchParentId || "");
 
@@ -840,6 +942,8 @@ const isRenamingGroup = ref(false);
 
 const isRenamingSavedSql = ref(false);
 
+const isRenamingConnection = ref(false);
+
 const renameInput = ref("");
 
 const renameInputRef = ref<HTMLInputElement>();
@@ -859,12 +963,21 @@ function startRenameSavedSql() {
   focusSidebarRenameInput(() => (isRenamingSavedSql.value ? renameInputRef.value : undefined));
 }
 
+function startRenameConnection() {
+  if (activeNode.value.type !== "connection" || !activeNode.value.connectionId) return;
+  renameInput.value = activeNode.value.label;
+  isRenamingConnection.value = true;
+  emit("rename-started");
+  focusSidebarRenameInput(() => (isRenamingConnection.value ? renameInputRef.value : undefined));
+}
+
 watch(
   () => props.pendingRename,
   (pending) => {
     if (!pending) return;
     if (activeNode.value.type === "connection-group") startRenameGroup();
     else if (activeNode.value.type === "saved-sql-file") startRenameSavedSql();
+    else if (activeNode.value.type === "connection") startRenameConnection();
   },
   { immediate: true },
 );
@@ -872,7 +985,7 @@ watch(
 function shouldMeasureLabelOverflow(): boolean {
   return shouldMeasureSidebarLabelOverflow({
     hasDetailTooltip: !!detailTooltip.value?.rows.length,
-    isRenaming: isRenamingGroup.value || isRenamingSavedSql.value,
+    isRenaming: isRenamingGroup.value || isRenamingSavedSql.value || isRenamingConnection.value,
     usesFullWidthLabel: usesFullWidthLabel.value,
   });
 }
@@ -906,14 +1019,29 @@ async function finishRenameSavedSql() {
   }
 }
 
+async function finishRenameConnection() {
+  if (!isRenamingConnection.value) return;
+  isRenamingConnection.value = false;
+  const connectionId = activeNode.value.connectionId;
+  const trimmed = renameInput.value.trim();
+  if (!connectionId || !trimmed || trimmed === activeNode.value.label) return;
+  try {
+    await connectionStore.renameConnection(connectionId, trimmed);
+  } catch (e: any) {
+    toast(t("connection.saveFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
 function finishRename() {
-  if (isRenamingSavedSql.value) void finishRenameSavedSql();
+  if (isRenamingConnection.value) void finishRenameConnection();
+  else if (isRenamingSavedSql.value) void finishRenameSavedSql();
   else finishRenameGroup();
 }
 
 function cancelRename() {
   isRenamingGroup.value = false;
   isRenamingSavedSql.value = false;
+  isRenamingConnection.value = false;
 }
 
 const PINNED_TREE_NODE_DRAG_TYPE = "__pinned-tree-node__";
@@ -941,7 +1069,7 @@ const {
   // together; otherwise just the grabbed one (issue #681).
   const selected = connectionStore.selectedTreeNodeIds;
   const draggedIds = selected.length > 1 && selected.includes(draggedId) ? [...selected] : [draggedId];
-  connectionStore.reorderSidebarEntries(draggedIds, targetId, position);
+  connectionStore.reorderSidebarEntries(draggedIds, targetId, position, { preserveSameGroupOrder: props.moveToGroupOnly });
 });
 
 const canReorderTreeNode = computed(() => {
@@ -984,6 +1112,12 @@ function updateTreeDragTarget(event: MouseEvent) {
     return;
   }
   updateTarget(event, activeNode.value.id, activeNode.value.type);
+  // While the list is display-sorted, the underlying manual order used for
+  // before/after positioning is invisible, so only moving into a different
+  // group (a display-order-independent operation) is a coherent drop.
+  if (props.moveToGroupOnly && dragState.dropPosition !== "inside") {
+    clearTarget(activeNode.value.id);
+  }
 }
 
 function clearTreeDragTarget() {
@@ -1020,6 +1154,7 @@ function tableReferenceDragPayload(): QueryEditorTableReferencePayload | null {
       database: activeNode.value.database,
       referenceType: "database",
       databaseType: currentDatabaseType(),
+      driverProfile: currentDriverProfile(),
     });
   }
   if (activeNode.value.type === "column") {
@@ -1032,6 +1167,7 @@ function tableReferenceDragPayload(): QueryEditorTableReferencePayload | null {
       tableName: activeNode.value.tableName,
       columnName,
       databaseType: currentDatabaseType(),
+      driverProfile: currentDriverProfile(),
     });
   }
   const payload = createTableReferencePayload({
@@ -1040,6 +1176,7 @@ function tableReferenceDragPayload(): QueryEditorTableReferencePayload | null {
     schema: activeNode.value.schema,
     tableName: activeNode.value.label,
     databaseType: currentDatabaseType(),
+    driverProfile: currentDriverProfile(),
   });
   return payload;
 }
@@ -1086,7 +1223,7 @@ function onTableReferenceMouseUp(event: MouseEvent) {
   if (payload) {
     suppressNextTableReferenceClick = true;
     const target = document.elementFromPoint(event.clientX, event.clientY);
-    if (target instanceof Element && target.closest("[data-query-editor-root]")) {
+    if (target instanceof Element && target.closest(`[data-query-editor-root], ${AI_ASSISTANT_TABLE_DROP_ROOT_SELECTOR}`)) {
       window.dispatchEvent(
         createTableReferenceDropEvent({
           payload,
@@ -1128,6 +1265,7 @@ watch(
     // from the previously rendered node into the new row.
     isRenamingGroup.value = false;
     isRenamingSavedSql.value = false;
+    isRenamingConnection.value = false;
     renameInput.value = "";
     labelOverflowing.value = false;
     suppressNextTableReferenceClick = false;
@@ -1242,11 +1380,11 @@ function onKeydown(event: KeyboardEvent) {
     </LightTooltip>
   </div>
 
-  <div v-else @contextmenu="onTreeItemContextMenu">
+  <div v-else :class="{ 'sidebar-tree-item--sticky': stickyHeader }" @contextmenu="onTreeItemContextMenu">
     <LightTooltip :text="visibleLabel(node)" :disabled="isTooltipDisabled()" side="right" :side-offset="8" :delay="0" :close-delay="30" :surface="detailTooltip ? 'popover' : 'foreground'">
       <div
         ref="rowRef"
-        class="group flex cursor-default items-center gap-2 py-1 px-2 relative outline-none"
+        class="group flex cursor-default items-center gap-2 min-h-7 py-1 px-2 relative outline-none"
         style="contain: layout style"
         :class="[
           rowWidthClass,
@@ -1295,7 +1433,7 @@ function onKeydown(event: KeyboardEvent) {
         <div ref="trailingCommentLayoutRef" :class="hasTrailingMetadata() ? 'flex flex-1 min-w-0 items-center' : 'contents'">
           <div ref="trailingCommentLeadingRef" :class="trailingComment ? 'flex max-w-full min-w-0 shrink-0 items-center gap-2' : formattedObjectStorage() ? 'flex min-w-0 flex-1 items-center gap-2' : 'contents'" :style="alignedCommentLeadingStyle()">
             <input
-              v-if="isRenamingGroup || isRenamingSavedSql"
+              v-if="isRenamingGroup || isRenamingSavedSql || isRenamingConnection"
               ref="renameInputRef"
               v-model="renameInput"
               class="min-w-0 flex-1 truncate bg-transparent border border-primary/50 rounded px-1 outline-none"
@@ -1323,11 +1461,13 @@ function onKeydown(event: KeyboardEvent) {
             <span
               v-if="
                 (node.type === 'group-tables' ||
+                  node.type === 'group-dolt-system-tables' ||
                   node.type === 'group-views' ||
                   node.type === 'group-materialized-views' ||
                   node.type === 'group-procedures' ||
                   node.type === 'group-functions' ||
                   node.type === 'group-triggers' ||
+                  node.type === 'group-events' ||
                   node.type === 'group-sequences' ||
                   node.type === 'group-synonyms' ||
                   node.type === 'group-packages' ||
@@ -1338,7 +1478,7 @@ function onKeydown(event: KeyboardEvent) {
                 node.objectCount != null
               "
               class="text-muted-foreground text-[10px] shrink-0"
-              >{{ node.objectCount }}<span v-if="hasActiveTableNameFilter(node)"> · {{ t("tree.tableNameFilterActive") }}</span></span
+              >{{ node.objectCount }}<span v-if="hasActiveObjectNameFilter(node)"> · {{ t("tree.tableNameFilterActive") }}</span></span
             >
             <Badge v-if="isNodeDefaultDatabase" variant="secondary" class="h-4 px-1.5 text-[10px]">
               {{ t("editor.defaultDatabase") }}
@@ -1359,7 +1499,7 @@ function onKeydown(event: KeyboardEvent) {
         </div>
         <span v-if="node.type === 'connection' && node.connectionId && connectionStore.connectedIds.has(node.connectionId)" class="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" />
         <span v-if="databaseOpenVisual.showsIndicator" class="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" />
-        <Badge v-if="isConnectionReadonly" variant="secondary" class="h-4 px-1.5 text-[10px] gap-0.5"><Lock class="w-2.5 h-2.5" />{{ t("connection.readOnlyBadge") }}</Badge>
+        <Badge v-if="isConnectionReadonly" variant="secondary" class="h-4 px-1.5 text-[10px] gap-0.5"> <Lock class="w-2.5 h-2.5" />{{ t("connection.readOnlyBadge") }} </Badge>
         <ConnectionErrorIndicator v-if="node.type === 'connection'" :connection-id="node.connectionId" trigger-class="h-4 w-4" />
         <span v-if="formattedObjectStorage()" class="ml-auto shrink-0 text-right text-xs tabular-nums text-muted-foreground">{{ formattedObjectStorage() }}</span>
         <button
@@ -1377,12 +1517,28 @@ function onKeydown(event: KeyboardEvent) {
           v-if="node.type === 'connection'"
           type="button"
           class="flex h-4 w-4 shrink-0 items-center justify-center rounded text-muted-foreground/55 opacity-0 transition-colors transition-opacity hover:bg-secondary/45 hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover/sidebar-row:opacity-100"
-          :class="[{ 'opacity-100': isConnectionSelectionChecked || connectionStore.connectionMultiSelectActive }, isConnecting ? '' : 'ml-auto']"
+          :class="[{ 'opacity-100': isConnectionSelectionChecked || isConnectionMultiSelectActive() }, isConnecting ? '' : 'ml-auto']"
           :aria-label="isConnectionSelectionChecked ? t('connectionGroup.deselectConnection') : t('connectionGroup.selectConnection')"
           @mousedown.stop
           @click="toggleConnectionMultiSelection"
         >
           <Check v-if="isConnectionSelectionChecked" class="h-3 w-3 text-primary" />
+          <Square v-else class="h-3 w-3 stroke-[1.7]" />
+        </button>
+        <button
+          v-if="node.type === 'connection-group'"
+          type="button"
+          role="checkbox"
+          data-sidebar-group-selection-toggle="true"
+          class="ml-auto flex h-4 w-4 shrink-0 items-center justify-center rounded text-muted-foreground/55 opacity-0 transition-colors transition-opacity hover:bg-secondary/45 hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover/sidebar-row:opacity-100"
+          :class="{ 'opacity-100': isConnectionMultiSelectActive() || isConnectionGroupMultiSelectActive() || connectionGroupSelectionState !== 'none' }"
+          :aria-label="connectionGroupSelectionState === 'all' ? t('connectionGroup.deselectGroup') : t('connectionGroup.selectGroup')"
+          :aria-checked="connectionGroupSelectionState === 'partial' ? 'mixed' : connectionGroupSelectionState === 'all'"
+          @mousedown.stop
+          @click="toggleConnectionGroupMultiSelection"
+        >
+          <Check v-if="connectionGroupSelectionState === 'all'" class="h-3 w-3 text-primary" />
+          <Minus v-else-if="connectionGroupSelectionState === 'partial'" class="h-3 w-3 text-primary" />
           <Square v-else class="h-3 w-3 stroke-[1.7]" />
         </button>
       </div>
@@ -1421,8 +1577,9 @@ function onKeydown(event: KeyboardEvent) {
 <style>
 .sidebar-object-comment {
   color: var(--muted-foreground);
-  font-size: 12px;
-  line-height: 1rem;
+  /* Relative to the sidebar tree root font size so comments follow the sidebarFontSize setting. */
+  font-size: 0.85em;
+  line-height: 1.25;
   opacity: 0.6;
   /* Sidebar rows repaint on hover; avoid heavier font shaping and fallback here. */
   text-rendering: auto;
@@ -1436,7 +1593,7 @@ function onKeydown(event: KeyboardEvent) {
 
 .sidebar-object-comment--windows {
   font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
-  font-size: 14px;
+  font-size: 1em;
   font-weight: 500;
   opacity: 1;
 }
@@ -1465,6 +1622,18 @@ function onKeydown(event: KeyboardEvent) {
 .tree-item-connection-tint.tree-item-active,
 .tree-item-connection-tint.tree-item-active:focus {
   background-color: transparent !important;
+}
+
+/* Plain (non-virtualized) renderer: database/schema container rows stick to
+   the top of the tree scroller while their children scroll under them,
+   mirroring the overlay sticky header the virtual renderer uses. The row is
+   min-h-7, so a solid background guarantees no content shows through while
+   rows slide underneath. */
+.sidebar-tree-item--sticky {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background-color: var(--background);
 }
 
 .tree-item-connection-tint:hover::before {
@@ -1507,6 +1676,7 @@ function onKeydown(event: KeyboardEvent) {
 .tree-item-active {
   background-color: var(--tree-connection-active-bg, rgb(235 235 235)) !important;
 }
+
 :root.dark .tree-item-active {
   background-color: var(--tree-connection-active-bg, rgb(36 36 36)) !important;
 }
@@ -1515,6 +1685,7 @@ function onKeydown(event: KeyboardEvent) {
 .tree-item-active:focus {
   background-color: var(--tree-connection-active-focus-bg, rgb(211 227 245)) !important;
 }
+
 :root.dark .tree-item-active:focus {
   background-color: var(--tree-connection-active-focus-bg, rgb(33 60 89)) !important;
 }
@@ -1524,6 +1695,7 @@ function onKeydown(event: KeyboardEvent) {
   background-color: var(--tree-connection-active-bg, rgb(235 235 235)) !important;
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foreground) 14%, transparent);
 }
+
 :root.dark .tree-item-active--selection-set:focus {
   background-color: var(--tree-connection-active-bg, rgb(36 36 36)) !important;
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--foreground) 18%, transparent);

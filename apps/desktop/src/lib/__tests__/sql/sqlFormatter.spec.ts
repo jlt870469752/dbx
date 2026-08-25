@@ -1,7 +1,16 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { canFormatSqlForDatabaseType, formatSqlForDisplay, formatSqlForEditing, formatSqlText, MAX_SQL_FORMAT_CHARS, sqlFormatDialectForDbType, UnsupportedStructuredInputError } from "@/lib/sql/sqlFormatter";
+import { extractSqlParameters } from "@/lib/sql/sqlParameters";
+
+const sqlFormatterSource = readFileSync(new URL("../../sql/sqlFormatter.ts", import.meta.url), "utf8");
 
 describe("sqlFormatter", () => {
+  it("does not use lookbehind regular expressions in the startup path", () => {
+    expect(sqlFormatterSource).not.toContain("(?<!");
+    expect(sqlFormatterSource).not.toContain("(?<=");
+  });
+
   it("disables SQL formatting for VictoriaMetrics queries", () => {
     expect(canFormatSqlForDatabaseType("victoriametrics")).toBe(false);
     expect(canFormatSqlForDatabaseType("mysql")).toBe(true);
@@ -23,6 +32,81 @@ describe("sqlFormatter", () => {
     expect(sqlFormatDialectForDbType("dameng")).toBe("dameng");
   });
 
+  it("maps DuckDB to its scoped formatter dialect", () => {
+    expect(sqlFormatDialectForDbType("duckdb")).toBe("duckdb");
+  });
+
+  it("keeps DuckDB prefix aliases out of formatted named parameters", async () => {
+    const cases = [
+      ["select 日期:date(订单日期) from 订单;", []],
+      ['select total:price * quantity, "order":sum(amount) from sales;', []],
+      ["from r:range(:row_count) select total:r.range + :offset;", ["row_count", "offset"]],
+      ["select res: col1 + col2, root: sqrt(col1) from tbl;", []],
+    ] as const;
+
+    for (const [sql, expectedParameters] of cases) {
+      const formatted = await formatSqlText(sql, sqlFormatDialectForDbType("duckdb"));
+
+      expect(formatted).not.toBe(sql);
+      expect(extractSqlParameters(formatted, { databaseType: "duckdb" })).toEqual(expectedParameters);
+      expect(formatted).not.toContain("__DBX_DUCKDB_PREFIX_ALIAS_COLON_");
+    }
+  });
+
+  it("keeps ordinary DuckDB named parameters enabled independently of prefix aliases", async () => {
+    const formatted = await formatSqlText("select :outside, total:price from sales;", sqlFormatDialectForDbType("duckdb"));
+
+    expect(extractSqlParameters(formatted, { databaseType: "duckdb" })).toEqual(["outside"]);
+    expect(extractSqlParameters(formatted, { databaseType: "duckdb", enabledSyntaxes: [] })).toEqual([]);
+  });
+
+  it("does not change generic formatting of compact colon syntax", async () => {
+    const formatted = await formatSqlText("select total:price from sales;", "generic");
+
+    expect(extractSqlParameters(formatted, { databaseType: "postgres" })).toEqual(["price"]);
+  });
+
+  it("preserves DuckDB strings and comments while protecting prefix aliases", async () => {
+    const sql = `select total:price, 'literal:date', $$dollar:date
+AND inside
+OR inside$$ as note
+      from sales /* alias:date */ /*__DBX_DUCKDB_PREFIX_ALIAS_COLON_0__*/ -- trailing:date`;
+    const formatted = await formatSqlText(sql, sqlFormatDialectForDbType("duckdb"), { logicalOperatorNewline: "none" });
+
+    expect(extractSqlParameters(formatted, { databaseType: "duckdb" })).toEqual([]);
+    expect(formatted).toContain("'literal:date'");
+    expect(formatted).toContain("$$dollar:date\nAND inside\nOR inside$$");
+    expect(formatted).toContain("/* alias:date */");
+    expect(formatted).toContain("/*__DBX_DUCKDB_PREFIX_ALIAS_COLON_0__*/");
+    expect(formatted).toContain("-- trailing:date");
+  });
+
+  it("keeps DuckDB casts, named arguments, and their real parameters intact", async () => {
+    const sql = "select struct_pack(key := :value), total:price, value::integer;";
+    const formatted = await formatSqlText(sql, sqlFormatDialectForDbType("duckdb"));
+
+    expect(extractSqlParameters(formatted, { databaseType: "duckdb" })).toEqual(["value"]);
+    expect(formatted).toContain("value::integer");
+  });
+
+  it("returns unsupported DuckDB struct literals unchanged without leaking formatter markers", async () => {
+    const sql = "select {'key': value, nested: {'inner': inner_value}}, total:price;";
+    const formatted = await formatSqlForEditing(sql, sqlFormatDialectForDbType("duckdb"));
+
+    expect(formatted).toBe(sql);
+    expect(extractSqlParameters(formatted, { databaseType: "duckdb" })).toEqual([]);
+    expect(formatted).not.toContain("__DBX_DUCKDB_PREFIX_ALIAS_COLON_");
+  });
+
+  it("returns malformed DuckDB SQL unchanged without leaking formatter markers", async () => {
+    const sql = "select total:price from dbname.\n;";
+
+    const formatted = await formatSqlForEditing(sql, sqlFormatDialectForDbType("duckdb"));
+
+    expect(formatted).toBe(sql);
+    expect(formatted).not.toContain("__DBX_DUCKDB_PREFIX_ALIAS_COLON_");
+  });
+
   it("preserves ClickHouse lambda arrows when formatting issue #3573 SQL", async () => {
     const sql = `
       WITH industry_code_donghua_id_RYCzfD AS (SELECT id
@@ -40,6 +124,42 @@ describe("sqlFormatter", () => {
     expect(formatted).toContain("x -> dictGet");
     expect(formatted).not.toContain("- >");
   });
+
+  it("preserves the ClickHouse table alias from issue #7079", async () => {
+    const formatted = await formatSqlText("SELECT *\nFROM MATERIAL m\nLIMIT 100;", sqlFormatDialectForDbType("clickhouse"));
+
+    expect(formatted).toBe("SELECT\n  *\nFROM\n  MATERIAL m\nLIMIT\n  100;");
+  });
+
+  it.each(["d", "dd", "h", "hh", "m", "mcs", "mi", "mm", "ms", "n", "ns", "q", "qq", "s", "ss", "wk", "ww", "yy", "yyyy"])("preserves ClickHouse identifier-like date part %s while formatting keywords", async (identifier) => {
+    const formatted = await formatSqlText(`select ${identifier}, t.${identifier} from material ${identifier} limit 100;`, sqlFormatDialectForDbType("clickhouse"));
+
+    expect(formatted).toContain(`  ${identifier},`);
+    expect(formatted).toContain(`material ${identifier}`);
+    expect(formatted).toContain("SELECT");
+    expect(formatted).toContain("FROM");
+    expect(formatted).toContain("LIMIT");
+  });
+
+  it("keeps ClickHouse identifier casing independent from keyword casing", async () => {
+    const sql = "SELECT * FROM MATERIAL M LIMIT 100;";
+
+    const lowerKeywords = await formatSqlText(sql, sqlFormatDialectForDbType("clickhouse"), { keywordCase: "lower", identifierCase: "preserve" });
+    const lowerIdentifiers = await formatSqlText(sql, sqlFormatDialectForDbType("clickhouse"), { keywordCase: "upper", identifierCase: "lower" });
+
+    expect(lowerKeywords).toContain("from\n  MATERIAL M");
+    expect(lowerKeywords).toContain("limit\n  100");
+    expect(lowerIdentifiers).toContain("FROM\n  material m");
+    expect(lowerIdentifiers).toContain("LIMIT\n  100");
+  });
+
+  it("still formats unambiguous ClickHouse interval keywords", async () => {
+    const formatted = await formatSqlText("select now() + interval 1 minutes from source_table m;", sqlFormatDialectForDbType("clickhouse"));
+
+    expect(formatted).toContain("INTERVAL 1 MINUTES");
+    expect(formatted).toContain("FROM\n  source_table m");
+  });
+
   it("preserves DBX brace placeholders in generic and MySQL SQL", async () => {
     const sql = "SELECT ${x} AS shell_value, #{x} AS mybatis_value, '${date}' AS quoted_value";
 
@@ -52,11 +172,83 @@ describe("sqlFormatter", () => {
     }
   });
 
+  it.each(["mysql", "sqlite"] as const)("applies keyword case to LIKE operators in the %s dialect", async (dialect) => {
+    const sql = "select * from users where name like '%like%' and note not like 'LIKE'";
+
+    const upper = await formatSqlText(sql, dialect, { keywordCase: "upper", functionCase: "preserve" });
+    const lower = await formatSqlText(sql.toUpperCase(), dialect, { keywordCase: "lower", functionCase: "preserve", identifierCase: "lower" });
+
+    expect(upper).toContain("name LIKE '%like%'");
+    expect(upper).toContain("note NOT LIKE 'LIKE'");
+    expect(lower).toContain("name like '%LIKE%'");
+    expect(lower).toContain("note not like 'LIKE'");
+  });
+
+  it("keeps SQLite LIKE functions and qualified identifiers under their own case settings", async () => {
+    const formatted = await formatSqlText("select like('%a%', name), filters.like from users", "sqlite", {
+      keywordCase: "upper",
+      functionCase: "preserve",
+      identifierCase: "preserve",
+    });
+
+    expect(formatted).toContain("like(");
+    expect(formatted).toContain("filters.like");
+  });
+
+  it.each(["mysql", "sqlite"] as const)("does not rewrite LIKE inside DBX placeholders in the %s dialect", async (dialect) => {
+    for (const [lowerPlaceholder, upperPlaceholder] of [
+      ["${like}", "${LIKE}"],
+      ["#{like}", "#{LIKE}"],
+      [":like", ":LIKE"],
+      ["@like", "@LIKE"],
+    ]) {
+      const upper = await formatSqlText(`select * from users where name like 'a';\nselect ${lowerPlaceholder} as marker`, dialect, {
+        keywordCase: "upper",
+        functionCase: "preserve",
+      });
+      const lower = await formatSqlText(`SELECT * FROM users WHERE name LIKE 'a';\nSELECT ${upperPlaceholder} AS marker`, dialect, {
+        keywordCase: "lower",
+        functionCase: "preserve",
+        identifierCase: "lower",
+      });
+
+      expect(upper).toContain(lowerPlaceholder);
+      expect(upper).toContain("name LIKE 'a'");
+      expect(lower).toContain(upperPlaceholder);
+      expect(lower).toContain("name like 'a'");
+    }
+  });
+
   it("falls back to the postgres formatter when the generic dialect cannot parse SQL", async () => {
     const formatted = await formatSqlText("SELECT 1::int AS id;", "generic");
 
     expect(formatted).toContain("1::int");
     expect(formatted).toContain("AS id");
+  });
+
+  it("formats complete backtick-quoted spans with the PostgreSQL dialect", async () => {
+    const formatted = await formatSqlText("select `schema`.`odd``name` from user;", "postgres");
+
+    expect(formatted).toBe("SELECT\n  `schema`.`odd``name`\nFROM\n  user;");
+  });
+
+  it("keeps PostgreSQL double-quoted identifiers and casts unchanged", async () => {
+    const formatted = await formatSqlText('select "display""name" from records where payload::jsonb is not null;', "postgres");
+
+    expect(formatted).toBe('SELECT\n  "display""name"\nFROM\n  records\nWHERE\n  payload::jsonb IS NOT NULL;');
+  });
+
+  it("keeps MySQL backtick formatting unchanged", async () => {
+    const formatted = await formatSqlText("select `schema`.`odd``name` from `user`;", "mysql");
+
+    expect(formatted).toBe("SELECT\n  `schema`.`odd``name`\nFROM\n  `user`;");
+  });
+
+  it("keeps malformed PostgreSQL backtick input unchanged while editing", async () => {
+    const sql = "select `id from user;";
+
+    await expect(formatSqlText(sql, "postgres")).rejects.toThrow("Parse error: Unexpected");
+    await expect(formatSqlForEditing(sql, "postgres")).resolves.toBe(sql);
   });
 
   it("formats Dameng SQL with a standalone trailing dot without changing the invalid token", async () => {

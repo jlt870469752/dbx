@@ -28,6 +28,7 @@ pub struct SchemaQuery {
     pub apply_visible_filter: Option<bool>,
     pub client_session_id: Option<String>,
     pub include_postgres_access: Option<bool>,
+    pub portable: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -239,6 +240,10 @@ pub async fn list_objects(
     let object_types = q.object_types.as_ref().map(|value| {
         value.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).collect::<Vec<_>>()
     });
+    let table_name_filter = q
+        .table_name_filter
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<dbx_core::schema::TableNameFilter>(value).ok());
     let result = if let Some(catalog) = external_doris_catalog(&state, &q.connection_id, q.catalog.as_deref()).await {
         let tables = dbx_core::schema::list_doris_catalog_tables_core(
             &state.app,
@@ -249,7 +254,7 @@ pub async fn list_objects(
             q.limit,
             q.offset,
             object_types.as_deref(),
-            None,
+            table_name_filter.as_ref(),
         )
         .await
         .map_err(AppError::from)?;
@@ -282,6 +287,7 @@ pub async fn list_objects(
             q.limit,
             q.offset,
             object_types.as_deref(),
+            table_name_filter.as_ref(),
         )
         .await
         .map_err(AppError::from)?
@@ -339,6 +345,22 @@ pub async fn get_object_source(
         object_type,
         q.signature.as_deref(),
         q.relation_name.as_deref(),
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
+pub async fn get_event_info(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<SchemaQuery>,
+) -> Result<Json<dbx_core::db::MysqlEventInfo>, AppError> {
+    let result = dbx_core::schema::get_event_info_core(
+        &state.app,
+        &q.connection_id,
+        q.database.as_deref().unwrap_or(""),
+        q.schema.as_deref().unwrap_or(""),
+        q.table.as_deref().unwrap_or(""),
     )
     .await
     .map_err(AppError::from)?;
@@ -539,6 +561,26 @@ pub async fn list_indexes(
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
+pub async fn list_reference_key_columns(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<SchemaQuery>,
+) -> Result<Json<Vec<String>>, AppError> {
+    let database = q.database.as_deref().unwrap_or("");
+    let schema = q.schema.as_deref().unwrap_or("");
+    let table = q.table.as_deref().unwrap_or("");
+    let catalog = external_doris_catalog(&state, &q.connection_id, q.catalog.as_deref()).await;
+    let indexes = if let Some(catalog) = catalog.as_deref() {
+        dbx_core::schema::list_doris_catalog_indexes_core(&state.app, &q.connection_id, catalog, database, table)
+            .await
+            .map_err(AppError::from)?
+    } else {
+        dbx_core::schema::list_indexes_core(&state.app, &q.connection_id, database, schema, table)
+            .await
+            .map_err(AppError::from)?
+    };
+    Ok(Json(dbx_core::schema::reference_key_columns_from_indexes(&indexes)))
+}
+
 pub async fn list_foreign_keys(
     State(state): State<Arc<WebState>>,
     Query(q): Query<SchemaQuery>,
@@ -622,6 +664,32 @@ pub async fn list_partitions(
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
+pub async fn get_table_partition_status(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<SchemaQuery>,
+) -> Result<Json<dbx_core::schema::TablePartitionStatus>, AppError> {
+    let database = q.database.as_deref().unwrap_or("");
+    let schema = q.schema.as_deref().unwrap_or("");
+    let table = q.table.as_deref().unwrap_or("");
+    dbx_core::schema::table_partition_status_core(&state.app, &q.connection_id, database, schema, table)
+        .await
+        .map(Json)
+        .map_err(AppError::from)
+}
+
+pub async fn list_invalid_indexes(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<SchemaQuery>,
+) -> Result<Json<Vec<String>>, AppError> {
+    let database = q.database.as_deref().unwrap_or("");
+    let schema = q.schema.as_deref().unwrap_or("");
+    let table = q.table.as_deref().unwrap_or("");
+    dbx_core::schema::list_invalid_indexes_core(&state.app, &q.connection_id, database, schema, table)
+        .await
+        .map(Json)
+        .map_err(AppError::from)
+}
+
 pub async fn list_subpartitions(
     State(state): State<Arc<WebState>>,
     Query(q): Query<SchemaQuery>,
@@ -646,6 +714,17 @@ pub async fn get_ddl(
         dbx_core::schema::get_doris_catalog_table_ddl_core(&state.app, &q.connection_id, &catalog, database, table)
             .await
             .map_err(AppError::from)?
+    } else if q.portable.unwrap_or(false) {
+        dbx_core::schema::get_table_export_ddl_core(
+            &state.app,
+            &q.connection_id,
+            database,
+            schema,
+            table,
+            q.object_type,
+        )
+        .await
+        .map_err(AppError::from)?
     } else if q.include_postgres_access.unwrap_or(false) {
         dbx_core::schema::get_table_display_ddl_core(
             &state.app,
@@ -722,6 +801,19 @@ pub async fn list_owners(
     let database = q.database.as_deref().unwrap_or("");
     let schema = q.schema.as_deref().unwrap_or("");
     let result = dbx_core::schema::list_owners_core(&state.app, &q.connection_id, database, schema)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
+}
+
+pub async fn get_table_owner(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<SchemaQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let database = q.database.as_deref().unwrap_or("");
+    let schema = q.schema.as_deref().unwrap_or("");
+    let table = q.table.as_deref().unwrap_or("");
+    let result = dbx_core::schema::get_table_owner_core(&state.app, &q.connection_id, database, schema, table)
         .await
         .map_err(AppError::from)?;
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))

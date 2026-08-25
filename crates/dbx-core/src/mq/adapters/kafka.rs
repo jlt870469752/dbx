@@ -197,7 +197,10 @@ impl MessageQueueAdmin for KafkaAdmin {
                 TopicInfo {
                     name: name.clone(),
                     short_name: name,
-                    partitioned: partitions.map(|p| p > 1).unwrap_or(false),
+                    // Kafka topics always have partitions; mark as partitioned so the
+                    // "Adjust Partitions" UI button is available even for single-partition
+                    // topics (fixes t8y2/dbx#6208).
+                    partitioned: partitions.map(|p| p > 0).unwrap_or(false),
                     partitions,
                     persistent: true,
                     internal: t.get("internal").and_then(|v| v.as_bool()).unwrap_or(false),
@@ -206,6 +209,7 @@ impl MessageQueueAdmin for KafkaAdmin {
                     message_count: None,
                     messages_ready: None,
                     messages_unacked: None,
+                    ..Default::default()
                 }
             })
             .collect())
@@ -253,6 +257,7 @@ impl MessageQueueAdmin for KafkaAdmin {
             msg_out_counter: 0,
             subscription_count: 0,
             producer_count: 0,
+            rates_unavailable: false,
             raw: result,
         })
     }
@@ -294,6 +299,10 @@ impl MessageQueueAdmin for KafkaAdmin {
             }
         }
         Ok(subs)
+    }
+
+    async fn get_kafka_consumer_group_snapshot(&self) -> Result<KafkaConsumerGroupSnapshot, String> {
+        self.call("mq_get_consumer_group_snapshot", consumer_group_snapshot_params(&self.config)).await
     }
 
     async fn create_subscription(&self, _topic: &TopicRef, _sub: &str, _pos: ResetPosition) -> Result<(), String> {
@@ -652,6 +661,12 @@ fn build_connection_params(cfg: &MqAdminConfig) -> serde_json::Value {
     })
 }
 
+fn consumer_group_snapshot_params(cfg: &MqAdminConfig) -> serde_json::Value {
+    serde_json::json!({
+        "timeout_ms": cfg.request_timeout_ms(),
+    })
+}
+
 fn peek_messages_params(
     cfg: &MqAdminConfig,
     topic: &TopicRef,
@@ -857,6 +872,28 @@ mod tests {
         assert_eq!(params.get("startPosition").and_then(|value| value.as_str()), Some("offset"));
         assert_eq!(params.get("partition").and_then(|value| value.as_i64()), Some(2));
         assert_eq!(params.get("offset").and_then(|value| value.as_i64()), Some(17));
+    }
+
+    #[test]
+    fn consumer_group_snapshot_params_forward_the_configured_query_timeout() {
+        let mut cfg = kafka_config(serde_json::json!({ "bootstrapServers": "broker:9092" }), MqAuth::None, false);
+        cfg.query_timeout_secs = 17;
+
+        let params = consumer_group_snapshot_params(&cfg);
+
+        assert_eq!(params.get("timeout_ms").and_then(serde_json::Value::as_u64), Some(17_000));
+        assert_eq!(cfg.rpc_timeout(), Some(std::time::Duration::from_secs(17)));
+    }
+
+    #[test]
+    fn consumer_group_snapshot_params_keep_a_finite_agent_budget_for_unlimited_rpc_timeout() {
+        let mut cfg = kafka_config(serde_json::json!({ "bootstrapServers": "broker:9092" }), MqAuth::None, false);
+        cfg.query_timeout_secs = 0;
+
+        let params = consumer_group_snapshot_params(&cfg);
+
+        assert_eq!(params.get("timeout_ms").and_then(serde_json::Value::as_u64), Some(3_600_000));
+        assert_eq!(cfg.rpc_timeout(), None);
     }
 
     #[test]
@@ -1199,5 +1236,22 @@ mod tests {
         });
 
         assert!(kafka_subscription_for_topic("billing-service", "orders", &desc, Some(&lag)).is_none());
+    }
+
+    #[test]
+    fn kafka_topic_partitioned_flag_true_for_any_partition_count() {
+        // Single-partition topics must still be marked as partitioned so the
+        // frontend "Adjust Partitions" button is available (t8y2/dbx#6208).
+        let single = serde_json::json!({ "name": "orders", "partitions": 1 });
+        let partitions = single.get("partitions").and_then(|v| v.as_u64()).map(|v| v as u32);
+        assert!(partitions.map(|p| p > 0).unwrap_or(false));
+
+        let multi = serde_json::json!({ "name": "events", "partitions": 3 });
+        let partitions = multi.get("partitions").and_then(|v| v.as_u64()).map(|v| v as u32);
+        assert!(partitions.map(|p| p > 0).unwrap_or(false));
+
+        let missing = serde_json::json!({ "name": "unknown" });
+        let partitions = missing.get("partitions").and_then(|v| v.as_u64()).map(|v| v as u32);
+        assert!(!partitions.map(|p| p > 0).unwrap_or(false));
     }
 }

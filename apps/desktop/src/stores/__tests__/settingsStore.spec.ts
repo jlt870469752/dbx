@@ -5,6 +5,28 @@ import { DEFAULT_EDITOR_SETTINGS, EXECUTE_MODE_CURRENT_DEFAULT_VERSION, enforceR
 import type { AiConfigItem } from "@/types/ai";
 
 describe("normalizeEditorSettings", () => {
+  it("enables SQL variable substitution by default and only preserves booleans", () => {
+    expect(normalizeEditorSettings({}).sqlVariableSubstitutionEnabled).toBe(true);
+    expect(normalizeEditorSettings({ sqlVariableSubstitutionEnabled: true }).sqlVariableSubstitutionEnabled).toBe(true);
+    expect(normalizeEditorSettings({ sqlVariableSubstitutionEnabled: false }).sqlVariableSubstitutionEnabled).toBe(false);
+    expect(normalizeEditorSettings({ sqlVariableSubstitutionEnabled: "false" } as any).sqlVariableSubstitutionEnabled).toBe(true);
+    expect(normalizeEditorSettings({ sqlVariableSubstitutionEnabled: null } as any).sqlVariableSubstitutionEnabled).toBe(true);
+  });
+
+  it("keeps the quick filter view by default and preserves fixed filter views", () => {
+    expect(normalizeEditorSettings({}).dataGridFilterEditorView).toBe("quick");
+    expect(normalizeEditorSettings({ dataGridFilterEditorView: "conditions" }).dataGridFilterEditorView).toBe("conditions");
+    expect(normalizeEditorSettings({ dataGridFilterEditorView: "text" }).dataGridFilterEditorView).toBe("text");
+    expect(normalizeEditorSettings({ dataGridFilterEditorView: "invalid" } as any).dataGridFilterEditorView).toBe("quick");
+  });
+
+  it("defaults and bounds the persisted text filter panel height", () => {
+    expect(normalizeEditorSettings({}).dataGridTextFilterPanelHeight).toBe(168);
+    expect(normalizeEditorSettings({ dataGridTextFilterPanelHeight: 236.4 }).dataGridTextFilterPanelHeight).toBe(236);
+    expect(normalizeEditorSettings({ dataGridTextFilterPanelHeight: 20 }).dataGridTextFilterPanelHeight).toBe(96);
+    expect(normalizeEditorSettings({ dataGridTextFilterPanelHeight: 900 }).dataGridTextFilterPanelHeight).toBe(420);
+  });
+
   it("keeps data type colors disabled by default and preserves an explicit opt-in", () => {
     expect(normalizeEditorSettings({}).colorizeDataGridCellTypes).toBe(false);
     expect(normalizeEditorSettings({ colorizeDataGridCellTypes: true }).colorizeDataGridCellTypes).toBe(true);
@@ -20,6 +42,14 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ reuseDataTab: true } as any).dataTabReuseMode).toBe("same-table");
   });
 
+  it("keeps adjacent data-tab opening disabled unless explicitly enabled", () => {
+    expect(normalizeEditorSettings({}).openDataTabsNextToActive).toBe(false);
+    expect(normalizeEditorSettings({ openDataTabsNextToActive: true }).openDataTabsNextToActive).toBe(true);
+    expect(normalizeEditorSettings({ openDataTabsNextToActive: false }).openDataTabsNextToActive).toBe(false);
+    expect(normalizeEditorSettings({ openDataTabsNextToActive: "true" } as any).openDataTabsNextToActive).toBe(false);
+    expect(normalizeEditorSettings({ openDataTabsNextToActive: null } as any).openDataTabsNextToActive).toBe(false);
+  });
+
   it("defaults and bounds the regular expression match limit", () => {
     expect(normalizeEditorSettings({}).regexMaxMatchCount).toBe(1000);
     expect(normalizeEditorSettings({ regexMaxMatchCount: 2500 }).regexMaxMatchCount).toBe(2500);
@@ -27,6 +57,17 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ regexMaxMatchCount: Number.POSITIVE_INFINITY }).regexMaxMatchCount).toBe(1000);
     expect(normalizeEditorSettings({ regexMaxMatchCount: Number.NaN }).regexMaxMatchCount).toBe(1000);
   });
+  it("defaults and bounds the sidebar indent and font size", () => {
+    expect(normalizeEditorSettings({}).sidebarIndent).toBe(16);
+    expect(normalizeEditorSettings({}).sidebarFontSize).toBe(14);
+    expect(normalizeEditorSettings({ sidebarIndent: 24, sidebarFontSize: 18 }).sidebarIndent).toBe(24);
+    expect(normalizeEditorSettings({ sidebarIndent: 24, sidebarFontSize: 18 }).sidebarFontSize).toBe(18);
+    expect(normalizeEditorSettings({ sidebarIndent: 999, sidebarFontSize: 1 } as any).sidebarIndent).toBe(32);
+    expect(normalizeEditorSettings({ sidebarIndent: 999, sidebarFontSize: 1 } as any).sidebarFontSize).toBe(9);
+    expect(normalizeEditorSettings({ sidebarIndent: 1.4, sidebarFontSize: 13.6 } as any).sidebarIndent).toBe(4);
+    expect(normalizeEditorSettings({ sidebarIndent: 1.4, sidebarFontSize: 13.6 } as any).sidebarFontSize).toBe(14);
+  });
+
   it("uses inline comments by default and preserves legacy comment visibility", () => {
     expect(normalizeEditorSettings({}).sidebarObjectInfoMode).toBe("comment-inline");
     expect(normalizeEditorSettings({ sidebarObjectInfoMode: "comment-aligned" }).sidebarObjectInfoMode).toBe("comment-aligned");
@@ -90,6 +131,12 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ sidebarConnectionSortMode: "invalid" as any }).sidebarConnectionSortMode).toBe("manual");
   });
 
+  it("shows line numbers by default and preserves an explicit opt-out", () => {
+    expect(normalizeEditorSettings({}).showLineNumbers).toBe(true);
+    expect(normalizeEditorSettings({ showLineNumbers: false }).showLineNumbers).toBe(false);
+    expect(normalizeEditorSettings({ showLineNumbers: "false" } as any).showLineNumbers).toBe(true);
+  });
+
   it("shows the current statement frame by default", () => {
     expect(normalizeEditorSettings({}).showCurrentStatementFrame).toBe(true);
   });
@@ -145,6 +192,12 @@ describe("normalizeEditorSettings", () => {
   it("migrates legacy open tab restore booleans", () => {
     expect(normalizeEditorSettings({ restoreOpenTabsOnLaunch: false } as any).openTabsRestoreMode).toBe("none");
     expect(normalizeEditorSettings({ restoreOpenTabsOnLaunch: true } as any).openTabsRestoreMode).toBe("all");
+  });
+
+  it("prompts for unsaved SQL on quit by default and preserves explicit modes", () => {
+    expect(normalizeEditorSettings({}).appCloseUnsavedTabsMode).toBe("prompt");
+    expect(normalizeEditorSettings({ appCloseUnsavedTabsMode: "keep-drafts" }).appCloseUnsavedTabsMode).toBe("keep-drafts");
+    expect(normalizeEditorSettings({ appCloseUnsavedTabsMode: "invalid" as any }).appCloseUnsavedTabsMode).toBe("prompt");
   });
 
   it("preserves CNB, migrates AtomGit to CNB, and rejects invalid values", () => {
@@ -226,6 +279,16 @@ describe("normalizeEditorSettings", () => {
     expect(invalid.dataGridBooleanDisplayMode).toBe("dropdown");
   });
 
+  it("defaults the cell detail hover button on and preserves only boolean values", () => {
+    expect(normalizeEditorSettings({}).dataGridCellDetailButtonVisible).toBe(true);
+    expect(normalizeEditorSettings({ dataGridCellDetailButtonVisible: true }).dataGridCellDetailButtonVisible).toBe(true);
+    expect(normalizeEditorSettings({ dataGridCellDetailButtonVisible: false }).dataGridCellDetailButtonVisible).toBe(false);
+
+    for (const invalidValue of [0, 1, "false", null]) {
+      expect(normalizeEditorSettings({ dataGridCellDetailButtonVisible: invalidValue as never }).dataGridCellDetailButtonVisible).toBe(true);
+    }
+  });
+
   it("defaults the data grid font and preserves a custom font family", () => {
     const defaultFontFamily = `"Geist Variable Tabular", "Geist Variable", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif`;
     expect(normalizeEditorSettings({}).tableFontFamily).toBe(defaultFontFamily);
@@ -304,6 +367,13 @@ describe("right sidebar panel transitions", () => {
 });
 
 describe("normalizeDesktopSettings", () => {
+  it("normalizes the metadata cache memory budget", () => {
+    expect(normalizeDesktopSettings({}).metadata_cache_max_memory_mb).toBe(64);
+    expect(normalizeDesktopSettings({ metadata_cache_max_memory_mb: 1 }).metadata_cache_max_memory_mb).toBe(16);
+    expect(normalizeDesktopSettings({ metadata_cache_max_memory_mb: 384 }).metadata_cache_max_memory_mb).toBe(384);
+    expect(normalizeDesktopSettings({ metadata_cache_max_memory_mb: 513 }).metadata_cache_max_memory_mb).toBe(64);
+  });
+
   it("defaults DuckDB worker process isolation to disabled for old settings", () => {
     expect(normalizeDesktopSettings({}).duckdb_worker_process_isolation).toBe(false);
   });
@@ -628,6 +698,95 @@ describe("settingsStore persisted settings initialization", () => {
     expect(saveEditorSettings).toHaveBeenCalledWith(expect.objectContaining({ fontSize: 17, theme: "xcode-dark", appLayout: "separated" }));
   });
 
+  it("loads and persists the substitution switch without discarding syntax overrides", async () => {
+    const loadEditorSettings = vi.fn().mockResolvedValue({
+      sqlVariableSubstitutionEnabled: false,
+      sqlVariableSyntaxOverrides: { mysql: { shell: false } },
+    });
+    const saveEditorSettings = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+
+    expect(store.editorSettings.sqlVariableSubstitutionEnabled).toBe(false);
+    expect(store.editorSettings.sqlVariableSyntaxOverrides).toEqual({ mysql: { shell: false } });
+
+    await store.updateEditorSettingsAndPersist({ sqlVariableSubstitutionEnabled: true });
+
+    expect(store.editorSettings.sqlVariableSubstitutionEnabled).toBe(true);
+    expect(store.editorSettings.sqlVariableSyntaxOverrides).toEqual({ mysql: { shell: false } });
+    expect(saveEditorSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sqlVariableSubstitutionEnabled: true,
+        sqlVariableSyntaxOverrides: { mysql: { shell: false } },
+      }),
+    );
+  });
+
+  it("loads and persists adjacent data-tab opening", async () => {
+    const loadEditorSettings = vi.fn().mockResolvedValue({ openDataTabsNextToActive: true });
+    const saveEditorSettings = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+
+    expect(store.editorSettings.openDataTabsNextToActive).toBe(true);
+
+    await store.updateEditorSettingsAndPersist({ openDataTabsNextToActive: false });
+
+    expect(store.editorSettings.openDataTabsNextToActive).toBe(false);
+    expect(saveEditorSettings).toHaveBeenLastCalledWith(expect.objectContaining({ openDataTabsNextToActive: false }));
+  });
+
+  it("loads, persists, and reloads the cell detail button visibility", async () => {
+    let persistedSettings: Record<string, unknown> = { dataGridCellDetailButtonVisible: false };
+    const loadEditorSettings = vi.fn(async () => JSON.parse(JSON.stringify(persistedSettings)));
+    const saveEditorSettings = vi.fn(async (settings: Record<string, unknown>) => {
+      persistedSettings = JSON.parse(JSON.stringify(settings));
+    });
+    vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+
+    expect(store.editorSettings.dataGridCellDetailButtonVisible).toBe(false);
+    await store.updateEditorSettingsAndPersist({ dataGridCellDetailButtonVisible: true });
+    expect(saveEditorSettings).toHaveBeenLastCalledWith(expect.objectContaining({ dataGridCellDetailButtonVisible: true }));
+
+    setActivePinia(createPinia());
+    const restartedStore = useSettingsStore();
+    await restartedStore.initEditorSettings();
+    expect(restartedStore.editorSettings.dataGridCellDetailButtonVisible).toBe(true);
+  });
+
+  it("loads, persists, and reloads hidden query editor line numbers", async () => {
+    let persistedSettings: Record<string, unknown> = { showLineNumbers: true };
+    const loadEditorSettings = vi.fn(async () => JSON.parse(JSON.stringify(persistedSettings)));
+    const saveEditorSettings = vi.fn(async (settings: Record<string, unknown>) => {
+      persistedSettings = JSON.parse(JSON.stringify(settings));
+    });
+    vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+    await store.updateEditorSettingsAndPersist({ showLineNumbers: false });
+
+    expect(store.editorSettings.showLineNumbers).toBe(false);
+    expect(saveEditorSettings).toHaveBeenLastCalledWith(expect.objectContaining({ showLineNumbers: false }));
+
+    setActivePinia(createPinia());
+    const restartedStore = useSettingsStore();
+    await restartedStore.initEditorSettings();
+
+    expect(restartedStore.editorSettings.showLineNumbers).toBe(false);
+  });
+
   it("shares concurrent initialization and applies startup changes after saved settings load", async () => {
     let resolveLoad!: (value: unknown) => void;
     const loadEditorSettings = vi.fn(
@@ -705,6 +864,38 @@ describe("settingsStore editor settings persistence", () => {
   beforeEach(() => {
     vi.resetModules();
     setActivePinia(createPinia());
+  });
+
+  it("initializes legacy settings before queueing formatter mutations", async () => {
+    const loadEditorSettings = vi.fn().mockResolvedValue({
+      updateDownloadSource: "atomgit",
+      customColumnFormatters: {},
+      executeModeDefaultVersion: EXECUTE_MODE_CURRENT_DEFAULT_VERSION,
+    });
+    const saveEditorSettings = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    const formatter = { id: "fmt_pre_init", name: "Pre-init", template: "legacy:${value}" };
+
+    await store.upsertCustomColumnFormatter(formatter);
+
+    expect(loadEditorSettings).toHaveBeenCalledOnce();
+    expect(saveEditorSettings).toHaveBeenCalledTimes(2);
+    expect(saveEditorSettings.mock.calls[0][0]).toEqual(
+      expect.objectContaining({
+        updateDownloadSource: "cnb",
+        customColumnFormatters: {},
+      }),
+    );
+    expect(saveEditorSettings.mock.calls[1][0]).toEqual(
+      expect.objectContaining({
+        updateDownloadSource: "cnb",
+        customColumnFormatters: { fmt_pre_init: formatter },
+      }),
+    );
+    expect(store.editorSettings.customColumnFormatters.fmt_pre_init).toEqual(formatter);
   });
 
   it("rolls back a failed atomic update and allows retry", async () => {
@@ -816,6 +1007,65 @@ describe("settingsStore editor settings persistence", () => {
 
     expect(store.editorSettings).toMatchObject({ ignoredUpdateVersion: "", theme: "xcode-dark" });
     expect(saveEditorSettings.mock.calls[1][0]).toEqual(expect.objectContaining({ ignoredUpdateVersion: "", theme: "xcode-dark" }));
+  });
+
+  it("serializes queued saves before a failed formatter delete", async () => {
+    let persistedSettings: Record<string, unknown> = {
+      customColumnFormatters: {
+        fmt_a: { id: "fmt_a", name: "A", template: "a:${value}" },
+      },
+      columnFormatters: {
+        first: { kind: "custom-ref", formatterId: "fmt_a" },
+      },
+      executeModeDefaultVersion: EXECUTE_MODE_CURRENT_DEFAULT_VERSION,
+    };
+    const loadEditorSettings = vi.fn(async () => JSON.parse(JSON.stringify(persistedSettings)));
+    const saveEditorSettings = vi.fn(async (settings: Record<string, unknown>) => {
+      persistedSettings = JSON.parse(JSON.stringify(settings));
+    });
+    vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+    saveEditorSettings.mockClear();
+
+    let resolveFirstSave!: () => void;
+    let saveCall = 0;
+    saveEditorSettings.mockImplementation(async (settings: Record<string, unknown>) => {
+      saveCall += 1;
+      if (saveCall === 1) {
+        await new Promise<void>((resolve) => {
+          resolveFirstSave = resolve;
+        });
+      }
+      if (saveCall === 3) throw new Error("delete save failed");
+      persistedSettings = JSON.parse(JSON.stringify(settings));
+    });
+
+    store.updateEditorSettings({ theme: "xcode-dark" });
+    await vi.waitFor(() => expect(saveEditorSettings).toHaveBeenCalledOnce());
+    store.updateEditorSettings({ resultRunDisplayMode: "list" });
+    const deletePromise = store.deleteCustomColumnFormatter("fmt_a");
+    const deleteRejected = expect(deletePromise).rejects.toThrow("delete save failed");
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.editorSettings.customColumnFormatters.fmt_a).toBeDefined();
+
+    resolveFirstSave();
+    await deleteRejected;
+
+    expect(saveEditorSettings).toHaveBeenCalledTimes(3);
+    expect(store.editorSettings.customColumnFormatters.fmt_a).toBeDefined();
+    expect(store.editorSettings.columnFormatters.first).toEqual({ kind: "custom-ref", formatterId: "fmt_a" });
+
+    setActivePinia(createPinia());
+    const restartedStore = useSettingsStore();
+    await restartedStore.initEditorSettings();
+
+    expect(restartedStore.editorSettings.customColumnFormatters.fmt_a).toEqual({ id: "fmt_a", name: "A", template: "a:${value}" });
+    expect(restartedStore.editorSettings.columnFormatters.first).toEqual({ kind: "custom-ref", formatterId: "fmt_a" });
   });
 });
 

@@ -181,6 +181,7 @@ fn add_mq_routes(router: Router<Arc<WebState>>) -> Router<Arc<WebState>> {
         .route("/mq/messages/trace", post(routes::mq::query_message_trace))
         .route("/mq/subscriptions/list", post(routes::mq::list_subscriptions))
         .route("/mq/subscriptions/enrich", post(routes::mq::enrich_subscriptions))
+        .route("/mq/kafka/consumer-groups", post(routes::mq::get_kafka_consumer_group_snapshot))
         .route("/mq/subscriptions/create", post(routes::mq::create_subscription))
         .route("/mq/subscriptions/delete", post(routes::mq::delete_subscription))
         .route("/mq/subscriptions/skip-messages", post(routes::mq::skip_messages))
@@ -333,6 +334,12 @@ async fn main() {
         .route("/connection/final-proxy-port", post(routes::connection::connection_final_proxy_port))
         .route("/connection/disconnect", post(routes::connection::disconnect_db))
         .route("/connection/check-health", post(routes::connection::check_connection_health))
+        .route("/connection/session-credential-status", post(routes::connection::session_credential_status))
+        .route("/connection/forget-session-credential", post(routes::connection::forget_session_credential))
+        .route(
+            "/connection/replace-nacos-session-credential",
+            post(routes::connection::replace_nacos_session_credential),
+        )
         .route("/connection/identifier-quote", post(routes::connection::connection_identifier_quote))
         .route("/connection/close-database", post(routes::connection::close_database_connection))
         .route("/connection/save", post(routes::connection::save_connections))
@@ -376,7 +383,9 @@ async fn main() {
         .route("/agents/runtime/stop", post(routes::agents::stop_driver_runtime))
         .route("/agents/runtime/restart", post(routes::agents::restart_driver_runtime))
         .route("/agents/install", post(routes::agents::install_agent))
+        .route("/agents/cancel-install", post(routes::agents::cancel_install))
         .route("/agents/upgrade-all", post(routes::agents::upgrade_all_agents))
+        .route("/agents/cancel-upgrade-all", post(routes::agents::cancel_upgrade_all))
         .route("/agents/update-blockers", post(routes::agents::check_agent_update_blockers))
         .route("/agents/uninstall", post(routes::agents::uninstall_agent))
         .route("/agents/import-offline", post(routes::agents::import_agents_from_zip))
@@ -409,20 +418,25 @@ async fn main() {
         .route("/schema/completion-objects", get(routes::schema::list_completion_objects))
         .route("/schema/completion-assistant", post(routes::schema::completion_assistant_search))
         .route("/schema/object-source", get(routes::schema::get_object_source))
+        .route("/schema/event-info", get(routes::schema::get_event_info))
         .route("/schema/custom-type-details", get(routes::schema::get_custom_type_details))
         .route("/schema/columns", get(routes::schema::list_columns))
         .route("/schema/all-columns", get(routes::schema::get_all_columns))
         .route("/schema/data-types", get(routes::schema::list_data_types))
         .route("/schema/indexes", get(routes::schema::list_indexes))
+        .route("/schema/reference-key-columns", get(routes::schema::list_reference_key_columns))
         .route("/schema/foreign-keys", get(routes::schema::list_foreign_keys))
         .route("/schema/triggers", get(routes::schema::list_triggers))
         .route("/schema/constraints", get(routes::schema::list_constraints))
         .route("/schema/partitions", get(routes::schema::list_partitions))
+        .route("/schema/table-partition-status", get(routes::schema::get_table_partition_status))
+        .route("/schema/invalid-indexes", get(routes::schema::list_invalid_indexes))
         .route("/schema/subpartitions", get(routes::schema::list_subpartitions))
         .route("/schema/functions", get(routes::schema::list_functions))
         .route("/schema/sequences", get(routes::schema::list_sequences))
         .route("/schema/rules", get(routes::schema::list_rules))
         .route("/schema/owners", get(routes::schema::list_owners))
+        .route("/schema/table-owner", get(routes::schema::get_table_owner))
         .route("/schema/extensions", get(routes::schema::list_extensions))
         .route("/schema/available-extensions", get(routes::schema::list_available_extensions))
         .route("/schema/ddl", get(routes::schema::get_ddl))
@@ -434,6 +448,7 @@ async fn main() {
         .route("/dialect/data-types", get(routes::dialect::list_data_types))
         .route("/schema-diff/prepare", post(routes::schema_diff::prepare_schema_diff))
         .route("/schema-diff/generate-sync-sql", post(routes::schema_diff::generate_schema_sync_sql))
+        .route("/schema-diff/generate-sync-plan", post(routes::schema_diff::generate_schema_sync_plan))
         .route(
             "/schema/cache",
             post(routes::schema_cache::save_schema_cache).get(routes::schema_cache::load_schema_cache),
@@ -450,6 +465,7 @@ async fn main() {
         .route("/tab-runtime-cache/owner", delete(routes::tab_runtime_cache::delete_tab_runtime_cache_owner))
         // Query
         .route("/query/execute", post(routes::query::execute_query))
+        .route("/query/execute-conditional-update", post(routes::query::execute_conditional_update))
         .route("/query/execute-multi", post(routes::query::execute_multi))
         .route("/query/execute-batch", post(routes::query::execute_batch))
         .route("/query/execute-script", post(routes::query::execute_script))
@@ -467,6 +483,8 @@ async fn main() {
         .route("/query/build-database-search-sql", post(routes::query::build_database_search_sql))
         .route("/query/build-search-result-where", post(routes::query::build_search_result_where))
         .route("/query/build-rename-object-sql", post(routes::query::build_rename_object_sql))
+        .route("/query/build-rename-database-sql", post(routes::query::build_rename_database_sql))
+        .route("/query/build-rename-database-preflight-sql", post(routes::query::build_rename_database_preflight_sql))
         .route("/query/build-create-database-sql", post(routes::query::build_create_database_sql))
         .route("/query/build-sqlite-attach-database-sql", post(routes::query::build_sqlite_attach_database_sql))
         .route("/query/build-drop-object-sql", post(routes::query::build_drop_object_sql))
@@ -474,6 +492,7 @@ async fn main() {
         .route("/query/build-drop-table-child-object-sql", post(routes::query::build_drop_table_child_object_sql))
         .route("/query/build-empty-table-sql", post(routes::query::build_empty_table_sql))
         .route("/query/build-truncate-table-sql", post(routes::query::build_truncate_table_sql))
+        .route("/query/build-vacuum-table-sql", post(routes::query::build_vacuum_table_sql))
         .route("/query/build-mysql-auto-increment-sql", post(routes::query::build_mysql_auto_increment_sql))
         .route("/query/build-drop-database-sql", post(routes::query::build_drop_database_sql))
         .route("/query/build-create-schema-sql", post(routes::query::build_create_schema_sql))
@@ -493,6 +512,7 @@ async fn main() {
         )
         .route("/query/build-view-ddl-sql", post(routes::query::build_view_ddl_sql))
         .route("/query/build-table-structure-change-sql", post(routes::query::build_table_structure_change_sql))
+        .route("/query/build-table-owner-change-sql", post(routes::query::build_table_owner_change_sql))
         .route(
             "/query/preview-sqlite-table-structure-change",
             post(routes::query::preview_sqlite_table_structure_change),
@@ -533,6 +553,10 @@ async fn main() {
             post(routes::query::build_data_grid_column_distinct_values_sql),
         )
         .route("/query/build-data-grid-count-sql", post(routes::query::build_data_grid_count_sql))
+        .route(
+            "/query/build-data-grid-conditional-update-sql",
+            post(routes::query::build_data_grid_conditional_update_sql),
+        )
         .route("/query/build-hive-table-properties-sql", post(routes::query::build_hive_table_properties_sql))
         .route("/query/build-export-insert-statements", post(routes::query::build_export_insert_statements))
         .route("/query/build-export-sql-insert", post(routes::query::build_export_sql_insert))
@@ -542,6 +566,7 @@ async fn main() {
         .route("/data-compare/prepare-missing-target", post(routes::data_compare::prepare_data_compare_missing_target))
         .route("/data-compare/build-sync-plan", post(routes::data_compare::build_data_compare_sync_plan))
         .route("/query/cancel", post(routes::query::cancel_query))
+        .route("/query/cancel-conditional-update", post(routes::query::cancel_conditional_update))
         .route("/query/close-session", post(routes::query::close_query_session))
         .route("/query/close-client-session", post(routes::query::close_client_connection_session))
         .route("/export/query-result-json", post(routes::text_export::export_query_result_json))
@@ -560,6 +585,7 @@ async fn main() {
         .route("/redis/load-more", post(routes::redis::load_more))
         .route("/redis/set-string", post(routes::redis::set_string))
         .route("/redis/delete-key", post(routes::redis::delete_key))
+        .route("/redis/rename-key", post(routes::redis::rename_key))
         .route("/redis/hash-set", post(routes::redis::hash_set))
         .route("/redis/hash-del", post(routes::redis::hash_del))
         .route("/redis/hash-field-set-ttl", post(routes::redis::hash_field_set_ttl))
@@ -721,8 +747,10 @@ async fn main() {
         // Nacos
         .route("/nacos/test-connection", post(routes::nacos::test_connection))
         .route("/nacos/namespaces/list", post(routes::nacos::list_namespaces))
+        .route("/nacos/sidebar/snapshot", post(routes::nacos::sidebar_snapshot))
         .route("/nacos/namespaces/create", post(routes::nacos::create_namespace))
         .route("/nacos/namespaces/update", post(routes::nacos::update_namespace))
+        .route("/nacos/namespaces/delete", post(routes::nacos::delete_namespace))
         .route("/nacos/configs/list", post(routes::nacos::list_configs))
         .route("/nacos/configs/get", post(routes::nacos::get_config))
         .route("/nacos/configs/publish", post(routes::nacos::publish_config))
@@ -732,6 +760,18 @@ async fn main() {
         .route("/nacos/configs/history/rollback", post(routes::nacos::rollback_config))
         .route("/nacos/rnacos-console/captcha", post(routes::nacos::get_rnacos_console_captcha))
         .route("/nacos/rnacos-console/login", post(routes::nacos::login_rnacos_console))
+        .route("/nacos/users/list", post(routes::nacos::list_users))
+        .route("/nacos/users/create", post(routes::nacos::create_user))
+        .route("/nacos/users/update", post(routes::nacos::update_user))
+        .route("/nacos/users/delete", post(routes::nacos::delete_user))
+        .route("/nacos/roles/list", post(routes::nacos::list_role_bindings))
+        .route("/nacos/roles/assign", post(routes::nacos::assign_role))
+        .route("/nacos/roles/remove", post(routes::nacos::remove_role))
+        .route("/nacos/access/snapshot", post(routes::nacos::access_snapshot))
+        .route("/nacos/access/operations/start", post(routes::nacos::start_access_operation))
+        .route("/nacos/access/operations/get", post(routes::nacos::get_access_operation))
+        .route("/nacos/access/operations/retry", post(routes::nacos::retry_access_operation))
+        .route("/nacos/access/operations/undo", post(routes::nacos::undo_access_operation))
         .route("/nacos/services/list", post(routes::nacos::list_services))
         .route("/nacos/services/get", post(routes::nacos::get_service))
         .route("/nacos/services/create", post(routes::nacos::create_service))
@@ -753,7 +793,11 @@ async fn main() {
         // MongoDB
         .route("/mongo/list-databases", post(routes::mongo::list_databases))
         .route("/mongo/list-collections", post(routes::mongo::list_collections))
-        .route("/mongo/vector-collection-detail", post(routes::mongo::vector_collection_detail))
+        .route("/mongo/vector-collection-detail", post(routes::vector::collection_detail))
+        .route("/vector/collection-detail", post(routes::vector::collection_detail))
+        .route("/vector/drop-database", post(routes::vector::drop_database))
+        .route("/vector/drop-collection", post(routes::vector::drop_collection))
+        .route("/vector/rename-collection", post(routes::vector::rename_collection))
         .route("/mongo/create-database", post(routes::mongo::create_database))
         .route("/mongo/drop-database", post(routes::mongo::drop_database))
         .route("/mongo/drop-collection", post(routes::mongo::drop_collection))
@@ -762,6 +806,8 @@ async fn main() {
         .route("/document-store/list-databases", post(routes::document_store::list_databases))
         .route("/document-store/list-collections", post(routes::document_store::list_collections))
         .route("/document-store/find-documents", post(routes::document_store::find_documents))
+        .route("/document-store/count-documents", post(routes::document_store::count_documents))
+        .route("/document-store/dynamodb-describe-table", post(routes::document_store::describe_dynamodb_table))
         .route(
             "/document-store/elasticsearch-count-documents",
             post(routes::document_store::elasticsearch_count_documents),
@@ -777,6 +823,31 @@ async fn main() {
         .route("/document-store/update-document", post(routes::document_store::update_document))
         .route("/document-store/delete-document", post(routes::document_store::delete_document))
         .route("/document-store/save-meilisearch-batch", post(routes::document_store::save_meilisearch_batch))
+        .route("/document-store/meilisearch/search", post(routes::document_store::meilisearch_search))
+        .route("/document-store/meilisearch/documents/fetch", post(routes::document_store::meilisearch_fetch_documents))
+        .route("/document-store/meilisearch/documents/get", post(routes::document_store::meilisearch_get_document))
+        .route("/document-store/meilisearch/settings/get", post(routes::document_store::meilisearch_get_settings))
+        .route("/document-store/meilisearch/settings/update", post(routes::document_store::meilisearch_update_settings))
+        .route("/document-store/meilisearch/stats", post(routes::document_store::meilisearch_get_stats))
+        .route("/document-store/meilisearch/overview", post(routes::document_store::meilisearch_get_overview))
+        .route("/document-store/meilisearch/index/delete", post(routes::document_store::meilisearch_delete_index))
+        .route(
+            "/document-store/meilisearch/system/overview",
+            post(routes::document_store::meilisearch_get_system_overview),
+        )
+        .route("/document-store/meilisearch/keys/list", post(routes::document_store::meilisearch_list_keys))
+        .route("/document-store/meilisearch/keys/get", post(routes::document_store::meilisearch_get_key))
+        .route("/document-store/meilisearch/keys/create", post(routes::document_store::meilisearch_create_key))
+        .route("/document-store/meilisearch/keys/update", post(routes::document_store::meilisearch_update_key))
+        .route("/document-store/meilisearch/keys/delete", post(routes::document_store::meilisearch_delete_key))
+        .route("/document-store/meilisearch/tasks/list", post(routes::document_store::meilisearch_get_tasks))
+        .route("/document-store/meilisearch/tasks/get", post(routes::document_store::meilisearch_get_task))
+        .route("/document-store/meilisearch/tasks/cancel", post(routes::document_store::meilisearch_cancel_tasks))
+        .route("/document-store/meilisearch/tasks/delete", post(routes::document_store::meilisearch_delete_tasks))
+        .route(
+            "/document-store/meilisearch/documents/delete-all",
+            post(routes::document_store::meilisearch_delete_all_documents),
+        )
         .route("/mongo/find-documents", post(routes::mongo::find_documents))
         .route("/mongo/parse-shell-command", post(routes::mongo::parse_shell_command))
         .route("/mongo/explain-find", post(routes::mongo::explain_find))

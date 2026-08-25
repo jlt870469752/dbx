@@ -1,6 +1,6 @@
 import type { DatabaseType } from "@/types/database";
 
-export type SidebarObjectKind = "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
+export type SidebarObjectKind = "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "EVENT" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
 
 export interface DatabaseObjectCapabilities {
   sidebarObjects: SidebarObjectKind[];
@@ -12,7 +12,7 @@ const TABLE_VIEW_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW"];
 const TABLE_VIEW_MV_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW"];
 
 const ROUTINE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "PROCEDURE", "FUNCTION"];
-const MYSQL_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "PROCEDURE", "FUNCTION", "TRIGGER"];
+const MYSQL_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "EVENT"];
 
 // PostgreSQL-family databases with a verified pg_type listing path. TYPE only
 // covers user-created types (enum/domain/composite/range/multirange/base);
@@ -24,14 +24,15 @@ const POSTGRES_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VI
 const POSTGRES_NO_TYPE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "SEQUENCE"];
 
 // Kingbase and Vastbase agents support the same user-defined type listing via
-// their own metadata query, but do not expose sequences. Kept separate from
-// POSTGRES_OBJECTS and POSTGRES_LIKE_OBJECTS so unverified PG-like databases
-// (highgo/uxdb/redshift) never advertise TYPE.
-const KINGBASE_VASTBASE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "TYPE"];
+// their own metadata query, but do not expose sequences. Kingbase additionally
+// has a verified schema-trigger path; keep Vastbase separate until its Agent
+// exposes the same parent-table-aware metadata contract.
+const KINGBASE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "TYPE"];
+const VASTBASE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "TYPE"];
 
 const POSTGRES_LIKE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION"];
-const ORACLE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "SYNONYM", "PACKAGE", "PACKAGE_BODY"];
-const OCEANBASE_ORACLE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE_BODY"];
+const ORACLE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "SEQUENCE", "SYNONYM", "PACKAGE", "PACKAGE_BODY"];
+const OCEANBASE_ORACLE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "SEQUENCE", "PACKAGE", "PACKAGE_BODY"];
 const DAMENG_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "SEQUENCE", "PACKAGE", "PACKAGE_BODY"];
 const XUGU_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "SEQUENCE", "SYNONYM", "PACKAGE", "PACKAGE_BODY", "TYPE", "TYPE_BODY"];
 const PACKAGE_MEMBER_EXPANSION_DATABASES = new Set<DatabaseType>(["oracle", "xugu"]);
@@ -43,10 +44,10 @@ const DATABASE_TYPE_OBJECTS = new Map<DatabaseType, SidebarObjectKind[]>([
   ["kwdb", POSTGRES_NO_TYPE_OBJECTS],
   ["opengauss", POSTGRES_OBJECTS],
   // postgres like
-  ["kingbase", KINGBASE_VASTBASE_OBJECTS],
+  ["kingbase", KINGBASE_OBJECTS],
   ["highgo", POSTGRES_LIKE_OBJECTS],
   ["uxdb", POSTGRES_LIKE_OBJECTS],
-  ["vastbase", KINGBASE_VASTBASE_OBJECTS],
+  ["vastbase", VASTBASE_OBJECTS],
   ["redshift", POSTGRES_LIKE_OBJECTS],
   // oracle
   ["oracle", ORACLE_OBJECTS],
@@ -69,12 +70,19 @@ const DATABASE_TYPE_OBJECTS = new Map<DatabaseType, SidebarObjectKind[]>([
   ["doris", TABLE_VIEW_OBJECTS],
   ["starrocks", TABLE_VIEW_MV_OBJECTS],
   ["hive", TABLE_VIEW_OBJECTS],
+  ["kyuubi", TABLE_VIEW_OBJECTS],
+  ["impala", TABLE_VIEW_OBJECTS],
   ["spark", TABLE_VIEW_OBJECTS],
   ["trino", TABLE_VIEW_OBJECTS],
   ["prestosql", TABLE_VIEW_OBJECTS],
   ["cassandra", TABLE_VIEW_OBJECTS],
   ["bigquery", TABLE_VIEW_OBJECTS],
+  // Cloud Spanner has no triggers, routines, sequences, or synonyms; without an
+  // explicit entry the sidebar would fall back to ROUTINE_OBJECTS.
+  ["spanner", TABLE_VIEW_OBJECTS],
   ["kylin", TABLE_VIEW_OBJECTS],
+  ["ignite", TABLE_VIEW_OBJECTS],
+  ["ignite3", TABLE_VIEW_OBJECTS],
   ["tdengine", TABLE_VIEW_OBJECTS],
   ["iotdb", TABLE_VIEW_OBJECTS],
   ["neo4j", TABLE_VIEW_OBJECTS],
@@ -153,6 +161,7 @@ export function normalizeSidebarObjectKind(type: string): SidebarObjectKind {
   if (normalized.includes("TYPE_BODY")) return "TYPE_BODY";
   if (normalized.includes("PACKAGE")) return "PACKAGE";
   if (normalized.includes("TRIGGER")) return "TRIGGER";
+  if (normalized.includes("EVENT")) return "EVENT";
   if (normalized.includes("TYPE")) return "TYPE";
   if (normalized.includes("MATERIALIZED_VIEW")) return "MATERIALIZED_VIEW";
   if (value.includes("VIEW")) return "VIEW";

@@ -1,14 +1,17 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io::{BufWriter, Write};
 use std::sync::RwLock;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use crate::connection::task_client_session_id;
 use crate::models::connection::DatabaseType;
 use crate::mysql_ddl_normalize::DdlNormalizeOptions;
 use crate::object_source_sql::build_export_object_source_sql;
-use crate::sql_dialect::{qualified_table_name, quote_table_identifier, uses_single_row_insert_statements};
+use crate::sql_dialect::{qualified_table_name, uses_single_row_insert_statements};
 use crate::transfer::{
     format_ch_array_sql_literal, format_pg_array_sql_literal, is_identity_column_extra,
     is_mysql_generated_column_extra, keyset_pagination_sql_with_identifier_quote, quote_identifier,
@@ -18,6 +21,9 @@ use crate::types::ObjectSourceKind;
 
 static EXPORT_CANCELLED: std::sync::LazyLock<RwLock<HashSet<String>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
+
+const EXPORT_CANCELLED_ERROR: &str = "Export cancelled";
+const EXPORT_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub fn database_export_client_session_id(export_id: &str) -> String {
     task_client_session_id("database-export", export_id)
@@ -266,6 +272,8 @@ pub struct ExportedTableSql {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_type: Option<DatabaseType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_quote: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_name: Option<String>,
@@ -290,6 +298,8 @@ pub struct ExportedTableSql {
 pub struct BuildExportInsertStatementsOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_type: Option<DatabaseType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_quote: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -935,6 +945,7 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
         options.schema.as_deref(),
         options.table_name.as_deref(),
         options.qualified_table_name.as_deref(),
+        options.identifier_quote.as_deref(),
     )?;
     let insert_columns = options
         .columns
@@ -970,7 +981,13 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
     };
     let columns = insert_columns
         .iter()
-        .map(|(_, column, _)| quote_table_identifier(options.database_type, column))
+        .map(|(_, column, _)| {
+            crate::sql_dialect::quote_table_data_identifier(
+                options.database_type,
+                column,
+                options.identifier_quote.as_deref(),
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let mut statements = Vec::new();
@@ -983,54 +1000,63 @@ pub fn build_export_insert_statements(options: BuildExportInsertStatementsOption
     let statement_overhead_bytes = export_sql_statement_bytes(options.database_type, &statement_prefix) + 1;
     let target_statement_bytes = DATABASE_EXPORT_TARGET_STATEMENT_BYTES;
     let separator_bytes = export_sql_statement_bytes(options.database_type, ", ");
-    let mut current_values = Vec::with_capacity(batch_size);
+    let mut current_values = String::new();
     let mut current_values_bytes = 0usize;
+    let mut current_row_count = 0usize;
 
-    let flush_values = |statements: &mut Vec<String>, values: &mut Vec<String>, values_bytes: &mut usize| {
-        if values.is_empty() {
-            return;
-        }
-        let insert_sql = format!("{statement_prefix}{};", values.join(", "));
-        if needs_dameng_identity_insert {
-            statements.push(wrap_dameng_identity_insert_sql_for_table(&insert_sql, &table));
-        } else {
-            statements.push(insert_sql);
-        }
-        values.clear();
-        *values_bytes = 0;
-    };
+    let flush_values =
+        |statements: &mut Vec<String>, values: &mut String, values_bytes: &mut usize, row_count: &mut usize| {
+            if *row_count == 0 {
+                return;
+            }
+            let mut insert_sql = String::with_capacity(statement_prefix.len() + values.len() + 1);
+            insert_sql.push_str(&statement_prefix);
+            insert_sql.push_str(values);
+            insert_sql.push(';');
+            if needs_dameng_identity_insert {
+                statements.push(wrap_dameng_identity_insert_sql_for_table(&insert_sql, &table));
+            } else {
+                statements.push(insert_sql);
+            }
+            values.clear();
+            *values_bytes = 0;
+            *row_count = 0;
+        };
 
     for row in options.rows {
-        let row_values = insert_columns
-            .iter()
-            .map(|(index, _, sqlserver_unicode_string)| {
-                let value = row.get(*index).unwrap_or(&Value::Null);
-                format_export_sql_literal_typed(
-                    value,
-                    options.database_type,
-                    options.column_types.get(*index).and_then(|value| value.as_deref()),
-                    *sqlserver_unicode_string,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let rendered_row = format!("({row_values})");
+        let mut rendered_row = String::with_capacity(insert_columns.len().saturating_mul(16).saturating_add(2));
+        rendered_row.push('(');
+        for (column_index, (index, _, sqlserver_unicode_string)) in insert_columns.iter().enumerate() {
+            if column_index > 0 {
+                rendered_row.push_str(", ");
+            }
+            let value = row.get(*index).unwrap_or(&Value::Null);
+            rendered_row.push_str(&format_export_sql_literal_typed(
+                value,
+                options.database_type,
+                options.column_types.get(*index).and_then(|value| value.as_deref()),
+                *sqlserver_unicode_string,
+            ));
+        }
+        rendered_row.push(')');
         let rendered_row_bytes = export_sql_statement_bytes(options.database_type, &rendered_row);
         let candidate_bytes = statement_overhead_bytes
             + current_values_bytes
-            + if current_values.is_empty() { 0 } else { separator_bytes }
+            + if current_row_count == 0 { 0 } else { separator_bytes }
             + rendered_row_bytes;
 
-        if !current_values.is_empty()
-            && (current_values.len() >= batch_size || candidate_bytes > target_statement_bytes)
-        {
-            flush_values(&mut statements, &mut current_values, &mut current_values_bytes);
+        if current_row_count > 0 && (current_row_count >= batch_size || candidate_bytes > target_statement_bytes) {
+            flush_values(&mut statements, &mut current_values, &mut current_values_bytes, &mut current_row_count);
         }
-        current_values_bytes += if current_values.is_empty() { 0 } else { separator_bytes };
+        if current_row_count > 0 {
+            current_values.push_str(", ");
+            current_values_bytes += separator_bytes;
+        }
+        current_values.push_str(&rendered_row);
         current_values_bytes += rendered_row_bytes;
-        current_values.push(rendered_row);
+        current_row_count += 1;
     }
-    flush_values(&mut statements, &mut current_values, &mut current_values_bytes);
+    flush_values(&mut statements, &mut current_values, &mut current_values_bytes, &mut current_row_count);
 
     Ok(statements)
 }
@@ -1131,6 +1157,7 @@ pub fn build_database_sql_export(options: BuildDatabaseSqlExportOptions) -> Resu
 
         let inserts = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: table.database_type,
+            identifier_quote: table.identifier_quote.clone(),
             schema: table.schema,
             table_name: table.table_name,
             qualified_table_name: table.qualified_table_name,
@@ -1156,6 +1183,7 @@ fn export_qualified_table_name(
     schema: Option<&str>,
     table_name: Option<&str>,
     qualified_name: Option<&str>,
+    identifier_quote: Option<&str>,
 ) -> Result<String, String> {
     if let Some(name) = qualified_name.filter(|name| !name.trim().is_empty()) {
         return Ok(name.to_string());
@@ -1163,6 +1191,14 @@ fn export_qualified_table_name(
     let table_name = table_name
         .filter(|name| !name.trim().is_empty())
         .ok_or_else(|| "tableName is required when qualifiedTableName is not provided".to_string())?;
+    if crate::sql_dialect::uses_connection_identifier_quote(database_type, identifier_quote) {
+        return Ok(crate::sql_dialect::table_data_qualified_table_name(
+            database_type,
+            schema,
+            table_name,
+            identifier_quote,
+        ));
+    }
     Ok(qualified_table_name(database_type, schema, table_name))
 }
 
@@ -1182,6 +1218,34 @@ fn format_export_table_ddl(ddl: &str, database_type: Option<DatabaseType>, opts:
     let ddl = normalize_export_table_ddl(ddl, database_type, opts);
     let ddl = ddl.trim().trim_end_matches(';').trim_end();
     format!("{ddl};")
+}
+
+fn split_postgres_export_table_triggers(ddl: &str, database_type: DatabaseType) -> (String, Vec<String>) {
+    if database_type != DatabaseType::Postgres {
+        return (ddl.to_string(), Vec::new());
+    }
+
+    let mut table_statements = Vec::new();
+    let mut trigger_statements = Vec::new();
+    for range in crate::db::ddl_scan::top_level_statement_ranges(ddl) {
+        let statement = ddl[range].trim();
+        if statement.is_empty() {
+            continue;
+        }
+        let mut words = statement.split_ascii_whitespace().take(3).map(str::to_ascii_uppercase);
+        let first = words.next();
+        let second = words.next();
+        let third = words.next();
+        if first.as_deref() == Some("CREATE")
+            && (second.as_deref() == Some("TRIGGER")
+                || (second.as_deref() == Some("CONSTRAINT") && third.as_deref() == Some("TRIGGER")))
+        {
+            trigger_statements.push(statement.to_string());
+        } else {
+            table_statements.push(statement.to_string());
+        }
+    }
+    (table_statements.join("\n"), trigger_statements)
 }
 
 fn postgres_sequence_qualified_name(schema: &str, sequence_name: &str) -> String {
@@ -1395,6 +1459,74 @@ pub async fn clear_export_cancelled(export_id: &str) {
     }
 }
 
+/// Await one export operation while still observing the export-id cancellation
+/// marker. Metadata helpers ultimately await database-driver futures that do
+/// not accept a cancellation token; polling here keeps the export task
+/// responsive and dropping the pending future follows the same bounded
+/// prefetch cancellation behavior used below.
+async fn await_export_operation<T, F>(export_id: &str, operation: F) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    tokio::pin!(operation);
+    loop {
+        if is_export_cancelled_now(export_id) {
+            return Err(EXPORT_CANCELLED_ERROR.to_string());
+        }
+        tokio::select! {
+            biased;
+            result = &mut operation => {
+                return if is_export_cancelled_now(export_id) {
+                    Err(EXPORT_CANCELLED_ERROR.to_string())
+                } else {
+                    result
+                };
+            },
+            _ = tokio::time::sleep(EXPORT_CANCEL_POLL_INTERVAL) => {}
+        }
+    }
+}
+
+fn snapshot_batch_cancelled(db_type: &DatabaseType, export_id: &str) -> bool {
+    *db_type != DatabaseType::Postgres && is_export_cancelled_now(export_id)
+}
+
+/// Unlike metadata operations, a database row stream owns a live server query
+/// and transaction cleanup. Signal its cancellation token, then keep polling
+/// the future until that cleanup finishes before reporting Export cancelled.
+async fn await_export_stream_operation<T, F>(
+    export_id: &str,
+    cancel_token: &CancellationToken,
+    operation: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    tokio::pin!(operation);
+    loop {
+        if is_export_cancelled_now(export_id) {
+            cancel_token.cancel();
+            if let Err(error) = operation.await {
+                if error.contains("Transaction cleanup failed") || error.contains("stream cleanup timed out") {
+                    log::warn!("[database-export] cancellation cleanup was incomplete export_id={export_id}: {error}");
+                }
+            }
+            return Err(EXPORT_CANCELLED_ERROR.to_string());
+        }
+        tokio::select! {
+            biased;
+            result = &mut operation => {
+                return if is_export_cancelled_now(export_id) {
+                    Err(EXPORT_CANCELLED_ERROR.to_string())
+                } else {
+                    result
+                };
+            },
+            _ = tokio::time::sleep(EXPORT_CANCEL_POLL_INTERVAL) => {}
+        }
+    }
+}
+
 pub async fn begin_database_backup_snapshot_core(
     state: &crate::connection::AppState,
     connection_id: &str,
@@ -1591,8 +1723,12 @@ fn write_database_export_rows<W: Write>(
     // path and the legacy typed INSERT writer. In particular, MySQL uses the
     // selected database rather than a schema-qualified table name.
     let qualified_table_name = crate::transfer::qualified_table(table, schema, db_type, None);
+    // Batch database exports do not currently thread a per-connection identifier
+    // quote through BuildDatabaseSqlExportOptions; Kingbase MySQL-compat users
+    // should fall back to the single-table export path which carries the quote.
     let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
         database_type: Some(*db_type),
+        identifier_quote: None,
         schema: (!schema.is_empty()).then(|| schema.to_string()),
         table_name: Some(table.to_string()),
         qualified_table_name: Some(qualified_table_name),
@@ -1630,7 +1766,237 @@ fn emit_database_export_running(
     });
 }
 
+fn emit_database_export_cancelled(
+    on_progress: &(impl Fn(ExportProgress) + Sync),
+    export_id: &str,
+    current_object: impl Into<String>,
+    object_index: usize,
+    total_objects: usize,
+    rows_exported: u64,
+) {
+    on_progress(ExportProgress {
+        export_id: export_id.to_string(),
+        current_object: current_object.into(),
+        object_index,
+        total_objects,
+        rows_exported,
+        total_rows: None,
+        status: ExportStatus::Cancelled,
+        error: None,
+        preparing: false,
+    });
+}
+
+fn export_destination_state_key(dir: &std::path::Path) -> String {
+    format!("database_export_destination:{}", dir.to_string_lossy())
+}
+
+/// Records the destination identity for a scheduled backup as soon as it is
+/// configured, not just after its first successful export. Scheduled plans
+/// live in the frontend and may not run for hours after being saved; without
+/// an eager record here, a destination whose mount disappears before its
+/// very first run is indistinguishable from a brand-new local folder to
+/// `ensure_export_destination_dir` (both have no recorded state) and gets
+/// silently recreated on the wrong filesystem. The schedule editor only
+/// accepts directories selected from the filesystem, so a missing path here
+/// means the destination vanished before its identity could be recorded and
+/// the schedule must not be saved. See #6327.
+pub async fn record_export_destination_identity(
+    state: &crate::connection::AppState,
+    dir: &std::path::Path,
+) -> Result<(), String> {
+    if !dir.is_dir() {
+        return Err(format!(
+            "Backup directory {} does not exist or is not a directory. Select an existing destination before saving the schedule.",
+            dir.display()
+        ));
+    }
+    save_export_destination_dir_device_id(state, dir).await
+}
+
+async fn save_export_destination_dir_device_id(
+    state: &crate::connection::AppState,
+    dir: &std::path::Path,
+) -> Result<(), String> {
+    let value = match export_destination_device_id_for_path(dir) {
+        Some(dev) => dev.to_le_bytes().to_vec(),
+        None => Vec::new(),
+    };
+    state.storage.save_state(&export_destination_state_key(dir), &value, "application/octet-stream").await
+}
+
+/// Ensures `dir` exists for an export destination, without ever silently
+/// recreating a directory that previously produced a successful export (or
+/// was recorded via [`record_export_destination_identity`]) and has since
+/// disappeared. Auto-creating on every run is what the original fix for
+/// #6109 did, but that is unsafe for a destination on a removable or network
+/// drive: if the mount is temporarily gone when a run executes, blindly
+/// recreating the path resurrects it on the local root filesystem and the
+/// export "succeeds" while silently writing to the wrong disk. A directory
+/// dbx has never seen before is safe to create (normal first-time
+/// configuration of a local folder); a directory dbx has seen before but
+/// that is now missing, or that now resolves to a different filesystem than
+/// last time, is refused instead. See #6327.
+///
+/// Returns the device identity that was just verified (or recorded for a
+/// newly created directory), if the current platform can determine one, so
+/// the caller can re-verify it against the file it actually opens -- the
+/// directory check here and the later `File::create` are separate
+/// operations, and the mount can change in between.
+async fn ensure_export_destination_dir(
+    state: &crate::connection::AppState,
+    dir: &std::path::Path,
+) -> Result<Option<u64>, String> {
+    let key = export_destination_state_key(dir);
+    let recorded_dev: Option<Option<u64>> = state
+        .storage
+        .load_state(&key)
+        .await?
+        .map(|(bytes, _content_type)| <[u8; 8]>::try_from(bytes.as_slice()).ok().map(u64::from_le_bytes));
+
+    if dir.is_dir() {
+        if let Some(Some(recorded_dev)) = recorded_dev {
+            if let Some(current_dev) = export_destination_device_id_for_path(dir) {
+                if current_dev != recorded_dev {
+                    return Err(format!(
+                        "Backup directory {} now resolves to a different filesystem than the last \
+                         successful export to this location. Refusing to write here automatically -- \
+                         if this directory is on a removable or network drive, make sure the correct \
+                         drive is connected before running the backup.",
+                        dir.display()
+                    ));
+                }
+            }
+        }
+    } else {
+        if recorded_dev.is_some() {
+            return Err(format!(
+                "Backup directory {} is missing. It was configured or previously used for exports to \
+                 this location, so dbx will not recreate it automatically -- if this is on a removable \
+                 or network drive, reconnect it and try again.",
+                dir.display()
+            ));
+        }
+        std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create backup directory: {e}"))?;
+    }
+
+    save_export_destination_dir_device_id(state, dir).await?;
+    Ok(export_destination_device_id_for_path(dir))
+}
+
+/// Whether a destination's identity, checked once via [`ensure_export_destination_dir`]
+/// and then again against the file dbx actually opened, indicates the mount
+/// changed in between. An unknown expected identity has nothing to compare,
+/// but once an expected identity is known, failing to identify the opened
+/// handle must fail closed rather than allowing an unverified write.
+fn export_destination_identity_mismatch(expected: Option<u64>, actual: Option<u64>) -> bool {
+    expected.is_some_and(|expected| actual != Some(expected))
+}
+
+#[cfg(unix)]
+fn export_destination_device_id_for_path(dir: &std::path::Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(dir).ok().map(|metadata| metadata.dev())
+}
+
+#[cfg(unix)]
+fn export_destination_device_id_for_file(file: &std::fs::File) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().ok().map(|metadata| metadata.dev())
+}
+
+#[cfg(windows)]
+fn export_destination_device_id_for_path(dir: &std::path::Path) -> Option<u64> {
+    windows_export_destination::device_id_for_path(dir)
+}
+
+#[cfg(windows)]
+fn export_destination_device_id_for_file(file: &std::fs::File) -> Option<u64> {
+    windows_export_destination::device_id_for_handle(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn export_destination_device_id_for_path(_dir: &std::path::Path) -> Option<u64> {
+    None
+}
+
+#[cfg(not(any(unix, windows)))]
+fn export_destination_device_id_for_file(_file: &std::fs::File) -> Option<u64> {
+    None
+}
+
+/// Windows has no stable `std` API for a directory or file's volume identity
+/// (`MetadataExt::volume_serial_number` is still gated behind the unstable
+/// `windows_by_handle` feature), so this queries `dwVolumeSerialNumber` from
+/// `BY_HANDLE_FILE_INFORMATION` directly. Using the *handle* rather than
+/// re-resolving the path is what makes `export_destination_device_id_for_file`
+/// safe to call on an already-open `File`: it reports the volume the handle
+/// was actually opened against, not whatever currently sits at that path.
+#[cfg(windows)]
+mod windows_export_destination {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::path::Path;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    pub(super) fn device_id_for_path(path: &Path) -> Option<u64> {
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let result = volume_serial_number(handle);
+        unsafe { CloseHandle(handle) };
+        result
+    }
+
+    pub(super) fn device_id_for_handle(file: &std::fs::File) -> Option<u64> {
+        volume_serial_number(file.as_raw_handle() as HANDLE)
+    }
+
+    fn volume_serial_number(handle: HANDLE) -> Option<u64> {
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+        (ok != 0).then_some(info.dwVolumeSerialNumber as u64)
+    }
+}
+
 pub async fn export_database_sql_core(
+    state: &crate::connection::AppState,
+    request: &DatabaseExportRequest,
+    on_progress: impl Fn(ExportProgress) + Sync,
+) -> Result<(), String> {
+    // Keep the large export state machine on the heap. Besides making the
+    // caller future small, this prevents the metadata-prefetch locals from
+    // exhausting the bounded stack used by test and runtime worker threads.
+    let result = Box::pin(export_database_sql_core_inner(state, request, &on_progress)).await;
+    if result.as_ref().err().is_some_and(|error| error == EXPORT_CANCELLED_ERROR) {
+        // Every caller (Tauri and web SSE) needs a terminal Cancelled event;
+        // returning the marker as an error would leave the web EventSource
+        // without a terminal event and surface cancellation as Error in Tauri.
+        emit_database_export_cancelled(&on_progress, &request.export_id, String::new(), 0, 0, 0);
+        Ok(())
+    } else {
+        result
+    }
+}
+
+async fn export_database_sql_core_inner(
     state: &crate::connection::AppState,
     request: &DatabaseExportRequest,
     on_progress: impl Fn(ExportProgress) + Sync,
@@ -1655,12 +2021,15 @@ pub async fn export_database_sql_core(
 
     // 2. Get pool
     let client_session_id = database_export_client_session_id(&request.export_id);
-    let pool_key = state
-        .get_or_create_pool_for_session(&request.connection_id, Some(&request.database), Some(&client_session_id))
-        .await?;
+    let pool_key = Box::pin(state.get_or_create_pool_for_session(
+        &request.connection_id,
+        Some(&request.database),
+        Some(&client_session_id),
+    ))
+    .await?;
 
     // 3. List tables
-    let all_tables = crate::schema::list_tables_core(
+    let all_tables = Box::pin(crate::schema::list_tables_core(
         state,
         &request.connection_id,
         &request.database,
@@ -1670,10 +2039,31 @@ pub async fn export_database_sql_core(
         None,
         None,
         None,
-    )
+    ))
     .await?;
     // 4. Create file
+    let mut expected_destination_dev = None;
+    if let Some(parent) = std::path::Path::new(&request.file_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            expected_destination_dev = ensure_export_destination_dir(state, parent).await?;
+        }
+    }
     let file = std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to write file: {e}"))?;
+    // The directory check above and this `File::create` are separate
+    // operations: the mount can disappear and be replaced by something else
+    // at the same path in between. Re-check the identity of the handle we
+    // actually opened, not just the path, and refuse to keep a backup that
+    // landed on the wrong filesystem. See #6327.
+    if export_destination_identity_mismatch(expected_destination_dev, export_destination_device_id_for_file(&file)) {
+        drop(file);
+        let _ = std::fs::remove_file(&request.file_path);
+        return Err(format!(
+            "Backup destination for {} changed while opening the output file -- the directory now \
+             resolves to a different filesystem than the one just verified. If a removable or network \
+             drive was disconnected and reconnected, retry the backup.",
+            request.file_path
+        ));
+    }
     let mut file = BufWriter::new(file);
 
     let create_database_preamble = if request.include_create_database && matches!(db_type, DatabaseType::Mysql) {
@@ -1754,18 +2144,22 @@ pub async fn export_database_sql_core(
         }
     }
     let postgres_sequences = if request.include_structure && matches!(db_type, DatabaseType::Postgres) {
-        match list_postgres_export_sequences(
-            state,
-            &pool_key,
-            &request.schema,
-            &request.selected_tables,
-            &request.excluded_tables,
-            request.include_objects,
-            request.fail_on_error,
+        match await_export_operation(
+            &request.export_id,
+            list_postgres_export_sequences(
+                state,
+                &pool_key,
+                &request.schema,
+                &request.selected_tables,
+                &request.excluded_tables,
+                request.include_objects,
+                request.fail_on_error,
+            ),
         )
         .await
         {
             Ok(sequences) => sequences,
+            Err(e) if e == EXPORT_CANCELLED_ERROR => return Err(EXPORT_CANCELLED_ERROR.to_string()),
             Err(e) => {
                 record_export_error(&mut file, request.fail_on_error, format!("exporting sequences: {e}"))?;
                 Vec::new()
@@ -1776,8 +2170,12 @@ pub async fn export_database_sql_core(
     };
 
     // Sort tables by foreign key dependency so referenced (parent) tables are
-    // exported before referencing (child) tables.
-    if tables.len() > 1 {
+    // exported before referencing (child) tables. MySQL exports always emit
+    // `SET FOREIGN_KEY_CHECKS = 0`, so both the generated DDL and any INSERTs
+    // already tolerate child-before-parent ordering; reordering away from the
+    // alphabetical listing there only makes the output look shuffled to users
+    // without providing any correctness benefit.
+    if tables.len() > 1 && db_type != DatabaseType::Mysql {
         let table_names: Vec<String> = tables.iter().map(|t| t.name.clone()).collect();
         match crate::transfer::sort_tables_by_fk_dependency(
             state,
@@ -1809,6 +2207,7 @@ pub async fn export_database_sql_core(
             &request.connection_id,
             &request.database,
             &request.schema,
+            None,
             None,
             None,
             None,
@@ -1850,6 +2249,7 @@ pub async fn export_database_sql_core(
 
     let mut object_index: usize = 0;
     let mut total_rows_exported = 0_u64;
+    let mut deferred_postgres_triggers = Vec::new();
     // total_objects is known later for the write phase; preparing updates stay
     // presence-only so the UI does not show a counter that later resets.
     emit_database_export_running(&on_progress, &request.export_id, "", 0, 0, 0, true);
@@ -1894,13 +2294,16 @@ pub async fn export_database_sql_core(
                 }
                 let ddl = if request.include_structure {
                     Some(
-                        crate::schema::get_table_ddl_core(
-                            state,
-                            &request.connection_id,
-                            &request.database,
-                            &request.schema,
-                            &table_name,
-                            None,
+                        await_export_operation(
+                            &request.export_id,
+                            crate::schema::get_table_relation_export_ddl_core(
+                                state,
+                                &request.connection_id,
+                                &request.database,
+                                &request.schema,
+                                &table_name,
+                                None,
+                            ),
                         )
                         .await,
                     )
@@ -1912,12 +2315,15 @@ pub async fn export_database_sql_core(
                 }
                 let columns = if request.include_data {
                     Some(
-                        crate::schema::get_columns_core(
-                            state,
-                            &request.connection_id,
-                            &request.database,
-                            &request.schema,
-                            &table_name,
+                        await_export_operation(
+                            &request.export_id,
+                            crate::schema::get_columns_core(
+                                state,
+                                &request.connection_id,
+                                &request.database,
+                                &request.schema,
+                                &table_name,
+                            ),
                         )
                         .await,
                     )
@@ -1928,6 +2334,17 @@ pub async fn export_database_sql_core(
             }))
             .buffer_unordered(database_export_metadata_prefetch_concurrency(db_type));
         while let Some((index, metadata)) = prefetch_stream.next().await {
+            if metadata
+                .ddl
+                .as_ref()
+                .is_some_and(|result| result.as_ref().err().is_some_and(|error| error == EXPORT_CANCELLED_ERROR))
+                || metadata
+                    .columns
+                    .as_ref()
+                    .is_some_and(|result| result.as_ref().err().is_some_and(|error| error == EXPORT_CANCELLED_ERROR))
+            {
+                return Err(EXPORT_CANCELLED_ERROR.to_string());
+            }
             prefetched_table_metadata[index] = Some(metadata);
             if let Some(table_info) = tables.get(index) {
                 // Presence-only updates: no prepare counter that later resets to 0/N.
@@ -1990,17 +2407,14 @@ pub async fn export_database_sql_core(
     for (table_index, table_info) in tables.iter().enumerate().filter(|_| exports_database_tables(request)) {
         // Check cancellation
         if is_export_cancelled(&request.export_id).await {
-            on_progress(ExportProgress {
-                export_id: request.export_id.clone(),
-                current_object: table_info.name.clone(),
+            emit_database_export_cancelled(
+                &on_progress,
+                &request.export_id,
+                table_info.name.clone(),
                 object_index,
                 total_objects,
-                rows_exported: total_rows_exported,
-                total_rows: None,
-                status: ExportStatus::Cancelled,
-                error: None,
-                preparing: false,
-            });
+                total_rows_exported,
+            );
             return Ok(());
         }
 
@@ -2052,19 +2466,27 @@ pub async fn export_database_sql_core(
             {
                 Some(result) => result,
                 None => {
-                    crate::schema::get_table_ddl_core(
-                        state,
-                        &request.connection_id,
-                        &request.database,
-                        &request.schema,
-                        table_name,
-                        None,
+                    await_export_operation(
+                        &request.export_id,
+                        crate::schema::get_table_relation_export_ddl_core(
+                            state,
+                            &request.connection_id,
+                            &request.database,
+                            &request.schema,
+                            table_name,
+                            None,
+                        ),
                     )
                     .await
                 }
             };
+            if ddl_result.as_ref().err().is_some_and(|error| error == EXPORT_CANCELLED_ERROR) {
+                return Err(EXPORT_CANCELLED_ERROR.to_string());
+            }
             match ddl_result {
                 Ok(ddl) => {
+                    let (ddl, triggers) = split_postgres_export_table_triggers(&ddl, db_type);
+                    deferred_postgres_triggers.extend(triggers);
                     let ddl = format_export_table_ddl(
                         &ddl,
                         Some(db_type),
@@ -2092,16 +2514,22 @@ pub async fn export_database_sql_core(
             {
                 Some(result) => result,
                 None => {
-                    crate::schema::get_columns_core(
-                        state,
-                        &request.connection_id,
-                        &request.database,
-                        &request.schema,
-                        table_name,
+                    await_export_operation(
+                        &request.export_id,
+                        crate::schema::get_columns_core(
+                            state,
+                            &request.connection_id,
+                            &request.database,
+                            &request.schema,
+                            table_name,
+                        ),
                     )
                     .await
                 }
             };
+            if columns_result.as_ref().err().is_some_and(|error| error == EXPORT_CANCELLED_ERROR) {
+                return Err(EXPORT_CANCELLED_ERROR.to_string());
+            }
             let columns = match columns_result {
                 Ok(cols) => cols,
                 Err(e) => {
@@ -2121,39 +2549,48 @@ pub async fn export_database_sql_core(
             if !col_names.is_empty() {
                 if let Some(snapshot_session_id) = request.snapshot_session_id.as_deref() {
                     let sql = database_export_select_sql(&col_names, &col_types, table_name, &request.schema, &db_type);
-                    crate::query::stream_rows_in_manual_transaction(
-                        state,
-                        snapshot_session_id,
-                        &sql,
-                        batch_size,
-                        |rows| {
-                            if is_export_cancelled_now(&request.export_id) {
-                                return Err("Export cancelled".to_string());
-                            }
-                            write_database_export_rows(
-                                &mut file,
-                                &rows,
-                                &col_names,
-                                &col_types,
-                                &col_extras,
-                                table_name,
-                                &request.schema,
-                                &db_type,
-                            )?;
-                            total_rows_exported += rows.len() as u64;
-                            on_progress(ExportProgress {
-                                export_id: request.export_id.clone(),
-                                current_object: table_name.clone(),
-                                object_index,
-                                total_objects,
-                                rows_exported: total_rows_exported,
-                                total_rows: None,
-                                status: ExportStatus::Running,
-                                error: None,
-                                preparing: false,
-                            });
-                            Ok(())
-                        },
+                    let cancel_token = CancellationToken::new();
+                    await_export_stream_operation(
+                        &request.export_id,
+                        &cancel_token,
+                        crate::query::stream_rows_in_manual_transaction_with_cancel(
+                            state,
+                            snapshot_session_id,
+                            &sql,
+                            batch_size,
+                            Some(cancel_token.clone()),
+                            |rows| {
+                                // PostgreSQL cancellation must unwind through its CancelRequest path so the
+                                // connection reaches ReadyForQuery before rollback. Other snapshot streams do
+                                // not consume the token yet, so retain their existing next-batch cancellation.
+                                if snapshot_batch_cancelled(&db_type, &request.export_id) {
+                                    return Err(EXPORT_CANCELLED_ERROR.to_string());
+                                }
+                                write_database_export_rows(
+                                    &mut file,
+                                    &rows,
+                                    &col_names,
+                                    &col_types,
+                                    &col_extras,
+                                    table_name,
+                                    &request.schema,
+                                    &db_type,
+                                )?;
+                                total_rows_exported += rows.len() as u64;
+                                on_progress(ExportProgress {
+                                    export_id: request.export_id.clone(),
+                                    current_object: table_name.clone(),
+                                    object_index,
+                                    total_objects,
+                                    rows_exported: total_rows_exported,
+                                    total_rows: None,
+                                    status: ExportStatus::Running,
+                                    error: None,
+                                    preparing: false,
+                                });
+                                Ok(())
+                            },
+                        ),
                     )
                     .await?;
                 } else {
@@ -2176,17 +2613,14 @@ pub async fn export_database_sql_core(
 
                     loop {
                         if is_export_cancelled(&request.export_id).await {
-                            on_progress(ExportProgress {
-                                export_id: request.export_id.clone(),
-                                current_object: table_name.clone(),
+                            emit_database_export_cancelled(
+                                &on_progress,
+                                &request.export_id,
+                                table_name.clone(),
                                 object_index,
                                 total_objects,
-                                rows_exported: total_rows_exported,
-                                total_rows,
-                                status: ExportStatus::Cancelled,
-                                error: None,
-                                preparing: false,
-                            });
+                                total_rows_exported,
+                            );
                             return Ok(());
                         }
 
@@ -2448,6 +2882,15 @@ pub async fn export_database_sql_core(
         }
     }
 
+    // PostgreSQL trigger definitions reference their trigger functions. The
+    // table DDL builder returns both statements together, while schema-wide
+    // routines are exported below the tables. Keep triggers part of table
+    // structure, but write them only after routines so the resulting script
+    // is executable in file order.
+    for trigger in deferred_postgres_triggers {
+        writeln!(file, "{trigger}\n").map_err(|e| format!("Failed to write file: {e}"))?;
+    }
+
     // For MySQL: re-enable foreign key checks
     if matches!(db_type, DatabaseType::Mysql) {
         writeln!(file, "SET FOREIGN_KEY_CHECKS = 1;").map_err(|e| format!("Failed to write file: {e}"))?;
@@ -2514,22 +2957,151 @@ fn build_database_export_object_source_sql(
 #[cfg(test)]
 mod tests {
     use super::{
+        await_export_operation, await_export_stream_operation, clear_export_cancelled,
+        concurrent_metadata_prefetch_allowed, database_export_metadata_prefetch_concurrency,
+        emit_database_export_cancelled, set_export_cancelled, snapshot_batch_cancelled, ExportStatus,
+        EXPORT_CANCELLED_ERROR,
+    };
+    use super::{
         build_database_export_object_source_sql, build_database_sql_export, build_export_insert_statements,
-        database_export_select_sql, database_export_total_objects, drop_table_if_exists_sql, filter_export_table_infos,
+        database_export_select_sql, database_export_total_objects, drop_table_if_exists_sql,
+        ensure_export_destination_dir, export_destination_identity_mismatch, filter_export_table_infos,
         format_export_sql_literal, format_export_table_ddl, format_mysql_spatial_export_literal,
         generate_postgres_extension_ddl, generate_postgres_sequence_create_ddl, generate_postgres_sequence_owner_ddl,
         generate_postgres_sequence_setval_sql, is_postgres_extension_member_routine, mysql_database_export_preamble,
         mysql_view_dependencies_from_rows, mysql_view_dependencies_sql, normalize_export_table_ddl,
-        record_export_error, replace_database_export_select_list, sort_export_views_by_dependencies,
-        write_database_export_rows, BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions,
-        DatabaseExportObjectCounts, DatabaseExportRequest, DdlNormalizeOptions, ExportedTableSql,
-        PostgresExportExtension, PostgresExportSequence, PostgresExtensionMembers, DATABASE_EXPORT_INSERT_BATCH_SIZE,
-        DATABASE_EXPORT_ROW_LIMIT,
+        record_export_destination_identity, record_export_error, replace_database_export_select_list,
+        sort_export_views_by_dependencies, split_postgres_export_table_triggers, write_database_export_rows,
+        BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions, DatabaseExportObjectCounts,
+        DatabaseExportRequest, DdlNormalizeOptions, ExportedTableSql, PostgresExportExtension, PostgresExportSequence,
+        PostgresExtensionMembers, DATABASE_EXPORT_INSERT_BATCH_SIZE, DATABASE_EXPORT_ROW_LIMIT,
     };
-    use super::{concurrent_metadata_prefetch_allowed, database_export_metadata_prefetch_concurrency};
+    use crate::connection::AppState;
     use crate::models::connection::DatabaseType;
+    use crate::storage::Storage;
     use crate::types::{ObjectInfo, ObjectSourceKind, TableInfo};
     use serde_json::{json, Value};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn await_export_operation_drops_pending_metadata_after_cancel() {
+        let export_id = format!("cancel-pending-{}", uuid::Uuid::new_v4());
+        clear_export_cancelled(&export_id).await;
+        let task_export_id = export_id.clone();
+        let task = tokio::spawn(async move {
+            await_export_operation(&task_export_id, async {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                Ok::<_, String>(())
+            })
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        set_export_cancelled(&export_id).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("cancellation should stop a pending metadata future")
+            .expect("cancellation task should not panic");
+        assert_eq!(result, Err(EXPORT_CANCELLED_ERROR.to_string()));
+        clear_export_cancelled(&export_id).await;
+    }
+
+    #[tokio::test]
+    async fn await_export_operation_preserves_completed_metadata() {
+        let export_id = format!("complete-metadata-{}", uuid::Uuid::new_v4());
+        clear_export_cancelled(&export_id).await;
+        let result = await_export_operation(&export_id, async { Ok::<_, String>(42_u32) }).await;
+        assert_eq!(result, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn await_export_stream_signals_cancel_and_waits_for_cleanup() {
+        let export_id = format!("cancel-stream-{}", uuid::Uuid::new_v4());
+        clear_export_cancelled(&export_id).await;
+        let cancel_token = CancellationToken::new();
+        let stream_cancel_token = cancel_token.clone();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleaned_after_cancel = cleaned.clone();
+        let task_export_id = export_id.clone();
+        let task = tokio::spawn(async move {
+            await_export_stream_operation(&task_export_id, &cancel_token, async move {
+                stream_cancel_token.cancelled().await;
+                cleaned_after_cancel.store(true, Ordering::SeqCst);
+                Err::<(), _>(crate::query::QUERY_CANCELED.to_string())
+            })
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        set_export_cancelled(&export_id).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("export stream cancellation should finish cleanup")
+            .expect("cancellation task should not panic");
+
+        assert_eq!(result, Err(EXPORT_CANCELLED_ERROR.to_string()));
+        assert!(cleaned.load(Ordering::SeqCst));
+        clear_export_cancelled(&export_id).await;
+    }
+
+    #[tokio::test]
+    async fn await_export_stream_prioritizes_existing_cancel_over_completion() {
+        let export_id = format!("cancel-ready-stream-{}", uuid::Uuid::new_v4());
+        clear_export_cancelled(&export_id).await;
+        set_export_cancelled(&export_id).await;
+        let cancel_token = CancellationToken::new();
+
+        let result = await_export_stream_operation(&export_id, &cancel_token, async { Ok::<_, String>(42) }).await;
+
+        assert_eq!(result, Err(EXPORT_CANCELLED_ERROR.to_string()));
+        assert!(cancel_token.is_cancelled());
+        clear_export_cancelled(&export_id).await;
+    }
+
+    #[tokio::test]
+    async fn await_export_stream_preserves_normal_completion() {
+        let export_id = format!("complete-stream-{}", uuid::Uuid::new_v4());
+        clear_export_cancelled(&export_id).await;
+        let cancel_token = CancellationToken::new();
+
+        let result = await_export_stream_operation(&export_id, &cancel_token, async { Ok::<_, String>(42) }).await;
+
+        assert_eq!(result, Ok(42));
+        assert!(!cancel_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn non_postgres_snapshot_batches_keep_existing_cancel_check() {
+        let export_id = format!("cancel-non-postgres-batch-{}", uuid::Uuid::new_v4());
+        clear_export_cancelled(&export_id).await;
+        set_export_cancelled(&export_id).await;
+
+        assert!(snapshot_batch_cancelled(&DatabaseType::Mysql, &export_id));
+        assert!(!snapshot_batch_cancelled(&DatabaseType::Postgres, &export_id));
+
+        clear_export_cancelled(&export_id).await;
+    }
+
+    #[test]
+    fn cancelled_progress_is_terminal_and_has_no_error() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        emit_database_export_cancelled(&|progress| sink.lock().unwrap().push(progress), "export-1", "seq", 3, 9, 17);
+
+        let progress = events.lock().unwrap().pop().expect("cancelled progress");
+        assert_eq!(progress.export_id, "export-1");
+        assert_eq!(progress.current_object, "seq");
+        assert_eq!(progress.object_index, 3);
+        assert_eq!(progress.total_objects, 9);
+        assert_eq!(progress.rows_exported, 17);
+        assert!(matches!(progress.status, ExportStatus::Cancelled));
+        assert!(progress.error.is_none());
+        assert!(!progress.preparing);
+    }
 
     fn table(name: &str, table_type: &str) -> TableInfo {
         TableInfo {
@@ -2657,6 +3229,33 @@ mod tests {
         assert!(is_postgres_extension_member_routine(&routine("similarity", "text, text"), &members));
         assert!(!is_postgres_extension_member_routine(&routine("similarity", "integer, integer"), &members));
         assert!(!is_postgres_extension_member_routine(&routine("user_similarity", "text, text"), &members));
+    }
+
+    #[test]
+    fn postgres_database_export_defers_table_triggers_without_splitting_function_bodies() {
+        let ddl = "CREATE TABLE \"public\".\"work_log\" (\n  \"id\" bigint,\n  \"note\" text DEFAULT ';'::text\n);\n\nCREATE INDEX \"idx_work_log\" ON \"public\".\"work_log\" (\"id\");\n\nCREATE TRIGGER trg_work_log BEFORE INSERT OR UPDATE ON public.work_log FOR EACH ROW EXECUTE FUNCTION fn_work_log_update();";
+
+        let (table_ddl, triggers) = split_postgres_export_table_triggers(ddl, DatabaseType::Postgres);
+
+        assert!(table_ddl.contains("CREATE TABLE"));
+        assert!(table_ddl.contains("DEFAULT ';'::text"));
+        assert!(table_ddl.contains("CREATE INDEX"));
+        assert!(!table_ddl.contains("CREATE TRIGGER"));
+        assert_eq!(triggers.len(), 1);
+        assert!(triggers[0].starts_with("CREATE TRIGGER trg_work_log"));
+    }
+
+    #[test]
+    fn postgres_database_export_defers_constraint_triggers_only_for_postgres() {
+        let ddl = "CREATE TABLE \"public\".\"items\" (\"id\" bigint);\nCREATE CONSTRAINT TRIGGER items_check AFTER INSERT ON public.items DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION check_items();";
+
+        let (postgres_table, postgres_triggers) = split_postgres_export_table_triggers(ddl, DatabaseType::Postgres);
+        assert!(!postgres_table.contains("CREATE CONSTRAINT TRIGGER"));
+        assert_eq!(postgres_triggers.len(), 1);
+
+        let (mysql_ddl, mysql_triggers) = split_postgres_export_table_triggers(ddl, DatabaseType::Mysql);
+        assert_eq!(mysql_ddl, ddl);
+        assert!(mysql_triggers.is_empty());
     }
 
     #[test]
@@ -2835,6 +3434,7 @@ mod tests {
     fn mysql_spatial_export_uses_wkb_constructor_and_preserves_srid() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
             schema: None,
             table_name: Some("places".to_string()),
             qualified_table_name: None,
@@ -2912,6 +3512,7 @@ mod tests {
     fn database_specific_boolean_export_literals() {
         let sqlserver_statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::SqlServer),
+            identifier_quote: None,
             schema: Some("dbo".to_string()),
             table_name: Some("flags".to_string()),
             qualified_table_name: None,
@@ -2924,6 +3525,7 @@ mod tests {
         .unwrap();
         let postgres_statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Postgres),
+            identifier_quote: None,
             schema: Some("public".to_string()),
             table_name: Some("flags".to_string()),
             qualified_table_name: None,
@@ -2951,6 +3553,7 @@ mod tests {
     fn sqlserver_export_prefixes_unicode_string_literals() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::SqlServer),
+            identifier_quote: None,
             schema: Some("dbo".to_string()),
             table_name: Some("people".to_string()),
             qualified_table_name: None,
@@ -2995,6 +3598,7 @@ mod tests {
     fn mysql_export_inserts_escape_control_characters() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
             schema: None,
             table_name: Some("notes".to_string()),
             qualified_table_name: None,
@@ -3017,6 +3621,7 @@ mod tests {
         let long_value = "x".repeat(300_000);
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
             schema: None,
             table_name: Some("payloads".to_string()),
             qualified_table_name: None,
@@ -3036,6 +3641,7 @@ mod tests {
     fn sqlserver_export_caps_multi_row_insert_at_1000_rows() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::SqlServer),
+            identifier_quote: None,
             schema: Some("dbo".to_string()),
             table_name: Some("items".to_string()),
             qualified_table_name: None,
@@ -3056,6 +3662,7 @@ mod tests {
     fn doris_export_inserts_escape_control_characters() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Doris),
+            identifier_quote: None,
             schema: Some("warehouse".to_string()),
             table_name: Some("events".to_string()),
             qualified_table_name: None,
@@ -3074,6 +3681,7 @@ mod tests {
     fn postgres_export_inserts_escape_control_characters() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Postgres),
+            identifier_quote: None,
             schema: Some("public".to_string()),
             table_name: Some("notes".to_string()),
             qualified_table_name: None,
@@ -3092,6 +3700,7 @@ mod tests {
     fn postgres_export_inserts_escape_quotes_and_backslashes_without_changing_plain_strings() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Postgres),
+            identifier_quote: None,
             schema: Some("public".to_string()),
             table_name: Some("notes".to_string()),
             qualified_table_name: None,
@@ -3120,6 +3729,7 @@ mod tests {
     fn postgres_jsonb_export_preserves_json_escape_sequences() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Postgres),
+            identifier_quote: None,
             schema: Some("public".to_string()),
             table_name: Some("events".to_string()),
             qualified_table_name: None,
@@ -3143,6 +3753,7 @@ mod tests {
     fn postgres_vector_export_preserves_pgvector_bracket_literals() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Postgres),
+            identifier_quote: None,
             schema: Some("public".to_string()),
             table_name: Some("items".to_string()),
             qualified_table_name: None,
@@ -3176,6 +3787,7 @@ mod tests {
     fn builds_batched_insert_statements_for_export() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
             schema: None,
             table_name: Some("users".to_string()),
             qualified_table_name: None,
@@ -3200,6 +3812,7 @@ mod tests {
     fn oracle_export_inserts_use_one_statement_per_row() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Oracle),
+            identifier_quote: None,
             schema: Some("APP".to_string()),
             table_name: Some("USERS".to_string()),
             qualified_table_name: None,
@@ -3224,6 +3837,7 @@ mod tests {
     fn oracle_export_omits_synthetic_rowid_from_insert_columns() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Oracle),
+            identifier_quote: None,
             schema: Some("APP".to_string()),
             table_name: Some("USERS".to_string()),
             qualified_table_name: None,
@@ -3242,6 +3856,7 @@ mod tests {
     fn oceanbase_oracle_export_omits_synthetic_rowid_from_insert_columns() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::OceanbaseOracle),
+            identifier_quote: None,
             schema: Some("APP".to_string()),
             table_name: Some("USERS".to_string()),
             qualified_table_name: None,
@@ -3260,6 +3875,7 @@ mod tests {
     fn non_oracle_export_preserves_dbx_rowid_named_column() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
             schema: None,
             table_name: Some("users".to_string()),
             qualified_table_name: None,
@@ -3278,6 +3894,7 @@ mod tests {
     fn oracle_date_columns_export_as_date_literals() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Oracle),
+            identifier_quote: None,
             schema: Some("APP".to_string()),
             table_name: Some("EVENTS".to_string()),
             qualified_table_name: None,
@@ -3306,6 +3923,7 @@ mod tests {
         for database_type in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
             let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
                 database_type: Some(database_type),
+                identifier_quote: None,
                 schema: Some("APP".to_string()),
                 table_name: Some("EVENTS".to_string()),
                 qualified_table_name: None,
@@ -3377,6 +3995,7 @@ mod tests {
     fn non_oracle_timestamp_exports_keep_existing_literals() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Postgres),
+            identifier_quote: None,
             schema: Some("public".to_string()),
             table_name: Some("events".to_string()),
             qualified_table_name: None,
@@ -3401,6 +4020,7 @@ mod tests {
     fn mysql_bit_columns_export_without_quoted_string_values() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
             schema: None,
             table_name: Some("flags".to_string()),
             qualified_table_name: None,
@@ -3422,6 +4042,7 @@ mod tests {
     fn dameng_bit_columns_export_as_numeric_literals() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Dameng),
+            identifier_quote: None,
             schema: Some("DBX_TEST".to_string()),
             table_name: Some("FLAGS".to_string()),
             qualified_table_name: None,
@@ -3443,6 +4064,7 @@ mod tests {
     fn dameng_strings_export_nul_as_chr_expression() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Dameng),
+            identifier_quote: None,
             schema: Some("DBX_TEST".to_string()),
             table_name: Some("NUL_VALUES".to_string()),
             qualified_table_name: None,
@@ -3484,6 +4106,7 @@ mod tests {
     fn mysql_export_uses_typed_literals_for_numeric_and_blob_columns() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
             schema: None,
             table_name: Some("t_test_01".to_string()),
             qualified_table_name: None,
@@ -3510,6 +4133,7 @@ mod tests {
     fn temporal_columns_export_without_rfc3339_separator_or_utc_suffix() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
             schema: None,
             table_name: Some("events".to_string()),
             qualified_table_name: None,
@@ -3543,6 +4167,7 @@ mod tests {
     fn postgres_timestamptz_export_keeps_timezone_without_rfc3339_t_separator() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Postgres),
+            identifier_quote: None,
             schema: Some("public".to_string()),
             table_name: Some("events".to_string()),
             qualified_table_name: None,
@@ -3569,6 +4194,7 @@ mod tests {
     fn sqlserver_rowversion_timestamp_type_is_not_treated_as_datetime() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::SqlServer),
+            identifier_quote: None,
             schema: Some("dbo".to_string()),
             table_name: Some("events".to_string()),
             qualified_table_name: None,
@@ -3592,6 +4218,7 @@ mod tests {
     fn postgres_tsvector_columns_are_omitted_from_sql_insert_export() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Postgres),
+            identifier_quote: None,
             schema: Some("public".to_string()),
             table_name: Some("articles".to_string()),
             qualified_table_name: None,
@@ -3615,6 +4242,7 @@ mod tests {
             tables: vec![ExportedTableSql {
                 display_name: "orders".to_string(),
                 database_type: Some(DatabaseType::Mysql),
+                identifier_quote: None,
                 schema: None,
                 table_name: Some("orders".to_string()),
                 qualified_table_name: None,
@@ -3701,6 +4329,7 @@ mod tests {
     fn dameng_identity_export_inserts_enable_identity_insert() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Dameng),
+            identifier_quote: None,
             schema: Some("SYSDBA".to_string()),
             table_name: Some("USERS".to_string()),
             qualified_table_name: None,
@@ -3728,6 +4357,7 @@ mod tests {
             tables: vec![ExportedTableSql {
                 display_name: "users".to_string(),
                 database_type: Some(DatabaseType::Mysql),
+                identifier_quote: None,
                 schema: None,
                 table_name: Some("users".to_string()),
                 qualified_table_name: None,
@@ -3921,5 +4551,180 @@ mod tests {
         assert_eq!(result.unwrap_err(), "exporting table users: permission denied");
         assert!(std::fs::read_to_string(&path).unwrap().is_empty());
         let _ = std::fs::remove_file(path);
+    }
+
+    async fn test_app_state(scratch_dir: &std::path::Path) -> AppState {
+        let storage = Storage::open(&scratch_dir.join("storage.db")).await.unwrap();
+        AppState::new(storage)
+    }
+
+    // Regression tests for #6327: create_dir_all on every export run is unsafe
+    // when the destination is on a removable/network drive, because a mount
+    // that is temporarily gone at write time would be silently recreated on
+    // the local root filesystem, and the backup would "succeed" while writing
+    // to the wrong disk.
+
+    #[tokio::test]
+    async fn ensure_export_destination_dir_creates_a_never_before_seen_local_directory() {
+        let scratch = std::env::temp_dir().join(format!("dbx-export-dest-new-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let state = test_app_state(&scratch).await;
+
+        let destination = scratch.join("backups").join("mydb");
+        assert!(!destination.exists());
+
+        ensure_export_destination_dir(&state, &destination)
+            .await
+            .expect("first-time local directory should be created");
+        assert!(destination.is_dir());
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[tokio::test]
+    async fn ensure_export_destination_dir_refuses_to_recreate_a_destination_that_disappeared() {
+        let scratch = std::env::temp_dir().join(format!("dbx-export-dest-vanished-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let state = test_app_state(&scratch).await;
+
+        // Simulates a previously configured, already-used backup destination
+        // (e.g. on an external or network drive) by successfully exporting to
+        // it once first.
+        let destination = scratch.join("mounted-drive").join("mydb");
+        ensure_export_destination_dir(&state, &destination).await.expect("initial export should create the directory");
+        assert!(destination.is_dir());
+
+        // Simulates the mount disappearing (unplugged drive, unmounted share,
+        // etc.) before the next run.
+        std::fs::remove_dir_all(scratch.join("mounted-drive")).unwrap();
+        assert!(!destination.exists());
+
+        let result = ensure_export_destination_dir(&state, &destination).await;
+
+        assert!(result.is_err(), "a destination that existed before should not be silently recreated");
+        assert!(!destination.exists(), "the backup directory must not be resurrected on the wrong filesystem");
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // Regression test for review feedback on #6327: `ensure_export_destination_dir`
+    // only remembered a destination *after* a successful export, so a mount
+    // that was present when a schedule was configured but vanished before its
+    // very first run looked identical to a brand-new local folder (no
+    // recorded state either way) and got silently recreated on the local
+    // disk. `record_export_destination_identity` closes that gap by letting
+    // the schedule-configuration flow record the destination eagerly.
+    #[tokio::test]
+    async fn record_export_destination_identity_protects_a_mount_that_vanishes_before_its_first_run() {
+        let scratch = std::env::temp_dir().join(format!("dbx-export-dest-eager-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let state = test_app_state(&scratch).await;
+
+        // Simulates the user picking an already-mounted external/network
+        // drive in the schedule editor and saving the schedule -- the
+        // directory exists at configuration time, but no export has run yet.
+        let destination = scratch.join("mounted-drive").join("mydb");
+        std::fs::create_dir_all(&destination).unwrap();
+        record_export_destination_identity(&state, &destination)
+            .await
+            .expect("configuring the schedule should succeed");
+
+        // The mount disappears before the scheduler ever runs this schedule
+        // for the first time.
+        std::fs::remove_dir_all(scratch.join("mounted-drive")).unwrap();
+        assert!(!destination.exists());
+
+        let result = ensure_export_destination_dir(&state, &destination).await;
+
+        assert!(result.is_err(), "a mount that was recorded at configuration time must not be silently recreated");
+        assert!(!destination.exists(), "the backup directory must not be resurrected on the wrong filesystem");
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[tokio::test]
+    async fn record_export_destination_identity_rejects_a_directory_that_disappeared_before_save() {
+        let scratch = std::env::temp_dir().join(format!("dbx-export-dest-eager-new-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let state = test_app_state(&scratch).await;
+
+        // The schedule editor only accepts an existing directory. If that
+        // directory disappears before the save request reaches the backend,
+        // the schedule must not be persisted without a recorded identity.
+        let destination = scratch.join("backups").join("mydb");
+        assert!(!destination.exists());
+        let error = record_export_destination_identity(&state, &destination)
+            .await
+            .expect_err("a missing scheduled destination must be rejected");
+
+        assert!(error.contains("does not exist or is not a directory"));
+        assert!(!destination.exists());
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    // Regression test for review feedback on #6327: the directory identity
+    // check and the later `File::create` are separate operations, so the
+    // mount can disappear and be replaced by something else at the same path
+    // in between. `export_destination_identity_mismatch` is the comparison
+    // `export_database_sql_core` runs against the handle it actually opened;
+    // exercised directly here since reproducing a real cross-filesystem swap
+    // mid-write is not something a portable unit test can simulate.
+    #[test]
+    fn export_destination_identity_mismatch_detects_a_changed_device() {
+        assert!(export_destination_identity_mismatch(Some(1), Some(2)));
+        assert!(!export_destination_identity_mismatch(Some(1), Some(1)));
+        assert!(
+            !export_destination_identity_mismatch(None, Some(2)),
+            "an unknown expected device has nothing to compare against"
+        );
+        assert!(
+            export_destination_identity_mismatch(Some(1), None),
+            "an opened file with unknown identity must not bypass a known expected device"
+        );
+        assert!(!export_destination_identity_mismatch(None, None));
+    }
+
+    // Regression test for review feedback on #6327: the non-Unix path used
+    // to report no device identity at all, so replacing a Windows drive or
+    // mount at the same path went undetected. This only runs on native
+    // Windows (this repo's CI has no Windows job that executes `cargo test`,
+    // only `cargo check`, so it is exercised locally by Windows contributors
+    // and by the compile-check itself).
+    #[cfg(windows)]
+    #[test]
+    fn export_destination_device_id_for_path_and_open_file_agree_on_windows() {
+        let scratch = std::env::temp_dir().join(format!("dbx-export-dest-win-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let dir_dev = super::export_destination_device_id_for_path(&scratch);
+        assert!(dir_dev.is_some(), "a real local directory should report a volume serial number");
+
+        let file_path = scratch.join("probe.txt");
+        let file = std::fs::File::create(&file_path).unwrap();
+        let file_dev = super::export_destination_device_id_for_file(&file);
+        drop(file);
+
+        assert_eq!(dir_dev, file_dev, "a file and its parent directory must resolve to the same volume");
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn kingbase_mysql_compat_export_insert_uses_backtick_identifiers() {
+        let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
+            database_type: Some(DatabaseType::Kingbase),
+            identifier_quote: Some("`".to_string()),
+            schema: Some("audit-schema".to_string()),
+            table_name: Some("events".to_string()),
+            qualified_table_name: None,
+            columns: vec!["id".to_string(), "event_type".to_string()],
+            column_types: vec![None, None],
+            column_extras: vec![None, None],
+            rows: vec![vec![json!(1), json!("login")]],
+            batch_size: Some(100),
+        })
+        .unwrap();
+        assert_eq!(statements, vec!["INSERT INTO `audit-schema`.`events` (`id`, `event_type`) VALUES (1, 'login');"]);
     }
 }

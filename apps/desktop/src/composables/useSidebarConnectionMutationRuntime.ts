@@ -1,4 +1,4 @@
-import { computed, type ShallowRef } from "vue";
+import { computed, ref, type ShallowRef } from "vue";
 import { useI18n } from "vue-i18n";
 import { useToast } from "@/composables/useToast";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -14,9 +14,9 @@ import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { revealPathInFileManager } from "@/lib/backend/tauri";
 import { canConfigureVisibleSchemasForTreeNode } from "@/lib/database/databaseFeatureSupport";
 import { canCloseSidebarDatabaseConnection } from "@/lib/sidebar/sidebarDatabaseOpenState";
-import { selectedConnectionDeleteTargets, selectedConnectionDisconnectTargets, selectedConnectionDuplicateTargets } from "@/lib/sidebar/sidebarConnectionSelection";
+import { selectedConnectionDeleteTargets, selectedConnectionDisconnectTargets, selectedConnectionDuplicateTargets, selectedConnectionGroupDeleteTargets, selectedConnectionMoveTargets } from "@/lib/sidebar/sidebarConnectionSelection";
 import { releaseConnectionFromMultiSelection } from "@/lib/sidebar/sidebarConnectionMultiSelect";
-import { connectionDeleteTargetSnapshot, showDeleteConfirm, showDeleteGroupConfirm, sidebarFormTarget } from "@/components/sidebar/sidebarTreeDialogState";
+import { connectionDeleteTargetSnapshot, connectionGroupDeleteTargetSnapshot, deleteConnectionsWithGroup, showDeleteConfirm, showDeleteGroupConfirm, sidebarFormTarget } from "@/components/sidebar/sidebarTreeDialogState";
 import { connectionCanConfigureSidebarVisibleDatabases } from "@/lib/sidebar/sidebarVisibleFilterMenu";
 import { disconnectSidebarConnections } from "@/lib/sidebar/sidebarConnectionDisconnect";
 
@@ -27,7 +27,6 @@ interface SidebarConnectionMutationRuntimeOptions {
   connectionStore: ReturnType<typeof useConnectionStore>;
   queryStore: ReturnType<typeof useQueryStore>;
   requestGroupRename: (groupId: string) => void;
-  groupCreated: (groupId: string) => void;
   openVisibleDatabases: (node: TreeNode) => void;
   openVisibleSchemas: (node: TreeNode) => void;
 }
@@ -36,6 +35,7 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
   const { t } = useI18n();
   const { toast } = useToast();
   const { activeNode, selectedTreeNodesInVisibleOrder, connectionStore, queryStore } = options;
+  const deletingConnectionGroups = ref(false);
 
   async function setNodeAsDefaultDatabase() {
     const node = activeNode.value;
@@ -212,16 +212,12 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
     }
   }
 
-  async function disconnectConnection() {
-    const targets = selectedConnectionDisconnectTargets(activeNode.value, selectedTreeNodesInVisibleOrder()).filter((target) => connectionStore.connectedIds.has(target.connectionId));
-    if (!targets.length) return;
+  async function disconnectConnectionIds(connectionIds: readonly string[]) {
+    if (!connectionIds.length) return;
 
-    const result = await disconnectSidebarConnections(
-      targets.map((target) => target.connectionId),
-      (connectionId) => connectionStore.disconnect(connectionId),
-    );
+    const result = await disconnectSidebarConnections(connectionIds, (connectionId) => connectionStore.disconnect(connectionId));
     if (!result.failed) {
-      toast(targets.length > 1 ? t("connection.disconnectedSelected", { count: targets.length }) : t("connection.disconnected"), 2000);
+      toast(connectionIds.length > 1 ? t("connection.disconnectedSelected", { count: connectionIds.length }) : t("connection.disconnected"), 2000);
       return;
     }
     if (result.succeeded > 0) {
@@ -230,6 +226,13 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
     }
     const message = result.firstError instanceof Error ? result.firstError.message : String(result.firstError);
     toast(t("connection.saveFailed", { message }), 5000);
+  }
+
+  async function disconnectConnection() {
+    const connectionIds = selectedConnectionDisconnectTargets(activeNode.value, selectedTreeNodesInVisibleOrder())
+      .filter((target) => connectionStore.connectedIds.has(target.connectionId))
+      .map((target) => target.connectionId);
+    await disconnectConnectionIds(connectionIds);
   }
 
   function connectionDisconnectTargets() {
@@ -244,6 +247,44 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
 
   function canDisconnectConnection(): boolean {
     return connectionDisconnectTargets().some((target) => connectionStore.connectedIds.has(target.connectionId));
+  }
+
+  function connectionGroupDisconnectTargets(): string[] {
+    const node = activeNode.value;
+    if (node.type !== "connection-group") return [];
+    return connectionStore.connectionIdsInGroups([node.id]).filter((connectionId) => connectionStore.connectedIds.has(connectionId));
+  }
+
+  function connectionGroupDisconnectMenuLabel(): string {
+    return t("connectionGroup.closeConnections", { count: connectionGroupDisconnectTargets().length });
+  }
+
+  function canDisconnectConnectionGroup(): boolean {
+    return connectionGroupDisconnectTargets().length > 0;
+  }
+
+  async function disconnectConnectionGroup() {
+    await disconnectConnectionIds(connectionGroupDisconnectTargets());
+  }
+
+  /** "断开并忘记本次密码"是否可用：save_password=false 且当前已连接（本次运行期必已输入密码）。 */
+  function canForgetSessionCredential(): boolean {
+    const node = activeNode.value;
+    if (!node?.connectionId) return false;
+    const config = connectionStore.getConfig(node.connectionId);
+    return config?.save_password === false && connectionStore.connectedIds.has(node.connectionId);
+  }
+
+  /** "断开并忘记本次密码"：关闭连接池并清除该连接本次运行期的会话密码。 */
+  async function disconnectAndForgetConnectionPassword() {
+    const node = activeNode.value;
+    if (!node?.connectionId) return;
+    try {
+      await connectionStore.disconnectAndForgetConnectionPassword(node.connectionId);
+      toast(t("connection.passwordForgotten"), 2000);
+    } catch (error: any) {
+      toast(t("connection.saveFailed", { message: error?.message || String(error) }), 5000);
+    }
   }
 
   async function cancelConnectionAttempt() {
@@ -270,7 +311,11 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
 
   const isPinned = computed(() => activeNode.value.pinned || connectionStore.isTreeNodePinned(activeNode.value));
   const isNodeDefaultDatabase = computed(
-    () => (activeNode.value.type === "database" || activeNode.value.type === "redis-db" || activeNode.value.type === "mongo-db") && !!activeNode.value.connectionId && !!activeNode.value.database && connectionStore.isDefaultDatabase(activeNode.value.connectionId, activeNode.value.database),
+    () =>
+      (activeNode.value.type === "database" || activeNode.value.type === "redis-db" || activeNode.value.type === "mongo-db" || activeNode.value.type === "vector-database") &&
+      !!activeNode.value.connectionId &&
+      !!activeNode.value.database &&
+      connectionStore.isDefaultDatabase(activeNode.value.connectionId, activeNode.value.database),
   );
   const isNodeDefaultSchema = computed(() => activeNode.value.type === "schema" && !!activeNode.value.connectionId && !!activeNode.value.schema && connectionStore.isDefaultSchema(activeNode.value.connectionId, activeNode.value.schema));
   const isConnected = computed(() => activeNode.value.type === "connection" && !!activeNode.value.connectionId && connectionStore.connectedIds.has(activeNode.value.connectionId));
@@ -304,7 +349,26 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
     if (activeNode.value.type === "connection-group") options.requestGroupRename(activeNode.value.id);
   }
 
+  function connectionGroupDeleteTargets() {
+    if (showDeleteGroupConfirm.value && connectionGroupDeleteTargetSnapshot.value.length) return connectionGroupDeleteTargetSnapshot.value;
+    return selectedConnectionGroupDeleteTargets(activeNode.value, selectedTreeNodesInVisibleOrder());
+  }
+
+  function connectionGroupDeleteMenuLabel(): string {
+    const count = connectionGroupDeleteTargets().length;
+    return count > 1 ? t("connectionGroup.deleteSelectedGroups", { count }) : t("connectionGroup.deleteGroup");
+  }
+
+  function connectionGroupDeleteConfirmMessage(): string {
+    const targets = connectionGroupDeleteTargets();
+    return targets.length > 1 ? t("connectionGroup.deleteSelectedGroupsConfirmMessage", { count: targets.length }) : t("connectionGroup.deleteGroupConfirmMessage", { name: targets[0]?.label || sidebarFormTarget.value?.label || activeNode.value.label });
+  }
+
   function deleteConnectionGroup() {
+    const targets = selectedConnectionGroupDeleteTargets(activeNode.value, selectedTreeNodesInVisibleOrder());
+    if (!targets.length) return;
+    connectionGroupDeleteTargetSnapshot.value = targets.slice();
+    deleteConnectionsWithGroup.value = false;
     showDeleteGroupConfirm.value = true;
   }
 
@@ -314,32 +378,49 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
 
   function newSubgroup() {
     const groupId = connectionStore.createConnectionGroup(t("connectionGroup.newGroupDefault"), activeNode.value.id);
-    connectionStore.selectedTreeNodeId = groupId;
-    options.groupCreated(groupId);
+    options.requestGroupRename(groupId);
   }
 
-  function confirmDeleteGroup() {
-    const node = sidebarFormTarget.value ?? activeNode.value;
-    connectionStore.deleteConnectionGroup(node.id);
-    options.releaseActiveNodeReference([node.id]);
-    showDeleteGroupConfirm.value = false;
-    toast(t("connection.groupDeleted"), 2000);
+  async function confirmDeleteGroup() {
+    const targets = connectionGroupDeleteTargets();
+    if (!targets.length || deletingConnectionGroups.value) return;
+
+    const groupIds = targets.map((target) => target.id);
+    deletingConnectionGroups.value = true;
+    try {
+      const connectionIds = await connectionStore.deleteConnectionGroups(groupIds, deleteConnectionsWithGroup.value);
+      options.releaseActiveNodeReference(groupIds);
+      for (const connectionId of connectionIds) {
+        connectionStore.disconnect(connectionId).catch((error) => {
+          console.warn("[DBX][connection-group:delete:disconnect-failed]", { connectionId, error });
+        });
+      }
+      showDeleteGroupConfirm.value = false;
+      connectionGroupDeleteTargetSnapshot.value = [];
+      deleteConnectionsWithGroup.value = false;
+      toast(targets.length > 1 ? t("connection.groupsDeleted", { count: targets.length }) : t("connection.groupDeleted"), 2000);
+    } catch (error: any) {
+      toast(t("connection.saveFailed", { message: error?.message || String(error) }), 5000);
+    } finally {
+      deletingConnectionGroups.value = false;
+    }
   }
 
   function moveToGroup(groupId: string | null) {
-    const connectionId = activeNode.value.connectionId;
-    if (!connectionId) return;
-    connectionStore.moveConnectionToGroup(connectionId, groupId);
-    releaseConnectionFromMultiSelection(connectionStore, connectionId);
+    const targets = selectedConnectionMoveTargets(activeNode.value, selectedTreeNodesInVisibleOrder());
+    if (!targets.length) return;
+    for (const target of targets) connectionStore.moveConnectionToGroup(target.connectionId, groupId);
+    for (const target of targets) releaseConnectionFromMultiSelection(connectionStore, target.connectionId);
   }
 
   function createGroupAndMoveConnection(name: string): boolean {
     const node = sidebarFormTarget.value ?? activeNode.value;
     const normalizedName = name.trim();
-    if (!normalizedName || !node.connectionId) return false;
+    const targets = selectedConnectionMoveTargets(node, selectedTreeNodesInVisibleOrder());
+    if (!normalizedName || !targets.length) return false;
     const groupId = connectionStore.createConnectionGroup(normalizedName);
-    connectionStore.moveConnectionToGroup(node.connectionId, groupId);
-    releaseConnectionFromMultiSelection(connectionStore, node.connectionId);
+    for (const target of targets) connectionStore.moveConnectionToGroup(target.connectionId, groupId);
+    for (const target of targets) releaseConnectionFromMultiSelection(connectionStore, target.connectionId);
     return true;
   }
 
@@ -366,6 +447,11 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
     disconnectConnection,
     connectionDisconnectMenuLabel,
     canDisconnectConnection,
+    connectionGroupDisconnectMenuLabel,
+    canDisconnectConnectionGroup,
+    disconnectConnectionGroup,
+    canForgetSessionCredential,
+    disconnectAndForgetConnectionPassword,
     cancelConnectionAttempt,
     closeDatabaseConnection,
     isPinned,
@@ -381,10 +467,14 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
     openVisibleDatabasesDialog,
     openVisibleSchemasDialog,
     startRenameGroup,
+    connectionGroupDeleteTargets,
+    connectionGroupDeleteMenuLabel,
+    connectionGroupDeleteConfirmMessage,
     deleteConnectionGroup,
     newConnectionInGroup,
     newSubgroup,
     confirmDeleteGroup,
+    deletingConnectionGroups,
     moveToGroup,
     createGroupAndMoveConnection,
   };

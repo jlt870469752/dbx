@@ -12,6 +12,11 @@ function installLocalStorage() {
   });
 }
 
+// Mirrors SIDEBAR_TABLE_SEARCH_RESULT_BUDGET in connectionStore.ts (4× the
+// default sidebar_table_page_size of 500). Kept as a local constant because
+// connectionStore must stay dynamically imported for vi.doMock isolation.
+const SIDEBAR_SEARCH_RESULT_BUDGET = 2000;
+
 function postgresConnection(): ConnectionConfig {
   return {
     id: "pg-1",
@@ -35,6 +40,16 @@ function mysqlConnection(): ConnectionConfig {
     username: "root",
     password: "",
     database: "app",
+  } as ConnectionConfig;
+}
+
+function doltConnection(): ConnectionConfig {
+  return {
+    ...mysqlConnection(),
+    id: "dolt-1",
+    name: "Dolt",
+    driver_profile: "dolt",
+    external_config: { doltShowSystemTables: true },
   } as ConnectionConfig;
 }
 
@@ -160,7 +175,14 @@ describe("connectionStore metadata loading", () => {
       fallback_used: false,
     });
     vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
-    vi.doMock("@/lib/backend/api", () => ({ checkConnectionHealth: vi.fn().mockResolvedValue(undefined), completionAssistantSearch }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      completionAssistantSearch,
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      listInstalledAgents: vi.fn().mockResolvedValue([]),
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+    }));
 
     const { useConnectionStore } = await import("@/stores/connectionStore");
     const store = useConnectionStore();
@@ -173,7 +195,7 @@ describe("connectionStore metadata loading", () => {
       database: "app_db",
       schema: "app_schema",
       children: [],
-      isExpanded: false,
+      isExpanded: true,
     };
     store.connections = [connection];
     store.connectedIds = new Set([connection.id]);
@@ -204,6 +226,18 @@ describe("connectionStore metadata loading", () => {
     ]);
     expect(packageNode.children?.flatMap((group) => group.children ?? []).map((child) => child.label)).toEqual(["process_item(p_id IN INT)", "process_item(p_code IN VARCHAR)", "item_count"]);
     expect(packageNode.children?.flatMap((group) => group.children ?? []).every((child) => child.parentName === "business_api")).toBe(true);
+
+    completionAssistantSearch.mockResolvedValueOnce({
+      candidates: [{ name: "next_item", kind: "function", data_type: "INT" }],
+      incomplete: false,
+      fallback_used: false,
+    });
+    const functionGroup = packageNode.children?.find((child) => child.type === "group-functions");
+    await store.refreshTreeNode(functionGroup!);
+
+    expect(completionAssistantSearch).toHaveBeenCalledTimes(2);
+    expect(packageNode.children?.map((child) => [child.type, child.objectCount])).toEqual([["group-functions", 1]]);
+    expect(packageNode.children?.[0]?.children?.map((child) => child.label)).toEqual(["next_item"]);
   }, 15000);
 
   it("loads Xugu object type members through the scoped completion endpoint", async () => {
@@ -272,6 +306,50 @@ describe("connectionStore metadata loading", () => {
     expect(typeNode.children?.[0].children?.map((child) => child.label)).toEqual(["street (VARCHAR(120))", "created_at (DATETIME)"]);
     expect(typeNode.children?.[1].children?.map((child) => child.label)).toEqual(["FUNCTION format(p_locale IN VARCHAR) → VARCHAR"]);
     expect(typeNode.children?.every((child) => child.parentName === "ADDRESS_T")).toBe(true);
+  }, 15000);
+
+  it("keeps expanded Xugu type members loaded during forced tree refresh", async () => {
+    const completionAssistantSearch = vi.fn(async (request: { object_kinds?: string[] }) => ({
+      candidates: request.object_kinds?.includes("column") ? [{ name: "street", kind: "column", data_type: "VARCHAR(120)" }] : [],
+      incomplete: false,
+      fallback_used: false,
+    }));
+    const getCustomTypeDetails = vi.fn().mockRejectedValue(new Error("custom type loader must not be called for Xugu types"));
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      completionAssistantSearch,
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      getCustomTypeDetails,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    const connection = xuguConnection();
+    const typeNode: TreeNode = {
+      id: "xugu-1:app_db:app_schema:type:address_t",
+      label: "ADDRESS_T",
+      type: "type",
+      objectName: "ADDRESS_T",
+      connectionId: connection.id,
+      database: "app_db",
+      schema: "app_schema",
+      xuguTypeMembersExpandable: true,
+      children: [],
+      isExpanded: false,
+    };
+    store.connections = [connection];
+    store.connectedIds = new Set([connection.id]);
+    store.treeNodes = [typeNode];
+
+    await store.refreshTreeNode(typeNode);
+
+    expect(getCustomTypeDetails).not.toHaveBeenCalled();
+    expect(completionAssistantSearch).toHaveBeenCalledTimes(2);
+    expect(typeNode.children?.map((child) => [child.type, child.objectCount])).toEqual([["type-attributes", 1]]);
+    expect(typeNode.isExpanded).toBe(true);
   }, 15000);
 
   it("hides the Xugu type expander after loading no members", async () => {
@@ -508,8 +586,16 @@ describe("connectionStore metadata loading", () => {
     store.treeNodes = [node];
 
     const normalLoad = store.loadDatabases(connection.id);
-    const searchLoad = store.loadConnectedConnectionRootForSidebarSearch(connection.id);
     await listStarted;
+    const searchLoad = store.loadConnectedConnectionRootForSidebarSearch(connection.id);
+    let searchLoadSettled = false;
+    void searchLoad.finally(() => {
+      searchLoadSettled = true;
+    });
+    await Promise.resolve();
+
+    expect(searchLoadSettled).toBe(false);
+
     resolveDatabases([{ name: "dajia", comment: null }]);
     await Promise.all([normalLoad, searchLoad]);
 
@@ -1084,6 +1170,67 @@ describe("connectionStore metadata loading", () => {
 
     expect(listTables).toHaveBeenCalledWith(connection.id, "warehouse", "warehouse", undefined, 1001, 0, ["TABLE"], undefined, { includePatterns: ["ads_pgc_%"], excludePatterns: [] });
     expect(tableGroup.children?.map((node) => node.label)).toEqual(["ads_pgc_report"]);
+  });
+
+  it("loads Dolt user and system table groups with independent pre-pagination filters", async () => {
+    const listTables = vi.fn(async (...args: unknown[]) => {
+      const tableNameFilter = args[8] as { includePatterns: string[]; excludePatterns: string[] } | undefined;
+      if (tableNameFilter?.includePatterns.includes("dolt%")) {
+        return [{ name: "dolt_log", table_type: "BASE TABLE", comment: null }];
+      }
+      return [{ name: "orders", table_type: "BASE TABLE", comment: null }];
+    });
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      listTables,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useConnectionStore();
+    useSettingsStore().editorSettings.sidebarObjectDisplay = "grouped";
+    const connection = doltConnection();
+    const databaseNode: TreeNode = {
+      id: `${connection.id}:app`,
+      label: "app",
+      type: "database",
+      connectionId: connection.id,
+      database: "app",
+      isExpanded: false,
+      children: [],
+    };
+    store.connections = [connection];
+    store.connectedIds.add(connection.id);
+    store.treeNodes = [
+      {
+        id: connection.id,
+        label: connection.name,
+        type: "connection",
+        connectionId: connection.id,
+        isExpanded: true,
+        children: [databaseNode],
+      },
+    ];
+
+    await store.loadTables(connection.id, "app", undefined, { force: true });
+    const userTables = databaseNode.children?.find((node) => node.type === "group-tables");
+    const systemTables = databaseNode.children?.find((node) => node.type === "group-dolt-system-tables");
+    expect(systemTables?.label).toBe("tree.doltSystemTables");
+
+    await store.loadObjectGroupChildren(userTables!, { force: true });
+    await store.loadObjectGroupChildren(systemTables!, { force: true });
+
+    expect(userTables?.children?.map((node) => node.label)).toEqual(["orders"]);
+    expect(systemTables?.children?.map((node) => node.label)).toEqual(["dolt_log"]);
+    expect(listTables).toHaveBeenCalledWith(connection.id, "app", "app", undefined, 1001, 0, ["TABLE"], undefined, { includePatterns: [], excludePatterns: ["dolt%"] });
+    expect(listTables).toHaveBeenCalledWith(connection.id, "app", "app", undefined, 1001, 0, ["TABLE"], undefined, { includePatterns: ["dolt%"], excludePatterns: [] });
   });
 
   it("clears a stale connection error after a schema metadata retry succeeds", async () => {
@@ -3086,7 +3233,7 @@ describe("connectionStore metadata loading", () => {
     expect(tablesGroup.objectCount).toBe(5);
     expect(tablesGroup.isLoading).toBe(false);
     expect(listTables.mock.calls.map((call) => [call[3], call[4], call[5]])).toEqual([
-      ["0003", 2, undefined],
+      ["0003", SIDEBAR_SEARCH_RESULT_BUDGET, undefined],
       [undefined, 3, 0],
       [undefined, 3, 0],
       [undefined, 3, 2],
@@ -3140,7 +3287,7 @@ describe("connectionStore metadata loading", () => {
     store.sidebarSearchQuery = "orders";
     await store.loadObjectGroupChildren(tablesGroup, { force: true });
 
-    expect(listTables).toHaveBeenLastCalledWith(connection.id, "basic", "basic", "orders", 200, undefined, ["TABLE"]);
+    expect(listTables).toHaveBeenLastCalledWith(connection.id, "basic", "basic", "orders", SIDEBAR_SEARCH_RESULT_BUDGET, undefined, ["TABLE"]);
     expect(tablesGroup.children?.map((node) => node.label)).toEqual(["orders"]);
 
     let resolveAncestorLoad!: (tables: TableInfo[]) => void;

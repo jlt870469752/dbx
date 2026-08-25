@@ -16,19 +16,25 @@ import java.sql.Date;
 import java.sql.Driver;
 import java.sql.DriverManager;
 import java.sql.DriverPropertyInfo;
+import java.sql.ParameterMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.SQLClientInfoException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Statement;
 import java.sql.Time;
 import java.sql.Timestamp;
 import java.sql.Types;
+import java.time.Instant;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -49,6 +55,20 @@ final class DbxJdbcPluginTest {
         request("close", """
             { "connection": %s }
             """.formatted(CONNECTION));
+    }
+
+    @Test
+    void parsesTdengineTimezoneDescription() {
+        assertEquals(ZoneId.of("Asia/Shanghai"), DbxJdbcPlugin.parseTdengineTimezone("Asia/Shanghai (CST, +0800)"));
+        assertEquals(ZoneId.of("Etc/UTC"), DbxJdbcPlugin.parseTdengineTimezone("Etc/UTC (UTC, +0000)"));
+        assertEquals(null, DbxJdbcPlugin.parseTdengineTimezone("unknown (+0800)"));
+    }
+
+    @Test
+    void formatsTimestampInTdengineSessionTimezone() {
+        Timestamp timestamp = Timestamp.from(Instant.parse("2025-03-06T01:19:49.433Z"));
+
+        assertEquals("2025-03-06 09:19:49.433", DbxJdbcPlugin.formatTimestamp(timestamp, ZoneId.of("Asia/Shanghai")));
     }
 
     @Test
@@ -194,6 +214,120 @@ final class DbxJdbcPluginTest {
         assertFalse(info.path("driverName").asText().isEmpty());
         assertFalse(info.path("driverVersion").asText().isEmpty());
         assertFalse(info.path("jdbcVersion").asText().isEmpty());
+        assertEquals(true, info.path("supportsTransactions").asBoolean());
+    }
+
+    @Test
+    void manualTransactionsCommitAndRollbackOnTheDedicatedConnection() throws Exception {
+        request("executeQuery", """
+            {
+              "connection": %s,
+              "sql": "CREATE TABLE IF NOT EXISTS manual_tx_rows(id INT PRIMARY KEY)"
+            }
+            """.formatted(CONNECTION));
+        request("executeQuery", """
+            {
+              "connection": %s,
+              "sql": "DELETE FROM manual_tx_rows"
+            }
+            """.formatted(CONNECTION));
+
+        JsonNode begun = request("beginManualTransaction", """
+            { "connection": %s }
+            """.formatted(CONNECTION));
+        assertFalse(begun.has("error"), begun.toString());
+        JsonNode insertedThenRolledBack = request("executeInManualTransaction", """
+            {
+              "connection": %s,
+              "sql": "INSERT INTO manual_tx_rows VALUES (1)"
+            }
+            """.formatted(CONNECTION));
+        assertFalse(insertedThenRolledBack.has("error"), insertedThenRolledBack.toString());
+        JsonNode rolledBack = request("rollbackManualTransaction", """
+            { "connection": %s }
+            """.formatted(CONNECTION));
+        assertFalse(rolledBack.has("error"), rolledBack.toString());
+        assertEquals(0, manualTransactionRowCount());
+
+        request("begin_manual_transaction", """
+            { "connection": %s }
+            """.formatted(CONNECTION));
+        request("execute_in_manual_transaction", """
+            {
+              "connection": %s,
+              "sql": "INSERT INTO manual_tx_rows VALUES (2)"
+            }
+            """.formatted(CONNECTION));
+        JsonNode committed = request("commit_manual_transaction", """
+            { "connection": %s }
+            """.formatted(CONNECTION));
+        assertFalse(committed.has("error"), committed.toString());
+        assertEquals(1, manualTransactionRowCount());
+    }
+
+    @Test
+    void manualTransactionFallsBackWhenTransactionMetadataIsUnavailable() throws Exception {
+        for (Throwable failure : List.of(
+            new UnsupportedOperationException("unsupported"),
+            new AbstractMethodError("unsupported")
+        )) {
+            String connection = """
+                { "connection_string": "jdbc:dbx-transaction-metadata:%s" }
+                """.formatted(failure.getClass().getSimpleName());
+            Driver driver = testDriver(
+                "jdbc:dbx-transaction-metadata:",
+                transactionMetadataConnection(failure, true)
+            );
+            DriverManager.registerDriver(driver);
+            try {
+                JsonNode begun = request("beginManualTransaction", """
+                    { "connection": %s }
+                    """.formatted(connection));
+                assertFalse(begun.has("error"), failure.getClass().getSimpleName() + ": " + begun);
+
+                JsonNode rolledBack = request("rollbackManualTransaction", """
+                    { "connection": %s }
+                    """.formatted(connection));
+                assertFalse(rolledBack.has("error"), failure.getClass().getSimpleName() + ": " + rolledBack);
+            } finally {
+                closeAndDeregister(connection, driver);
+            }
+        }
+    }
+
+    @Test
+    void manualTransactionRejectsExplicitUnsupportedMetadata() throws Exception {
+        String connection = """
+            { "connection_string": "jdbc:dbx-transaction-metadata:false" }
+            """;
+        Driver driver = testDriver(
+            "jdbc:dbx-transaction-metadata:",
+            transactionMetadataConnection(null, false)
+        );
+        DriverManager.registerDriver(driver);
+        try {
+            JsonNode response = request("beginManualTransaction", """
+                { "connection": %s }
+                """.formatted(connection));
+
+            assertEquals(
+                "This JDBC driver does not support transactions",
+                response.path("error").path("message").asText()
+            );
+        } finally {
+            closeAndDeregister(connection, driver);
+        }
+    }
+
+    private static int manualTransactionRowCount() throws Exception {
+        JsonNode result = request("executeQuery", """
+            {
+              "connection": %s,
+              "sql": "SELECT COUNT(*) FROM manual_tx_rows"
+            }
+            """.formatted(CONNECTION));
+        assertFalse(result.has("error"), result.toString());
+        return result.path("result").path("rows").path(0).path(0).asInt();
     }
 
     @Test
@@ -220,6 +354,72 @@ final class DbxJdbcPluginTest {
 
         assertFalse(response.has("error"), response.toString());
         assertEquals("0x0001abff", response.path("result").path("rows").path(0).path(0).asText());
+    }
+
+    @Test
+    void phoenixSystemCatalogWildcardCastsEncodedColumnsToStandardBinary() throws Exception {
+        JsonNode connection = MAPPER.readTree("""
+            {
+              "connection_string": "jdbc:phoenix:localhost"
+            }
+            """);
+        ResultSet columns = rowsResultSet(
+            new String[] { "COLUMN_NAME", "DATA_TYPE", "TYPE_NAME" },
+            new Object[][] {
+                { "TENANT_ID", Types.VARCHAR, "VARCHAR" },
+                { "ROW_KEY_MATCHER", 9000, "VARBINARY_ENCODED" },
+                { "TABLE_NAME", Types.VARCHAR, "VARCHAR" }
+            }
+        );
+
+        String rewritten = DbxJdbcPlugin.rewritePhoenixSystemCatalogQuery(
+            connection,
+            metadataConnection(columns),
+            "/* generated table query */ SELECT * FROM SYSTEM.CATALOG;"
+        );
+
+        assertEquals(
+            "SELECT \"TENANT_ID\", CAST(\"ROW_KEY_MATCHER\" AS VARBINARY) AS \"ROW_KEY_MATCHER\", \"TABLE_NAME\" FROM \"SYSTEM\".\"CATALOG\"",
+            rewritten
+        );
+    }
+
+    @Test
+    void nonPhoenixWildcardQueryIsNotRewrittenForEncodedMetadata() throws Exception {
+        JsonNode connection = MAPPER.readTree("""
+            {
+              "connection_string": "jdbc:h2:mem:dbx"
+            }
+            """);
+        String sql = "SELECT * FROM SYSTEM.CATALOG";
+
+        assertEquals(sql, DbxJdbcPlugin.rewritePhoenixSystemCatalogQuery(connection, null, sql));
+    }
+
+    @Test
+    void readValueReadsPhoenixEncodedBinaryThroughBytesAccessor() throws Exception {
+        Method method = DbxJdbcPlugin.class.getDeclaredMethod(
+            "readValue",
+            ResultSet.class,
+            ResultSetMetaData.class,
+            int.class,
+            boolean.class
+        );
+        method.setAccessible(true);
+        ResultSet rs = (ResultSet) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { ResultSet.class },
+            (proxy, invokedMethod, args) -> switch (invokedMethod.getName()) {
+                case "getBytes" -> new byte[] { 0x00, 0x01, (byte) 0xab, (byte) 0xff };
+                case "getObject" -> throw new AssertionError("VARBINARY_ENCODED must use getBytes");
+                default -> defaultValue(invokedMethod.getReturnType());
+            }
+        );
+
+        assertEquals(
+            "0x0001abff",
+            method.invoke(null, rs, columnMeta(9000, "VARBINARY_ENCODED"), 1, false)
+        );
     }
 
     @Test
@@ -277,6 +477,51 @@ final class DbxJdbcPluginTest {
         assertEquals(5, third.path("result").path("rows").path(0).path(0).asInt());
         assertEquals(false, third.path("result").path("has_more").asBoolean());
         assertEquals(true, third.path("result").path("session_id").isNull());
+    }
+
+    @Test
+    void ordinaryRequestDoesNotInvalidateActivePostgresPagedQuery() throws Exception {
+        List<String> calls = new ArrayList<>();
+        Driver driver = testDriver("jdbc:postgresql:dbx-interleaved", interleavedPostgresConnection(calls));
+        DriverManager.registerDriver(driver);
+        String connection = """
+            { "connection_string": "jdbc:postgresql:dbx-interleaved" }
+            """;
+        try {
+            JsonNode first = request("executeQueryPage", """
+                {
+                  "connection": %s,
+                  "sql": "SELECT value FROM paged_values",
+                  "pageSize": 1,
+                  "maxRows": 10
+                }
+                """.formatted(connection));
+            assertFalse(first.has("error"), first.toString());
+            assertEquals(1, first.path("result").path("rows").path(0).path(0).asInt());
+            String sessionId = first.path("result").path("session_id").asText();
+
+            JsonNode ordinary = request("executeQuery", """
+                {
+                  "connection": %s,
+                  "sql": "SELECT 99 AS ordinary_value"
+                }
+                """.formatted(connection));
+            assertFalse(ordinary.has("error"), ordinary.toString());
+            assertEquals(99, ordinary.path("result").path("rows").path(0).path(0).asInt());
+
+            JsonNode second = request("fetchQueryPage", """
+                {
+                  "connection": %s,
+                  "sessionId": "%s",
+                  "pageSize": 1
+                }
+                """.formatted(connection, sessionId));
+            assertFalse(second.has("error"), second.toString());
+            assertEquals(2, second.path("result").path("rows").path(0).path(0).asInt());
+            assertFalse(calls.contains("setAutoCommit:true"), calls.toString());
+        } finally {
+            closeAndDeregister(connection, driver);
+        }
     }
 
     @Test
@@ -620,9 +865,143 @@ final class DbxJdbcPluginTest {
 
             assertFalse(response.has("error"), response.toString());
             assertEquals("row-value", response.path("result").path("rows").path(0).path(0).asText());
-            assertEquals(List.of("executeQuery"), calls);
+            assertEquals(List.of("createStatement", "executeQuery", "createStatement", "executeQuery"), calls);
         } finally {
             DriverManager.deregisterDriver(driver);
+        }
+    }
+
+    @Test
+    void tdengineUrlsApplyDatabaseClientInfoBeforeCreatingStatement() throws Exception {
+        for (String url : List.of(
+            "jdbc:taos://dbx-fake:6030",
+            "jdbc:taos-ws://dbx-fake:6041",
+            "jdbc:taos-rs://dbx-fake:6041"
+        )) {
+            List<String> calls = new ArrayList<>();
+            String prefix = url.substring(0, url.indexOf("//"));
+            Driver driver = new BrokenResultSetDriver(prefix, true, -1, calls);
+            DriverManager.registerDriver(driver);
+            String connection = """
+                {
+                  "connection_string": "%s",
+                  "connect_timeout_secs": 30
+                }
+                """.formatted(url);
+            try {
+                JsonNode response = request("executeQuery", """
+                    {
+                      "connection": %s,
+                      "database": "bopu_light",
+                      "sql": "SELECT v FROM meters"
+                    }
+                    """.formatted(connection));
+
+                assertFalse(response.has("error"), response.toString());
+                assertEquals(
+                    List.of(
+                        "setCatalog:bopu_light",
+                        "setClientInfo:dbname:bopu_light",
+                        "createStatement",
+                        "executeQuery",
+                        "createStatement",
+                        "executeQuery"
+                    ),
+                    calls,
+                    url
+                );
+            } finally {
+                closeAndDeregister(connection, driver);
+            }
+        }
+    }
+
+    @Test
+    void ordinaryJdbcDatabaseContextDoesNotSetTdengineClientInfo() throws Exception {
+        List<String> calls = new ArrayList<>();
+        Driver driver = new BrokenResultSetDriver("jdbc:dbx-context:", true, -1, calls);
+        DriverManager.registerDriver(driver);
+        String connection = """
+            {
+              "connection_string": "jdbc:dbx-context:demo",
+              "connect_timeout_secs": 30
+            }
+            """;
+        try {
+            JsonNode response = request("executeQuery", """
+                {
+                  "connection": %s,
+                  "database": "app",
+                  "sql": "SELECT v FROM meters"
+                }
+                """.formatted(connection));
+
+            assertFalse(response.has("error"), response.toString());
+            assertEquals(List.of("setCatalog:app", "createStatement", "execute", "executeQuery"), calls);
+        } finally {
+            closeAndDeregister(connection, driver);
+        }
+    }
+
+    @Test
+    void tdengineBlankDatabaseSkipsDatabaseContext() throws Exception {
+        List<String> calls = new ArrayList<>();
+        Driver driver = new BrokenResultSetDriver("jdbc:taos-rs:", true, -1, calls);
+        DriverManager.registerDriver(driver);
+        String connection = """
+            {
+              "connection_string": "jdbc:taos-rs://dbx-fake:6041",
+              "connect_timeout_secs": 30
+            }
+            """;
+        try {
+            JsonNode response = request("executeQuery", """
+                {
+                  "connection": %s,
+                  "database": "   ",
+                  "sql": "SELECT v FROM meters"
+                }
+                """.formatted(connection));
+
+            assertFalse(response.has("error"), response.toString());
+            assertEquals(List.of("createStatement", "executeQuery", "createStatement", "executeQuery"), calls);
+        } finally {
+            closeAndDeregister(connection, driver);
+        }
+    }
+
+    @Test
+    void tdengineClientInfoCompatibilityFailuresDoNotBlockQueries() throws Exception {
+        for (Throwable failure : List.of(
+            new SQLClientInfoException(),
+            new UnsupportedOperationException("unsupported"),
+            new AbstractMethodError("unsupported")
+        )) {
+            List<String> calls = new ArrayList<>();
+            Driver driver = new BrokenResultSetDriver("jdbc:taos-rs:", true, -1, calls, failure);
+            DriverManager.registerDriver(driver);
+            String connection = """
+                {
+                  "connection_string": "jdbc:taos-rs://dbx-fake:6041",
+                  "connect_timeout_secs": 30
+                }
+                """;
+            try {
+                JsonNode response = request("executeQuery", """
+                    {
+                      "connection": %s,
+                      "database": "bopu_light",
+                      "sql": "SELECT v FROM meters"
+                    }
+                    """.formatted(connection));
+
+                assertFalse(response.has("error"), failure.getClass().getSimpleName() + ": " + response);
+                assertEquals("setCatalog:bopu_light", calls.get(0));
+                assertEquals("setClientInfo:dbname:bopu_light", calls.get(1));
+                assertEquals("executeQuery", calls.get(calls.size() - 1));
+            } finally {
+                closeAndDeregister(connection, driver);
+            }
         }
     }
 
@@ -797,64 +1176,140 @@ final class DbxJdbcPluginTest {
     }
 
     @Test
-    void phoenixConnectionsEnableAutoCommitWhenDriverDefaultsToManualTransactions() throws Exception {
+    void ordinaryConnectionsEnableAutoCommitWhenDriverDefaultsToManualTransactions() throws Exception {
         Method method = DbxJdbcPlugin.class.getDeclaredMethod(
-            "configurePhoenixAutoCommit",
-            JsonNode.class,
-            String.class,
+            "configureOrdinaryAutoCommit",
             Connection.class
         );
         method.setAccessible(true);
         List<String> calls = new ArrayList<>();
-        JsonNode connection = MAPPER.readTree("""
-            {
-              "connection_string": "jdbc:phoenix:localhost"
-            }
-            """);
 
-        method.invoke(null, connection, "jdbc:phoenix:localhost", pagedQueryConnection(calls, false));
+        method.invoke(null, pagedQueryConnection(calls, false));
 
         assertEquals(List.of("getAutoCommit", "setAutoCommit:true"), calls);
     }
 
     @Test
-    void phoenixAutoCommitConfigurationSkipsNonPhoenixConnections() throws Exception {
-        Method method = DbxJdbcPlugin.class.getDeclaredMethod(
-            "configurePhoenixAutoCommit",
-            JsonNode.class,
-            String.class,
-            Connection.class
-        );
-        method.setAccessible(true);
-        List<String> calls = new ArrayList<>();
-        JsonNode connection = MAPPER.readTree("""
+    void phoenixDirectUrlPropertiesArePassedToTheDriver() throws Exception {
+        RecordingConnectDriver driver = new RecordingConnectDriver("jdbc:phoenix:");
+        DriverManager.registerDriver(driver);
+        String connection = """
             {
-              "connection_string": "jdbc:h2:mem:dbx"
+              "connection_string": "jdbc:phoenix:ambari01,ambari02,ambari03:2181:/hbase-unsecure;phoenix.schema.isNamespaceMappingEnabled=true;phoenix.schema.mapSystemTablesToNamespace=true;user=url-user",
+              "username": "phoenix-user",
+              "connect_timeout_secs": 30
             }
-            """);
+            """;
+        try {
+            JsonNode response = request("testConnection", """
+                { "connection": %s }
+                """.formatted(connection));
 
-        method.invoke(null, connection, "jdbc:h2:mem:dbx", pagedQueryConnection(calls, false));
-
-        assertEquals(List.of(), calls);
+            assertFalse(response.has("error"), response.toString());
+            assertEquals(
+                "jdbc:phoenix:ambari01,ambari02,ambari03:2181:/hbase-unsecure;phoenix.schema.isNamespaceMappingEnabled=true;phoenix.schema.mapSystemTablesToNamespace=true;user=url-user",
+                driver.urls.get(0)
+            );
+            assertEquals("true", driver.properties.get(0).getProperty("phoenix.schema.isNamespaceMappingEnabled"));
+            assertEquals("true", driver.properties.get(0).getProperty("phoenix.schema.mapSystemTablesToNamespace"));
+            assertEquals("phoenix-user", driver.properties.get(0).getProperty("user"));
+        } finally {
+            closeAndDeregister(connection, driver);
+        }
     }
 
     @Test
-    void phoenixAutoCommitConfigurationDoesNotResetExistingAutoCommit() throws Exception {
+    void phoenixConnectionUrlParamsUseSemicolonAndReachDriverProperties() throws Exception {
+        RecordingConnectDriver driver = new RecordingConnectDriver("jdbc:phoenix:");
+        DriverManager.registerDriver(driver);
+        String connection = """
+            {
+              "connection_string": "jdbc:phoenix:zk1,zk2:2181:/hbase-unsecure",
+              "url_params": "phoenix.schema.isNamespaceMappingEnabled=true;phoenix.schema.mapSystemTablesToNamespace=true",
+              "connect_timeout_secs": 30
+            }
+            """;
+        try {
+            JsonNode response = request("testConnection", """
+                { "connection": %s }
+                """.formatted(connection));
+
+            assertFalse(response.has("error"), response.toString());
+            assertEquals(
+                "jdbc:phoenix:zk1,zk2:2181:/hbase-unsecure;phoenix.schema.isNamespaceMappingEnabled=true;phoenix.schema.mapSystemTablesToNamespace=true",
+                driver.urls.get(0)
+            );
+            assertEquals("true", driver.properties.get(0).getProperty("phoenix.schema.isNamespaceMappingEnabled"));
+            assertEquals("true", driver.properties.get(0).getProperty("phoenix.schema.mapSystemTablesToNamespace"));
+        } finally {
+            closeAndDeregister(connection, driver);
+        }
+    }
+
+    @Test
+    void phoenixUrlPropertyParsingIgnoresMalformedSegmentsAndPreservesEqualsInValue() throws Exception {
+        Method method = DbxJdbcPlugin.class.getDeclaredMethod("applyPhoenixUrlProperties", String.class, Properties.class);
+        method.setAccessible(true);
+        Properties properties = new Properties();
+
+        method.invoke(
+            null,
+            "jdbc:phoenix;broken;=ignored;phoenix.query.custom=a=b",
+            properties
+        );
+
+        assertEquals("a=b", properties.getProperty("phoenix.query.custom"));
+        assertFalse(properties.containsKey("broken"));
+        assertFalse(properties.containsKey(""));
+    }
+
+    @Test
+    void phoenixThinUrlParamsUseSemicolonSyntax() throws Exception {
+        JsonNode connection = MAPPER.readTree("""
+            {
+              "connection_string": "jdbc:phoenix:thin:url=http://127.0.0.1:8765;serialization=PROTOBUF",
+              "url_params": "authentication=SPNEGO"
+            }
+            """);
+
+        assertEquals(
+            "jdbc:phoenix:thin:url=http://127.0.0.1:8765;serialization=PROTOBUF;authentication=SPNEGO",
+            DbxJdbcPlugin.jdbcUrl(connection)
+        );
+    }
+
+    @Test
+    void nonPhoenixSemicolonUrlPropertiesAreNotCopiedToDriverProperties() throws Exception {
+        RecordingConnectDriver driver = new RecordingConnectDriver("jdbc:dbx-semicolon:");
+        DriverManager.registerDriver(driver);
+        String connection = """
+            {
+              "connection_string": "jdbc:dbx-semicolon:demo;custom.option=true",
+              "connect_timeout_secs": 30
+            }
+            """;
+        try {
+            JsonNode response = request("testConnection", """
+                { "connection": %s }
+                """.formatted(connection));
+
+            assertFalse(response.has("error"), response.toString());
+            assertFalse(driver.properties.get(0).containsKey("custom.option"));
+        } finally {
+            closeAndDeregister(connection, driver);
+        }
+    }
+
+    @Test
+    void ordinaryAutoCommitConfigurationDoesNotResetExistingAutoCommit() throws Exception {
         Method method = DbxJdbcPlugin.class.getDeclaredMethod(
-            "configurePhoenixAutoCommit",
-            JsonNode.class,
-            String.class,
+            "configureOrdinaryAutoCommit",
             Connection.class
         );
         method.setAccessible(true);
         List<String> calls = new ArrayList<>();
-        JsonNode connection = MAPPER.readTree("""
-            {
-              "jdbc_driver_class": "org.apache.phoenix.jdbc.PhoenixDriver"
-            }
-            """);
 
-        method.invoke(null, connection, "jdbc:custom:phoenix", pagedQueryConnection(calls, true));
+        method.invoke(null, pagedQueryConnection(calls, true));
 
         assertEquals(List.of("getAutoCommit"), calls);
     }
@@ -1290,6 +1745,89 @@ final class DbxJdbcPluginTest {
         } finally {
             closeAndDeregister(connection, driver);
         }
+    }
+
+    @Test
+    void oracleExplainNullsBindPlaceholdersInsteadOfFailingWithMissingParameter() throws Exception {
+        List<String> calls = new ArrayList<>();
+        OracleExplainDriver driver = new OracleExplainDriver(calls);
+        DriverManager.registerDriver(driver);
+        String connection = """
+            {
+              "connection_string": "jdbc:oracle:dbx-explain:test",
+              "username": "system",
+              "query_timeout_secs": 30
+            }
+            """;
+        try {
+            // SQL copied from V$SQL/AWR reports commonly carries literal bind
+            // markers like :B1 with no bound value — EXPLAIN PLAN doesn't need
+            // the real value, but a PreparedStatement still requires every
+            // marker to be bound before execute() or Oracle throws ORA-17041.
+            JsonNode response = request("getExplainInfo", """
+                {
+                  "connection": %s,
+                  "sql": "SELECT * FROM T WHERE ID = :B1 AND NAME = :B2",
+                  "timeoutSecs": 30,
+                  "mode": "explain"
+                }
+                """.formatted(connection));
+
+            assertFalse(response.has("error"), response.toString());
+            assertEquals(2, calls.stream().filter(call -> call.equals("setNull:1:12")).count()
+                + calls.stream().filter(call -> call.equals("setNull:2:12")).count());
+        } finally {
+            closeAndDeregister(connection, driver);
+        }
+    }
+
+    @Test
+    void oracleExplainFallsBackToSqlBindScanWhenParameterMetadataIsUnsupported() throws Exception {
+        List<String> calls = new ArrayList<>();
+        OracleExplainDriver driver = new OracleExplainDriver(calls, false);
+        DriverManager.registerDriver(driver);
+        String connection = """
+            {
+              "connection_string": "jdbc:oracle:dbx-explain:test",
+              "username": "system",
+              "query_timeout_secs": 30
+            }
+            """;
+        try {
+            JsonNode response = request("getExplainInfo", """
+                {
+                  "connection": %s,
+                  "sql": "SELECT * FROM T WHERE ID = :B1 AND NAME = :name AND FLAG = ?",
+                  "timeoutSecs": 30,
+                  "mode": "explain"
+                }
+                """.formatted(connection));
+
+            assertFalse(response.has("error"), response.toString());
+            assertEquals(
+                List.of("setNull:1:12", "setNull:2:12", "setNull:3:12"),
+                calls.stream().filter(call -> call.startsWith("setNull:")).toList()
+            );
+        } finally {
+            closeAndDeregister(connection, driver);
+        }
+    }
+
+    @Test
+    void oracleExplainFallbackBindScanSkipsQuotedTextAndComments() throws Exception {
+        Method method = DbxJdbcPlugin.class.getDeclaredMethod("oracleExplainBindMarkerCount", String.class);
+        method.setAccessible(true);
+        String sql = """
+            SELECT :B1, :1, ?
+            FROM T
+            WHERE TEXT_VALUE = ':ignored ?'
+              AND Q_VALUE = q'[ignored :Q1 ?]'
+              AND "COL:IGNORED?" = 1
+              -- ignored :LINE ?
+              /* ignored :BLOCK ? */
+            """;
+
+        assertEquals(3, method.invoke(null, sql));
     }
 
     @Test
@@ -2045,6 +2583,105 @@ final class DbxJdbcPluginTest {
     }
 
     @Test
+    void listIndexesReturnsPrimaryAndUniqueIndexes() throws Exception {
+        request("executeQuery", """
+            {
+              "connection": %s,
+              "sql": "DROP TABLE IF EXISTS codex_jdbc_indexes"
+            }
+            """.formatted(CONNECTION));
+        request("executeQuery", """
+            {
+              "connection": %s,
+              "sql": "CREATE TABLE codex_jdbc_indexes (id INT CONSTRAINT codex_jdbc_indexes_pk PRIMARY KEY, code VARCHAR(32), CONSTRAINT codex_jdbc_indexes_code_uq UNIQUE(code))"
+            }
+            """.formatted(CONNECTION));
+
+        JsonNode response = request("listIndexes", """
+            {
+              "connection": %s,
+              "schema": "PUBLIC",
+              "table": "CODEX_JDBC_INDEXES"
+            }
+            """.formatted(CONNECTION));
+
+        assertFalse(response.has("error"), response.toString());
+        JsonNode indexes = response.path("result");
+        JsonNode primary = findByName(indexes, "CODEX_JDBC_INDEXES_PK_INDEX_4");
+        if (primary == null) {
+            primary = findIndexByColumn(indexes, "ID");
+        }
+        JsonNode unique = findByName(indexes, "CODEX_JDBC_INDEXES_CODE_UQ_INDEX_4");
+        if (unique == null) {
+            unique = findIndexByColumn(indexes, "CODE");
+        }
+        assertEquals(true, primary.path("is_primary").asBoolean(), indexes.toString());
+        assertEquals(true, primary.path("is_unique").asBoolean(), indexes.toString());
+        assertEquals(true, unique.path("is_unique").asBoolean(), indexes.toString());
+        assertEquals(false, unique.path("is_primary").asBoolean(), indexes.toString());
+    }
+
+    @Test
+    void oracleListIndexesGroupsColumnsAndMarksPrimaryKey() throws Exception {
+        ResultSet rows = rowsResultSet(
+            new String[] { "index_name", "uniqueness", "index_type", "column_name", "is_primary" },
+            new Object[][] {
+                { "CODEX_7046_CODE_IDX", "NONUNIQUE", "NORMAL", "CODE", 0 },
+                { "CODEX_7046_PK", "UNIQUE", "NORMAL", "ID", 1 },
+                { "CODEX_7046_PK", "UNIQUE", "NORMAL", "TENANT_ID", 1 }
+            }
+        );
+        Connection conn = preparedStatementConnection(rows);
+        Method method = DbxJdbcPlugin.class.getDeclaredMethod(
+            "oracleListIndexes",
+            Connection.class,
+            String.class,
+            String.class
+        );
+        method.setAccessible(true);
+
+        JsonNode indexes = (JsonNode) method.invoke(null, conn, "DBX_TEST", "CODEX_7046_META");
+
+        JsonNode primary = findByName(indexes, "CODEX_7046_PK");
+        assertEquals(true, primary.path("is_primary").asBoolean());
+        assertEquals(true, primary.path("is_unique").asBoolean());
+        assertEquals("ID", primary.path("columns").path(0).asText());
+        assertEquals("TENANT_ID", primary.path("columns").path(1).asText());
+        JsonNode secondary = findByName(indexes, "CODEX_7046_CODE_IDX");
+        assertEquals(false, secondary.path("is_primary").asBoolean());
+        assertEquals(false, secondary.path("is_unique").asBoolean());
+    }
+
+    @Test
+    void listIndexesDegradesToEmptyWhenDriverRejectsIndexMetadata() throws Exception {
+        for (Throwable failure : List.of(
+            new SQLFeatureNotSupportedException("indexes not supported"),
+            new UnsupportedOperationException("unsupported"),
+            new AbstractMethodError("unsupported")
+        )) {
+            String connection = """
+                { "connection_string": "jdbc:dbx-index-metadata:%s" }
+                """.formatted(failure.getClass().getSimpleName());
+            Driver driver = testDriver("jdbc:dbx-index-metadata:", indexMetadataConnection(failure));
+            DriverManager.registerDriver(driver);
+            try {
+                JsonNode response = request("listIndexes", """
+                    {
+                      "connection": %s,
+                      "schema": "PUBLIC",
+                      "table": "SOME_TABLE"
+                    }
+                    """.formatted(connection));
+
+                assertFalse(response.has("error"), failure.getClass().getSimpleName() + ": " + response);
+                assertEquals(0, response.path("result").size(), failure.getClass().getSimpleName() + ": " + response);
+            } finally {
+                closeAndDeregister(connection, driver);
+            }
+        }
+    }
+
+    @Test
     void oracleEffectiveSchemaUsesExactOwnerBeforeUppercaseFallback() throws Exception {
         Method method = DbxJdbcPlugin.class.getDeclaredMethod("oracleEffectiveSchema", Connection.class, String.class);
         method.setAccessible(true);
@@ -2211,6 +2848,10 @@ final class DbxJdbcPluginTest {
     }
 
     private static ResultSetMetaData columnMeta(int columnType) {
+        return columnMeta(columnType, "");
+    }
+
+    private static ResultSetMetaData columnMeta(int columnType, String typeName) {
         return (ResultSetMetaData) Proxy.newProxyInstance(
             DbxJdbcPluginTest.class.getClassLoader(),
             new Class<?>[] { ResultSetMetaData.class },
@@ -2219,8 +2860,28 @@ final class DbxJdbcPluginTest {
                     case "getColumnCount" -> 1;
                     case "getColumnLabel", "getColumnName" -> "CREATED_AT";
                     case "getColumnType" -> columnType;
+                    case "getColumnTypeName" -> typeName;
                     default -> defaultValue(method.getReturnType());
                 };
+            }
+        );
+    }
+
+    private static Connection metadataConnection(ResultSet columns) {
+        DatabaseMetaData metadata = (DatabaseMetaData) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { DatabaseMetaData.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "getColumns" -> columns;
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+        return (Connection) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Connection.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "getMetaData" -> metadata;
+                default -> defaultValue(method.getReturnType());
             }
         );
     }
@@ -2465,6 +3126,39 @@ final class DbxJdbcPluginTest {
         );
     }
 
+    private static Connection preparedStatementConnection(ResultSet rs) {
+        return (Connection) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Connection.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "prepareStatement" -> preparedStatement(rs);
+                case "isClosed" -> false;
+                case "close" -> null;
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+    }
+
+    private static JsonNode findByName(JsonNode items, String name) {
+        for (JsonNode item : items) {
+            if (name.equalsIgnoreCase(item.path("name").asText())) {
+                return item;
+            }
+        }
+        return null;
+    }
+
+    private static JsonNode findIndexByColumn(JsonNode indexes, String column) {
+        for (JsonNode index : indexes) {
+            for (JsonNode value : index.path("columns")) {
+                if (column.equalsIgnoreCase(value.asText())) {
+                    return index;
+                }
+            }
+        }
+        return null;
+    }
+
     private static ResultSet rowsResultSet(String[] columns, Object[][] rows) {
         return (ResultSet) Proxy.newProxyInstance(
             DbxJdbcPluginTest.class.getClassLoader(),
@@ -2477,6 +3171,7 @@ final class DbxJdbcPluginTest {
                     return switch (method.getName()) {
                         case "next" -> ++index < rows.length;
                         case "getString" -> stringValue(columns, rows[index], args[0]);
+                        case "getInt" -> ((Number) columnValue(columns, rows[index], args[0])).intValue();
                         case "getBoolean" -> booleanValue(columns, rows[index], args[0]);
                         case "getObject" -> columnValue(columns, rows[index], args[0]);
                         case "close" -> null;
@@ -2704,6 +3399,177 @@ final class DbxJdbcPluginTest {
                         case "getString" -> rows[index][((Integer) args[0]) - 1];
                         case "getObject" -> rows[index][((Integer) args[0]) - 1];
                         case "close" -> null;
+                        default -> defaultValue(method.getReturnType());
+                    };
+                }
+            }
+        );
+    }
+
+    private static Driver testDriver(String urlPrefix, Connection connection) {
+        return (Driver) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Driver.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "connect" -> ((String) args[0]).startsWith(urlPrefix) ? connection : null;
+                case "acceptsURL" -> ((String) args[0]).startsWith(urlPrefix);
+                case "getPropertyInfo" -> new DriverPropertyInfo[0];
+                case "getMajorVersion" -> 1;
+                case "getMinorVersion" -> 0;
+                case "jdbcCompliant" -> false;
+                case "getParentLogger" -> java.util.logging.Logger.getGlobal();
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+    }
+
+    private static Connection indexMetadataConnection(Throwable failure) {
+        DatabaseMetaData metadata = (DatabaseMetaData) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { DatabaseMetaData.class },
+            (proxy, method, args) -> {
+                if ("getPrimaryKeys".equals(method.getName()) || "getIndexInfo".equals(method.getName())) {
+                    throw failure;
+                }
+                return defaultValue(method.getReturnType());
+            }
+        );
+        return (Connection) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Connection.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "getMetaData" -> metadata;
+                case "isClosed" -> false;
+                case "close" -> null;
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+    }
+
+    private static Connection transactionMetadataConnection(Throwable metadataFailure, boolean supportsTransactions) {
+        boolean[] autoCommit = { true };
+        DatabaseMetaData metadata = (DatabaseMetaData) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { DatabaseMetaData.class },
+            (proxy, method, args) -> {
+                if ("supportsTransactions".equals(method.getName())) {
+                    if (metadataFailure != null) {
+                        throw metadataFailure;
+                    }
+                    return supportsTransactions;
+                }
+                return defaultValue(method.getReturnType());
+            }
+        );
+        return (Connection) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Connection.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "getAutoCommit" -> autoCommit[0];
+                case "setAutoCommit" -> {
+                    autoCommit[0] = (boolean) args[0];
+                    yield null;
+                }
+                case "getMetaData" -> metadata;
+                case "isClosed" -> false;
+                case "rollback", "close", "setCatalog", "setSchema" -> null;
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+    }
+
+    private static Connection interleavedPostgresConnection(List<String> calls) {
+        boolean[] autoCommit = { true };
+        boolean[] activePagedCursor = { false };
+        boolean[] cursorInvalidated = { false };
+        return (Connection) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Connection.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "getAutoCommit" -> {
+                    calls.add("getAutoCommit");
+                    yield autoCommit[0];
+                }
+                case "setAutoCommit" -> {
+                    boolean next = (boolean) args[0];
+                    calls.add("setAutoCommit:" + next);
+                    if (next && !autoCommit[0] && activePagedCursor[0]) {
+                        cursorInvalidated[0] = true;
+                    }
+                    autoCommit[0] = next;
+                    yield null;
+                }
+                case "createStatement" -> interleavedStatement(activePagedCursor, cursorInvalidated);
+                case "isClosed" -> false;
+                case "rollback", "close", "setCatalog", "setSchema" -> null;
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+    }
+
+    private static Statement interleavedStatement(boolean[] activePagedCursor, boolean[] cursorInvalidated) {
+        return (Statement) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { Statement.class },
+            new java.lang.reflect.InvocationHandler() {
+                private ResultSet resultSet;
+
+                @Override
+                public Object invoke(Object proxy, Method method, Object[] args) {
+                    return switch (method.getName()) {
+                        case "execute" -> {
+                            String sql = (String) args[0];
+                            boolean paged = sql.contains("paged_values");
+                            if (paged) {
+                                activePagedCursor[0] = true;
+                            }
+                            resultSet = integerResultSet(
+                                paged ? new int[] { 1, 2, 3 } : new int[] { 99 },
+                                paged,
+                                activePagedCursor,
+                                cursorInvalidated
+                            );
+                            yield true;
+                        }
+                        case "getResultSet" -> resultSet;
+                        case "getUpdateCount" -> -1;
+                        case "setMaxRows", "setFetchSize", "setQueryTimeout", "close" -> null;
+                        default -> defaultValue(method.getReturnType());
+                    };
+                }
+            }
+        );
+    }
+
+    private static ResultSet integerResultSet(
+        int[] values,
+        boolean paged,
+        boolean[] activePagedCursor,
+        boolean[] cursorInvalidated
+    ) {
+        return (ResultSet) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { ResultSet.class },
+            new java.lang.reflect.InvocationHandler() {
+                private int index = -1;
+
+                @Override
+                public Object invoke(Object proxy, Method method, Object[] args) throws SQLException {
+                    return switch (method.getName()) {
+                        case "next" -> {
+                            if (paged && cursorInvalidated[0]) {
+                                throw new SQLException("PostgreSQL cursor was invalidated by auto-commit");
+                            }
+                            yield ++index < values.length;
+                        }
+                        case "getMetaData" -> columnMeta(Types.INTEGER);
+                        case "getObject" -> values[index];
+                        case "close" -> {
+                            if (paged) {
+                                activePagedCursor[0] = false;
+                            }
+                            yield null;
+                        }
                         default -> defaultValue(method.getReturnType());
                     };
                 }
@@ -3120,16 +3986,22 @@ final class DbxJdbcPluginTest {
 
     private static final class OracleExplainDriver implements Driver {
         private final List<String> calls;
+        private final boolean parameterMetadataSupported;
 
         private OracleExplainDriver(List<String> calls) {
+            this(calls, true);
+        }
+
+        private OracleExplainDriver(List<String> calls, boolean parameterMetadataSupported) {
             this.calls = calls;
+            this.parameterMetadataSupported = parameterMetadataSupported;
         }
 
         @Override
         public Connection connect(String url, Properties info) {
             if (!acceptsURL(url)) return null;
             calls.add("connect");
-            return oracleExplainConnection(calls);
+            return oracleExplainConnection(calls, parameterMetadataSupported);
         }
 
         @Override
@@ -3144,12 +4016,16 @@ final class DbxJdbcPluginTest {
         @Override public java.util.logging.Logger getParentLogger() { return java.util.logging.Logger.getGlobal(); }
     }
 
-    private static Connection oracleExplainConnection(List<String> calls) {
+    private static Connection oracleExplainConnection(List<String> calls, boolean parameterMetadataSupported) {
         return (Connection) Proxy.newProxyInstance(
             DbxJdbcPluginTest.class.getClassLoader(),
             new Class<?>[] { Connection.class },
             (proxy, method, args) -> switch (method.getName()) {
-                case "prepareStatement" -> oracleExplainStatement(String.valueOf(args[0]), calls);
+                case "prepareStatement" -> oracleExplainStatement(
+                    String.valueOf(args[0]),
+                    calls,
+                    parameterMetadataSupported
+                );
                 case "isClosed" -> false;
                 case "close" -> null;
                 default -> defaultValue(method.getReturnType());
@@ -3157,8 +4033,13 @@ final class DbxJdbcPluginTest {
         );
     }
 
-    private static PreparedStatement oracleExplainStatement(String sql, List<String> calls) {
+    private static PreparedStatement oracleExplainStatement(
+        String sql,
+        List<String> calls,
+        boolean parameterMetadataSupported
+    ) {
         calls.add("prepare:" + sql);
+        int parameterCount = oracleExplainMockParameterCount(sql);
         return (PreparedStatement) Proxy.newProxyInstance(
             DbxJdbcPluginTest.class.getClassLoader(),
             new Class<?>[] { PreparedStatement.class },
@@ -3167,6 +4048,16 @@ final class DbxJdbcPluginTest {
                     calls.add("bind:" + args[0] + ":" + args[1]);
                     yield null;
                 }
+                case "setNull" -> {
+                    calls.add("setNull:" + args[0] + ":" + args[1]);
+                    yield null;
+                }
+                case "getParameterMetaData" -> {
+                    if (!parameterMetadataSupported) {
+                        throw new SQLFeatureNotSupportedException("parameter metadata unavailable");
+                    }
+                    yield oracleExplainMockParameterMetaData(parameterCount);
+                }
                 case "setQueryTimeout", "close" -> null;
                 case "execute" -> true;
                 case "executeUpdate" -> 1;
@@ -3174,6 +4065,27 @@ final class DbxJdbcPluginTest {
                     new String[] { "PLAN_TABLE_OUTPUT" },
                     new Object[][] { { "Plan hash value: 123" }, { "TABLE ACCESS FULL DUAL" } }
                 );
+                default -> defaultValue(method.getReturnType());
+            }
+        );
+    }
+
+    // Mirrors, loosely, how Oracle's JDBC driver counts distinct ":name"/":1"/"?"
+    // bind markers in real SQL text — just enough for the mock to exercise
+    // DbxJdbcPlugin's null-binding loop end to end.
+    private static int oracleExplainMockParameterCount(String sql) {
+        Matcher matcher = Pattern.compile("\\?|:[A-Za-z_][A-Za-z0-9_]*|:[0-9]+").matcher(sql);
+        int count = 0;
+        while (matcher.find()) count++;
+        return count;
+    }
+
+    private static ParameterMetaData oracleExplainMockParameterMetaData(int parameterCount) {
+        return (ParameterMetaData) Proxy.newProxyInstance(
+            DbxJdbcPluginTest.class.getClassLoader(),
+            new Class<?>[] { ParameterMetaData.class },
+            (proxy, method, args) -> switch (method.getName()) {
+                case "getParameterCount" -> parameterCount;
                 default -> defaultValue(method.getReturnType());
             }
         );
@@ -3286,16 +4198,28 @@ final class DbxJdbcPluginTest {
         private final boolean executeReturnsResultSet;
         private final int updateCount;
         private final List<String> calls;
+        private final Throwable clientInfoFailure;
 
         private BrokenResultSetDriver(String urlPrefix, boolean executeReturnsResultSet, int updateCount) {
-            this(urlPrefix, executeReturnsResultSet, updateCount, new ArrayList<>());
+            this(urlPrefix, executeReturnsResultSet, updateCount, new ArrayList<>(), null);
         }
 
         private BrokenResultSetDriver(String urlPrefix, boolean executeReturnsResultSet, int updateCount, List<String> calls) {
+            this(urlPrefix, executeReturnsResultSet, updateCount, calls, null);
+        }
+
+        private BrokenResultSetDriver(
+            String urlPrefix,
+            boolean executeReturnsResultSet,
+            int updateCount,
+            List<String> calls,
+            Throwable clientInfoFailure
+        ) {
             this.urlPrefix = urlPrefix;
             this.executeReturnsResultSet = executeReturnsResultSet;
             this.updateCount = updateCount;
             this.calls = calls;
+            this.clientInfoFailure = clientInfoFailure;
         }
 
         @Override
@@ -3303,7 +4227,7 @@ final class DbxJdbcPluginTest {
             if (!acceptsURL(url)) {
                 return null;
             }
-            return brokenResultSetConnection(executeReturnsResultSet, updateCount, calls);
+            return brokenResultSetConnection(executeReturnsResultSet, updateCount, calls, clientInfoFailure);
         }
 
         @Override
@@ -3337,15 +4261,36 @@ final class DbxJdbcPluginTest {
         }
     }
 
-    private static Connection brokenResultSetConnection(boolean executeReturnsResultSet, int updateCount, List<String> calls) {
+    private static Connection brokenResultSetConnection(
+        boolean executeReturnsResultSet,
+        int updateCount,
+        List<String> calls,
+        Throwable clientInfoFailure
+    ) {
         return (Connection) Proxy.newProxyInstance(
             DbxJdbcPluginTest.class.getClassLoader(),
             new Class<?>[] { Connection.class },
-            (proxy, method, args) -> switch (method.getName()) {
-                case "createStatement" -> brokenResultSetStatement(executeReturnsResultSet, updateCount, calls);
-                case "isClosed" -> false;
-                case "close" -> null;
-                default -> defaultValue(method.getReturnType());
+            (proxy, method, args) -> {
+                if ("setClientInfo".equals(method.getName())) {
+                    calls.add("setClientInfo:" + args[0] + ":" + args[1]);
+                    if (clientInfoFailure != null) {
+                        throw clientInfoFailure;
+                    }
+                    return null;
+                }
+                return switch (method.getName()) {
+                    case "createStatement" -> {
+                        calls.add("createStatement");
+                        yield brokenResultSetStatement(executeReturnsResultSet, updateCount, calls);
+                    }
+                    case "setCatalog" -> {
+                        calls.add("setCatalog:" + args[0]);
+                        yield null;
+                    }
+                    case "isClosed" -> false;
+                    case "close" -> null;
+                    default -> defaultValue(method.getReturnType());
+                };
             }
         );
     }

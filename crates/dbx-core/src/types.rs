@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub use crate::mysql_event_sql::MysqlEventInfo;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DatabaseInfo {
     pub name: String,
@@ -122,6 +124,7 @@ pub enum ObjectSourceKind {
     Procedure,
     Function,
     Trigger,
+    Event,
     Sequence,
     Synonym,
     Package,
@@ -144,6 +147,8 @@ pub struct ObjectSource {
 pub struct ColumnInfo {
     pub name: String,
     pub data_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_schema: Option<String>,
     pub is_nullable: bool,
     pub column_default: Option<String>,
     pub is_primary_key: bool,
@@ -405,6 +410,11 @@ pub struct IndexInfo {
     pub index_type: Option<String>,
     pub included_columns: Option<Vec<String>>,
     pub comment: Option<String>,
+    /// Parallel to `columns`: `true` at index `i` means `columns[i]` is a raw expression
+    /// (e.g. sourced from `pg_get_indexdef`), not a plain column name. Empty when the
+    /// introspection source doesn't track this (provenance unknown for that dialect/path).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_is_expression: Vec<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

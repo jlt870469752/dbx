@@ -9,7 +9,20 @@ import { useTheme } from "@/composables/useTheme";
 import { loadEditorTheme, editorFontTheme } from "@/lib/editor/editorThemes";
 import { createDbxCodeMirrorSqlDialect } from "@/lib/editor/codemirrorSqlDialect";
 import { Splitpanes, Pane } from "splitpanes";
-import { schemaDiffReviewAlert, selectedSchemaDiffObjects, summarizeSchemaDiffOperations, type SchemaDiffObject, type DiffOperationType, type DiffObjectKind, type CompatibilityWarning, type RenameCandidate, type MissingRollbackObject, type RollbackCompleteness } from "@/lib/schema/schemaDiff";
+import {
+  schemaDiffObjectSelectionState,
+  schemaDiffReviewAlert,
+  schemaDiffSelectionTargets,
+  selectedSchemaDiffObjects,
+  summarizeSchemaDiffOperations,
+  type SchemaDiffObject,
+  type DiffOperationType,
+  type DiffObjectKind,
+  type CompatibilityWarning,
+  type RenameCandidate,
+  type MissingRollbackObject,
+  type RollbackCompleteness,
+} from "@/lib/schema/schemaDiff";
 import ImpactReportPanel from "@/components/diff/ImpactReportPanel.vue";
 import type { ImpactReport } from "@/types/governance";
 import { ArrowLeft, Copy, Download, Play, Loader2, PlusCircle, XCircle, ArrowRightLeft, Table, Eye, FunctionSquare, ListOrdered, ScrollText, UserCog, Columns3, ListTree, Link2, Zap, AlertTriangle, ShieldCheck } from "@lucide/vue";
@@ -54,13 +67,13 @@ const objectPositions = computed(() => {
   const positions = new Map<string, { from: number; to: number }>();
   const sql = props.deploySql;
   for (const obj of topLevelObjects.value) {
-    const patterns = [`-- Create ${obj.objectKind}: ${obj.name}`, `-- Modify ${obj.objectKind}: ${obj.name}`, `-- Drop ${obj.objectKind}: ${obj.name}`];
+    const patterns = [`-- Create ${obj.objectKind}: ${obj.name}`, `-- Alter ${obj.objectKind}: ${obj.name}`, `-- Modify ${obj.objectKind}: ${obj.name}`, `-- Drop ${obj.objectKind}: ${obj.name}`];
     for (const pattern of patterns) {
       const index = sql.indexOf(pattern);
       if (index !== -1) {
         let endPos = sql.length;
         const remaining = sql.slice(index + pattern.length);
-        const nextMatch = remaining.match(/--\s*(Create|Modify|Drop)\s+\w+:/);
+        const nextMatch = remaining.match(/--\s*(Create|Alter|Modify|Drop)\s+\w+:/);
         if (nextMatch && nextMatch.index !== undefined) {
           endPos = index + pattern.length + nextMatch.index;
         }
@@ -90,8 +103,8 @@ const topLevelObjects = computed(() => {
   const operationOrder: Record<DiffOperationType, number> = { create: 0, modify: 1, delete: 2, none: 3 };
   return props.selectedObjects
     .filter((o) => {
-      const isTopLevel = !o.id.startsWith("col-") && !o.id.startsWith("idx-") && !o.id.startsWith("fk-") && !o.id.startsWith("trg-");
-      return o.selected && o.operationType !== "none" && isTopLevel;
+      const state = schemaDiffObjectSelectionState(o);
+      return o.operationType !== "none" && (state.checked || state.indeterminate);
     })
     .sort((a, b) => operationOrder[a.operationType] - operationOrder[b.operationType]);
 });
@@ -338,6 +351,7 @@ function getObjectIconColor(kind: DiffObjectKind): string {
             <component :is="operationIcons[obj.operationType]" class="w-3.5 h-3.5 shrink-0" :class="operationColors[obj.operationType]" />
             <component :is="getObjectIcon(obj.objectKind)" class="w-3.5 h-3.5 shrink-0" :class="getObjectIconColor(obj.objectKind)" />
             <span class="truncate">{{ obj.name }}</span>
+            <span v-if="obj.children?.length" class="text-[10px] text-muted-foreground shrink-0">{{ schemaDiffSelectionTargets(obj).filter((child) => child.selected).length }}/{{ schemaDiffSelectionTargets(obj).length }}</span>
             <span class="text-[10px] text-muted-foreground shrink-0 ml-auto">
               {{ getOperationLabel(obj.operationType) }}
             </span>
@@ -349,7 +363,7 @@ function getObjectIconColor(kind: DiffObjectKind): string {
       </Pane>
 
       <Pane size="70" min-size="40">
-        <div ref="editorContainer" class="h-full w-full" />
+        <div ref="editorContainer" class="deploy-sql-editor h-full w-full" />
       </Pane>
     </Splitpanes>
 
@@ -389,6 +403,19 @@ function getObjectIconColor(kind: DiffObjectKind): string {
 </template>
 
 <style scoped>
+/* CodeMirror's own selection layer isn't styled here, so selecting text in the deploy
+   script preview renders with no visible highlight at all in some environments. Match
+   the override already used by the other read-only CodeMirror views (DdlViewDialog,
+   NacosAdminConsole). */
+.deploy-sql-editor :deep(.cm-selectionBackground),
+.deploy-sql-editor :deep(.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground) {
+  background: var(--dbx-editor-selection-background, rgba(59, 130, 246, 0.35)) !important;
+}
+
+.deploy-sql-editor :deep(.cm-content ::selection) {
+  background: var(--dbx-editor-selection-background, rgba(59, 130, 246, 0.35)) !important;
+}
+
 :deep(.splitpanes--vertical > .splitpanes__splitter) {
   width: 4px;
   background: var(--border);

@@ -1,79 +1,9 @@
 import type { BackendError } from "@/lib/backend/errorUtils";
-import type { MultiDbResultRunExecution } from "@/types/sqlExecution";
+import type { TransferContent, TransferMode, TransferObjectKind, TransferTableNameCase } from "@/lib/backend/tauri";
+import type { MultiDbExecutionTarget, MultiDbResultRunExecution } from "@/types/sqlExecution";
+import type { DatabaseType } from "@/types/generated/databaseTypes";
 
-export type DatabaseType =
-  | "mysql"
-  | "postgres"
-  | "sqlite"
-  | "rqlite"
-  | "turso"
-  | "cloudflare-d1"
-  | "redis"
-  | "duckdb"
-  | "clickhouse"
-  | "sqlserver"
-  | "mongodb"
-  | "oracle"
-  | "elasticsearch"
-  | "easysearch"
-  | "meilisearch"
-  | "hbase"
-  | "qdrant"
-  | "milvus"
-  | "weaviate"
-  | "chromadb"
-  | "doris"
-  | "starrocks"
-  | "manticoresearch"
-  | "databend"
-  | "redshift"
-  | "dameng"
-  | "gaussdb"
-  | "kingbase"
-  | "highgo"
-  | "uxdb"
-  | "vastbase"
-  | "goldendb"
-  | "kwdb"
-  | "yashandb"
-  | "databricks"
-  | "saphana"
-  | "teradata"
-  | "vertica"
-  | "firebird"
-  | "exasol"
-  | "opengauss"
-  | "oceanbase-oracle"
-  | "questdb"
-  | "gbase"
-  | "access"
-  | "h2"
-  | "snowflake"
-  | "trino"
-  | "prestosql"
-  | "hive"
-  | "spark"
-  | "db2"
-  | "informix"
-  | "neo4j"
-  | "cassandra"
-  | "bigquery"
-  | "kylin"
-  | "sundb"
-  | "oscar"
-  | "tdengine"
-  | "xugu"
-  | "iotdb"
-  | "etcd"
-  | "zookeeper"
-  | "iris"
-  | "influxdb"
-  | "victoriametrics"
-  | "jdbc"
-  | "mq"
-  | "mqtt"
-  | "nacos"
-  | "consul";
+export type { DatabaseType } from "@/types/generated/databaseTypes";
 
 export function isElasticsearchCompatibleDatabaseType(dbType?: DatabaseType): boolean {
   return dbType === "elasticsearch" || dbType === "easysearch";
@@ -436,7 +366,7 @@ export interface TableInfo {
   parent_name?: string | null;
 }
 
-export type DatabaseObjectType = "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
+export type DatabaseObjectType = "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "EVENT" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
 
 export interface ObjectInfo {
   name: string;
@@ -465,7 +395,7 @@ export interface ObjectStatistics {
   total_bytes?: number | null;
 }
 
-export type ObjectSourceKind = "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
+export type ObjectSourceKind = "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "EVENT" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
 
 export interface ObjectSource {
   name: string;
@@ -473,6 +403,28 @@ export interface ObjectSource {
   schema?: string | null;
   source: string;
   editable?: boolean;
+}
+
+export interface MysqlEventInfo {
+  name: string;
+  schema: string;
+  definer?: string | null;
+  time_zone?: string | null;
+  event_type?: string | null;
+  execute_at?: string | null;
+  interval_value?: string | null;
+  interval_field?: string | null;
+  starts?: string | null;
+  ends?: string | null;
+  status?: string | null;
+  on_completion?: string | null;
+  comment?: string | null;
+  event_body?: string | null;
+  event_definition?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  last_executed?: string | null;
+  source?: string | null;
 }
 
 export type CustomTypeKind = "base" | "composite" | "domain" | "enum" | "range" | "multirange";
@@ -533,6 +485,7 @@ export interface CustomTypeDetails {
 export interface ColumnInfo {
   name: string;
   data_type: string;
+  resolved_schema?: string;
   is_nullable: boolean;
   column_default: string | null;
   is_primary_key: boolean;
@@ -563,6 +516,8 @@ export interface IndexInfo {
   index_type?: string | null;
   included_columns?: string[] | null;
   comment?: string | null;
+  /** Parallel to `columns`: true at index i means columns[i] is a raw expression, not a plain column name. */
+  key_is_expression?: boolean[] | null;
 }
 
 export interface ForeignKeyInfo {
@@ -761,7 +716,9 @@ export interface BatchSqlExecution {
   completed: number;
   total: number;
   startedAt: number;
+  executionTarget?: MultiDbExecutionTarget;
   finishedAt?: number;
+  recoveryDismissed?: boolean;
   items: BatchStatementExecutionItem[];
 }
 
@@ -770,12 +727,19 @@ export interface SpatialColumn {
   srid: number | null;
 }
 
+export interface QueryResultSourceColumnRef {
+  sourceKey: string;
+  sourceColumn: string;
+}
+
 export interface QueryResultRun {
   id: string;
   title: string;
   sequence: number;
   sql: string;
   createdAt: number;
+  /** Keeps this result from being replaced by an ordinary query execution. */
+  pinned?: boolean;
   /** Distinguishes successive result payloads that reuse the same run slot. */
   resultGridRevision?: string;
   result?: QueryResult;
@@ -810,6 +774,8 @@ export interface QueryResultRun {
   resultEvicted?: boolean;
   queryAnalysis?: QueryTab["queryAnalysis"];
   querySourceColumns?: QueryTab["querySourceColumns"];
+  resultColumnComments?: QueryTab["resultColumnComments"];
+  queryDisplaySourceColumns?: QueryTab["queryDisplaySourceColumns"];
   queryEditabilityReason?: QueryTab["queryEditabilityReason"];
   mongoEditTarget?: QueryTab["mongoEditTarget"];
   tableMeta?: QueryTab["tableMeta"];
@@ -896,10 +862,12 @@ export type TreeNodeType =
   | "group-indexes"
   | "group-fkeys"
   | "group-triggers"
+  | "group-events"
   | "group-constraints"
   | "group-table-partitions"
   | "group-table-subpartitions"
   | "group-tables"
+  | "group-dolt-system-tables"
   | "group-views"
   | "group-materialized-views"
   | "group-procedures"
@@ -929,12 +897,14 @@ export type TreeNodeType =
   | "index"
   | "fkey"
   | "trigger"
+  | "event"
   | "constraint"
   | "partition"
   | "subpartition"
   | "redis-db"
   | "mq-tenant"
   | "nacos-namespace"
+  | "nacos-access-control"
   | "etcd-root"
   | "etcd-dashboard"
   | "etcd-access-control"
@@ -946,9 +916,11 @@ export type TreeNodeType =
   | "mongo-buckets"
   | "mongo-bucket"
   | "mongo-collection"
+  | "dynamodb-table"
   | "vector-database"
   | "vector-collection"
   | "elasticsearch-index"
+  | "meilisearch-system"
   | "mqtt-topic";
 
 export interface ConnectionGroup {
@@ -1033,7 +1005,7 @@ export interface TableNameFilter {
   excludePatterns: string[];
 }
 
-export type TableInfoTab = "columns" | "indexes" | "foreignKeys" | "triggers" | "ddl";
+export type TableInfoTab = "columns" | "indexes" | "foreignKeys" | "constraints" | "triggers" | "ddl";
 
 export interface TableStructureEditorTarget {
   kind: "column" | "index";
@@ -1046,9 +1018,15 @@ export interface TableStructureEditorDraft {
   newTableName: string;
   tableComment: string;
   originalTableComment: string;
+  mysqlAutoIncrementValue?: string;
+  originalMysqlAutoIncrementValue?: string;
+  tableOwner?: string;
+  originalTableOwner?: string;
   columns: import("@/lib/table/tableStructureEditorSql").EditableStructureColumn[];
   indexes: import("@/lib/table/tableStructureEditorSql").EditableStructureIndex[];
   foreignKeys: import("@/lib/table/tableStructureEditorSql").EditableStructureForeignKey[];
+  constraints?: ConstraintInfo[];
+  constraintsLoaded?: boolean;
   triggers: import("@/lib/table/tableStructureEditorSql").EditableStructureTrigger[];
   triggersLoaded?: boolean;
   loadedMetadataFacets?: import("@/lib/metadata/objectMetadataCache").ObjectMetadataFacet[];
@@ -1082,6 +1060,8 @@ export interface QueryTab {
   forceWordWrap?: boolean;
   connectionId: string;
   database: string;
+  /** Optional branch context for a driver-profile database workspace. */
+  workspaceBranch?: string;
   schema?: string;
   /** Doris / StarRocks multi-catalog: the external catalog this tab's
    * database belongs to (undefined for internal/default catalog). */
@@ -1162,6 +1142,8 @@ export interface QueryTab {
     | "redis"
     | "redis-dashboard"
     | "mongo"
+    | "meilisearch"
+    | "meilisearch-system"
     | "mongo-gridfs"
     | "mongo-bucket"
     | "vector"
@@ -1176,6 +1158,7 @@ export interface QueryTab {
     | "mqtt"
     | "nacos"
     | "nacos-dashboard"
+    | "nacos-access-control"
     | "databases"
     | "objects"
     | "structure"
@@ -1186,7 +1169,8 @@ export interface QueryTab {
     | "processlist"
     | "sqlserver-trace"
     | "mysql-dashboard"
-    | "postgres-dashboard";
+    | "postgres-dashboard"
+    | "dolt-version-control";
   /** Ephemeral navigation intent; it is consumed by HBaseBrowser and is not persisted. */
   hbaseCreateTableOnOpen?: boolean;
   mqTenant?: string;
@@ -1207,6 +1191,10 @@ export interface QueryTab {
     catalog?: string;
     schema?: string;
     objectType?: "tables";
+    eventName?: string;
+    eventReadOnly?: boolean;
+    eventOpenRequestId?: number;
+    initialObjectFilter?: "tables" | "events";
     viewport?: ObjectBrowserViewport;
   };
   objectSource?: {
@@ -1225,6 +1213,9 @@ export interface QueryTab {
     primaryKeys: string[];
   };
   tableMetaUpdatedAt?: number;
+  /** 该 tab 的 tableMeta 是哪个连接元数据代次下写入的：disconnect / 关闭数据库 /
+   * 死池重连等生命周期边界会让该代次递增，代次失配视同冷缓存（issue #6623 / PR #6640）。 */
+  tableMetaGeneration?: number;
   pendingDataChangeCount?: number;
   /** Ephemeral editor draft that has not yet been applied to the data grid. */
   hasPendingDataEditorDraft?: boolean;
@@ -1267,8 +1258,36 @@ export interface QueryTab {
       resultName: string;
       expression: string;
     }[];
+    groupByColumns?: {
+      sourceName?: string;
+      sourceNameQuoted?: boolean;
+      sourceQualifier?: string;
+      sourceKey?: string;
+      star?: boolean;
+      resultName: string;
+      expression: string;
+    }[];
   };
   querySourceColumns?: Array<string | undefined>;
+  /**
+   * Column comments for a multi-source query result (e.g. JOIN), indexed by
+   * result-column ordinal (projection order). Each entry is the comment of the
+   * single base column that result column resolves to; `undefined` when the
+   * column is ambiguous (e.g. an unqualified name present in several sources)
+   * or cannot be resolved back to a base column, so the grid shows no comment
+   * instead of a wrong one. Populated even when the result is not editable
+   * (e.g. multi-table JOIN), so joined results still show column comments.
+   */
+  resultColumnComments?: Array<string | undefined>;
+  /**
+   * Display-only result-column to source mapping for multi-source results,
+   * indexed by result-column ordinal. Each entry carries the source identity
+   * (sourceKey + canonical source column name), so comments resolve per source
+   * instead of first-source-wins on name clashes. Unlike querySourceColumns it
+   * is also populated for multi-source results that are not editable, and must
+   * never be used for row identity or editing.
+   */
+  queryDisplaySourceColumns?: Array<QueryResultSourceColumnRef | undefined>;
   queryEditabilityReason?: "not-select" | "cte" | "set-operation" | "aggregation" | "external-source" | "complex-source" | "computed-columns" | "no-table" | "no-primary-key" | "primary-key-not-returned" | "aliased-columns" | "metadata-unavailable";
   mongoEditTarget?: {
     collection: string;
@@ -1320,6 +1339,50 @@ export interface SavedSqlFile {
 export interface SavedSqlLibrary {
   folders: SavedSqlFolder[];
   files: SavedSqlFile[];
+}
+
+/** Serializable configuration of a saved data-transfer task. */
+export interface TransferTaskConfig {
+  sourceConnectionId: string;
+  /** Undefined means the connection's built-in/default catalog. */
+  sourceCatalog?: string;
+  sourceDatabase: string;
+  sourceSchema?: string;
+  targetConnectionId: string;
+  targetCatalog?: string;
+  targetDatabase: string;
+  targetSchema?: string;
+  /** Selected object names grouped by object kind (TABLE, VIEW, ...). */
+  objects: Partial<Record<TransferObjectKind, string[]>>;
+  content: TransferContent;
+  mode: TransferMode;
+  targetTableNameCase: TransferTableNameCase;
+  batchSize: number;
+}
+
+export interface TransferTask {
+  id: string;
+  folderId?: string;
+  name: string;
+  orderIndex?: number;
+  config: TransferTaskConfig;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TransferTaskFolder {
+  id: string;
+  parentFolderId?: string;
+  name: string;
+  orderIndex?: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TransferTaskLibrary {
+  version: 1;
+  folders: TransferTaskFolder[];
+  tasks: TransferTask[];
 }
 
 export interface VectorCollectionMeta {

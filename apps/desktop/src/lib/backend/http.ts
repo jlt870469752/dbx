@@ -17,6 +17,7 @@ import type {
   CustomTypeDetails,
   ObjectSource,
   ObjectSourceKind,
+  MysqlEventInfo,
   ColumnInfo,
   SqlServerColumnMetadata,
   IndexInfo,
@@ -47,8 +48,10 @@ import type {
 } from "@/types/database";
 import { normalizeRustMongoCommand, type MongoCommand } from "@/lib/mongo/mongoShellCommand";
 import { BackendErrorException, type BackendError } from "@/lib/backend/errorUtils";
+import { decodeMeilisearchDocumentPage, decodeMeilisearchSearchResult, type MeilisearchDocumentPage, type MeilisearchDocumentPageWire, type MeilisearchSearchResult, type MeilisearchSearchWireResult } from "@/lib/backend/meilisearchTransport";
+import type { CreatedKey, EnqueuedTaskSummary, KeyCreateInput, KeyListItem, KeyPage, KeyUpdateInput, MeilisearchSystemOverview, MeilisearchTask, TaskListInput, TaskPage, TaskSelector } from "@/types/meilisearchManagement";
 import type { CollectionInfo } from "@/types/database";
-import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, TableDiff, FunctionDiff, SequenceDiff, RuleDiff, OwnerDiff } from "@/lib/schema/schemaDiff";
+import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, SchemaSyncSqlPlan, SelectedSchemaDiffInput, GenerateSchemaSyncPlanOptions, TableDiff, FunctionDiff, SequenceDiff, RuleDiff, OwnerDiff } from "@/lib/schema/schemaDiff";
 import type { SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
 import type { AiConfig, AiTestConnectionResult } from "@/stores/settingsStore";
 import type { AiChatSelectionState, AiEffortCapability } from "@/types/ai";
@@ -62,6 +65,8 @@ import type {
   DriverRuntimeSummary,
   UpgradeAllAgentDriversResult,
   AgentUpdateBlocker,
+  AgentOfflineExportPreview,
+  AgentOfflineExportResult,
   DesktopSettings,
   McpGlobalPolicy,
   SavedSqlSyncRequest,
@@ -98,6 +103,7 @@ import type {
   EtcdWatchPollResponse,
   EtcdLeaseListResponse,
   DocumentQueryResult,
+  DynamoDbTableDescription,
   MongoDocumentResult,
   MongoCollectionStatsResult,
   MongoCloneCollectionResult,
@@ -138,6 +144,7 @@ import type {
   AppSupportInfo,
   PromptTemplate,
   SshPromptResolution,
+  MeilisearchIndexOverview,
 } from "@/lib/backend/tauri";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
 import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
@@ -146,6 +153,7 @@ import type {
   DataGridColumnValueFilterConditionOptions,
   DataGridColumnValuesFilterConditionOptions,
   DataGridContextFilterConditionOptions,
+  DataGridConditionalUpdateSqlOptions,
   DataGridCountSqlOptions,
   DataGridCopyInsertStatementOptions,
   DataGridCopyUpdateStatementOptions,
@@ -153,14 +161,25 @@ import type {
   HiveTablePropertiesSqlOptions,
 } from "@/lib/dataGrid/dataGridSql";
 import type { DataGridExtractRequest, DataGridExtractResult } from "@/lib/dataGrid/dataGridCopyExtractor";
-import type { BuildTableStructureChangeSqlOptions, BuildSingleColumnAlterSqlOptions, SqliteTableStructureChangePreview, TableStructureChangeSql } from "@/lib/table/tableStructureEditorSql";
+import type { BuildTableOwnerChangeSqlOptions, BuildTableStructureChangeSqlOptions, BuildSingleColumnAlterSqlOptions, SqliteTableStructureChangePreview, TableStructureChangeSql } from "@/lib/table/tableStructureEditorSql";
 import type { BuildTableSelectSqlOptions } from "@/lib/table/tableSelectSql";
 import type { DatabaseSearchSql, DatabaseSearchSqlOptions, SearchResultWhereOptions } from "@/lib/database/databaseSearch";
 import type { BuildEditableObjectSourceSqlInput, BuildRoutineRenameObjectSourceInput } from "@/lib/table/objectSourceEditor";
 import type { BuildViewDdlInput } from "@/lib/table/viewDdl";
 import type { BuildRenameObjectSqlOptions } from "@/lib/table/objectRenameSql";
 import type { CreateDatabaseSqlOptions } from "@/lib/database/createDatabaseSql";
-import type { DatabaseNameSqlOptions, DatabasePropertyEditSqlOptions, DropTableChildObjectSqlOptions, DropObjectSqlOptions, DuplicateTableStructureSqlOptions, CopyTableDataSqlOptions, MysqlAutoIncrementSqlOptions, SchemaNameSqlOptions, TableAdminSqlOptions } from "@/lib/database/dbAdminSql";
+import type {
+  DatabaseNameSqlOptions,
+  DatabasePropertyEditSqlOptions,
+  DropTableChildObjectSqlOptions,
+  DropObjectSqlOptions,
+  DuplicateTableStructureSqlOptions,
+  CopyTableDataSqlOptions,
+  MysqlAutoIncrementSqlOptions,
+  SchemaNameSqlOptions,
+  TableAdminSqlOptions,
+  VacuumTableSqlOptions,
+} from "@/lib/database/dbAdminSql";
 import type { BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions } from "@/lib/export/databaseExport";
 import { loadBrowserAppState, saveBrowserAppState } from "@/lib/backend/browserAppStateStorage";
 import type { DataCompareFromTablesOptions, DataCompareFromTablesPreparation, DataCompareSyncPlan, DataCompareSyncPlanOptions, DataComparePreparation, DataComparePreparationOptions } from "@/lib/dataGrid/dataCompare";
@@ -185,6 +204,17 @@ import type {
   NacosConfigUpsert,
   NacosConnectionInfo,
   NacosRNacosConsoleCaptcha,
+  NacosUserQuery,
+  NacosUserList,
+  NacosUserCreate,
+  NacosUserUpdate,
+  NacosRoleQuery,
+  NacosRoleList,
+  NacosRoleBinding,
+  NacosAccessControlSnapshot,
+  NacosAccessOperationRequest,
+  NacosAccessOperationResult,
+  NacosAccessOperationRetry,
   NacosInstanceInfo,
   NacosInstanceRef,
   NacosInstanceRegistration,
@@ -194,6 +224,7 @@ import type {
   NacosDashboardSnapshot,
   NacosNamespaceCreate,
   NacosNamespaceInfo,
+  NacosNamespaceSidebarSnapshot,
   NacosNamespaceUpdate,
   NacosRawRequest,
   NacosRawResponse,
@@ -219,6 +250,7 @@ const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   quit_on_close: false,
   close_action_prompted: false,
   debug_logging_enabled: false,
+  metadata_cache_max_memory_mb: 64,
   duckdb_worker_process_isolation: false,
   duckdb_worker_max_processes: 4,
   saved_sql_sync_dir: null,
@@ -371,6 +403,18 @@ export async function connectionFinalProxyPort(config: ConnectionConfig): Promis
 
 export async function disconnectDb(connectionId: string, clientAttempt?: number): Promise<void> {
   return post("/api/connection/disconnect", { connectionId, clientAttempt });
+}
+
+export async function sessionCredentialStatus(connectionId: string): Promise<boolean> {
+  return post("/api/connection/session-credential-status", { connectionId });
+}
+
+export async function forgetSessionCredential(connectionId: string): Promise<void> {
+  return post("/api/connection/forget-session-credential", { connectionId });
+}
+
+export async function replaceNacosSessionCredential(connectionId: string, username: string, password: string): Promise<void> {
+  return post("/api/connection/replace-nacos-session-credential", { connectionId, username, password });
 }
 
 export async function checkConnectionHealth(connectionId: string): Promise<void> {
@@ -561,6 +605,14 @@ export async function upgradeAllAgents(_source?: UpdateDownloadSource, operation
   return post("/api/agents/upgrade-all", { operationId });
 }
 
+export async function cancelAgentInstall(dbType: string, operationId?: string): Promise<void> {
+  await post("/api/agents/cancel-install", { dbType, operationId });
+}
+
+export async function cancelAgentUpgradeAll(operationId?: string): Promise<void> {
+  await post("/api/agents/cancel-upgrade-all", { operationId });
+}
+
 export async function checkAgentUpdateBlockers(dbTypes: string[]): Promise<AgentUpdateBlocker[]> {
   return post("/api/agents/update-blockers", { dbTypes });
 }
@@ -595,6 +647,14 @@ export async function importAgentsFromZip(fileOrPath: string | File, operationId
   if (!res.ok) throw await backendResponseError(res);
   const result: { count: number } = await res.json();
   return result.count;
+}
+
+export async function previewAgentOfflineExport(): Promise<AgentOfflineExportPreview> {
+  throw new Error("Offline Agent package export is only available in the desktop app.");
+}
+
+export async function exportAgentsOffline(_path: string, _driverKeys: string[]): Promise<AgentOfflineExportResult> {
+  throw new Error("Offline Agent package export is only available in the desktop app.");
 }
 
 export async function importAgentDriver(dbType: string, pathOrFile: string | File): Promise<void> {
@@ -641,6 +701,10 @@ export async function listenAgentInstallProgress(handler: (progress: DriverInsta
 
 export async function loadSavedSqlLibrary(): Promise<SavedSqlLibrary> {
   return get("/api/saved-sql");
+}
+
+export async function loadSavedSqlFilesForSync(): Promise<SavedSqlFile[]> {
+  throw new Error("SQL directory sync is only available in the desktop app.");
 }
 
 export async function loadSavedSqlFile(id: string): Promise<SavedSqlFile | null> {
@@ -767,7 +831,11 @@ export async function getTableComment(_connectionId: string, _database: string, 
   throw new Error("Table comment lookup is not available in the web backend");
 }
 
-export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: (SidebarObjectKind | "EVENT")[], filter?: string, limit?: number, offset?: number, catalog?: string): Promise<ObjectInfo[]> {
+export async function getMysqlTableAutoIncrement(_connectionId: string, _database: string, _table: string): Promise<string | null> {
+  throw new Error("MySQL AUTO_INCREMENT metadata is not available in the web backend");
+}
+
+export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: (SidebarObjectKind | "EVENT")[], filter?: string, limit?: number, offset?: number, catalog?: string, tableNameFilter?: TableNameFilter): Promise<ObjectInfo[]> {
   return get(
     `/api/schema/objects?${qs({
       connection_id: connectionId,
@@ -778,6 +846,7 @@ export async function listObjects(connectionId: string, database: string, schema
       limit,
       offset,
       catalog,
+      table_name_filter: tableNameFilter ? JSON.stringify(tableNameFilter) : undefined,
     })}`,
   );
 }
@@ -796,6 +865,10 @@ export async function completionAssistantSearch(request: CompletionAssistantRequ
 
 export async function getObjectSource(connectionId: string, database: string, schema: string, name: string, objectType: ObjectSourceKind, signature?: string, relationName?: string): Promise<ObjectSource> {
   return get(`/api/schema/object-source?${qs({ connection_id: connectionId, database, schema, table: name, object_type: objectType, signature, relation_name: relationName })}`);
+}
+
+export async function getEventInfo(connectionId: string, database: string, schema: string, name: string): Promise<MysqlEventInfo> {
+  return get(`/api/schema/event-info?${qs({ connection_id: connectionId, database, schema, table: name })}`);
 }
 
 export async function getCustomTypeDetails(connectionId: string, database: string, schema: string, name: string): Promise<CustomTypeDetails> {
@@ -828,6 +901,10 @@ export async function listIndexes(connectionId: string, database: string, schema
   return get(`/api/schema/indexes?${qs({ connection_id: connectionId, database, schema, table, catalog })}`);
 }
 
+export async function listReferenceKeyColumns(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<string[]> {
+  return get(`/api/schema/reference-key-columns?${qs({ connection_id: connectionId, database, schema, table, catalog })}`);
+}
+
 export async function listForeignKeys(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<ForeignKeyInfo[]> {
   return get(`/api/schema/foreign-keys?${qs({ connection_id: connectionId, database, schema, table, catalog })}`);
 }
@@ -844,12 +921,25 @@ export async function listPartitions(connectionId: string, database: string, sch
   return get(`/api/schema/partitions?${qs({ connection_id: connectionId, database, schema, table, catalog })}`);
 }
 
+export interface TablePartitionStatus {
+  isPartitionedParent: boolean;
+  isPartition: boolean;
+}
+
+export async function getTablePartitionStatus(connectionId: string, database: string, schema: string, table: string): Promise<TablePartitionStatus> {
+  return get(`/api/schema/table-partition-status?${qs({ connection_id: connectionId, database, schema, table })}`);
+}
+
+export async function listInvalidIndexes(connectionId: string, database: string, schema: string, table: string): Promise<string[]> {
+  return get(`/api/schema/invalid-indexes?${qs({ connection_id: connectionId, database, schema, table })}`);
+}
+
 export async function listSubpartitions(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<SubpartitionInfo[]> {
   return get(`/api/schema/subpartitions?${qs({ connection_id: connectionId, database, schema, table, catalog })}`);
 }
 
-export async function getTableDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind, catalog?: string): Promise<string> {
-  return get(`/api/schema/ddl?${qs({ connection_id: connectionId, database, schema, table, object_type: objectType, catalog })}`);
+export async function getTableDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind, catalog?: string, portable = false): Promise<string> {
+  return get(`/api/schema/ddl?${qs({ connection_id: connectionId, database, schema, table, object_type: objectType, catalog, portable })}`);
 }
 
 export async function getTableDisplayDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind, catalog?: string): Promise<string> {
@@ -873,6 +963,13 @@ export async function generateSchemaSyncSql(diffs: TableDiff[], databaseType: Da
   });
 }
 
+export async function generateSchemaSyncPlan(input: SelectedSchemaDiffInput, options: GenerateSchemaSyncPlanOptions): Promise<SchemaSyncSqlPlan> {
+  return post("/api/schema-diff/generate-sync-plan", {
+    ...input,
+    ...options,
+  });
+}
+
 export async function listFunctions(connectionId: string, database: string, schema: string): Promise<FunctionInfo[]> {
   return get(`/api/schema/functions?${qs({ connection_id: connectionId, database, schema })}`);
 }
@@ -887,6 +984,10 @@ export async function listRules(connectionId: string, database: string, schema: 
 
 export async function listOwners(connectionId: string, database: string, schema: string): Promise<OwnerInfo[]> {
   return get(`/api/schema/owners?${qs({ connection_id: connectionId, database, schema })}`);
+}
+
+export async function getTableOwner(connectionId: string, database: string, schema: string, table: string): Promise<string | null> {
+  return get(`/api/schema/table-owner?${qs({ connection_id: connectionId, database, schema, table })}`);
 }
 
 export async function listExtensions(connectionId: string, database: string, schema?: string): Promise<ExtensionInfo[]> {
@@ -959,6 +1060,34 @@ export async function executeQuery(
   },
 ): Promise<QueryResult> {
   return post("/api/query/execute", {
+    connectionId,
+    database,
+    sql,
+    schema,
+    executionId,
+    ...options,
+  });
+}
+
+export async function executeConditionalUpdate(
+  connectionId: string,
+  database: string,
+  sql: string,
+  schema?: string,
+  executionId?: string,
+  options?: {
+    maxRows?: number;
+    catalog?: string;
+    fetchSize?: number;
+    pageSize?: number;
+    rowOffset?: number;
+    resultSessionId?: string;
+    clientSessionId?: string;
+    timeoutSecs?: number;
+    executionMode?: "simple" | "postgres_read_only_transaction";
+  },
+): Promise<QueryResult> {
+  return post("/api/query/execute-conditional-update", {
     connectionId,
     database,
     sql,
@@ -1080,12 +1209,13 @@ export async function closeClientConnectionSession(connectionId: string, databas
   });
 }
 
-export async function executeBatch(connectionId: string, database: string, statements: string[], schema?: string): Promise<QueryResult> {
+export async function executeBatch(connectionId: string, database: string, statements: string[], schema?: string, timeoutSecs?: number): Promise<QueryResult> {
   return post("/api/query/execute-batch", {
     connectionId,
     database,
     statements,
     schema,
+    timeoutSecs,
   });
 }
 
@@ -1122,7 +1252,7 @@ export async function beginManualTransaction(_connectionId: string, _database: s
   throw new Error("Manual transaction management is only available in the desktop app.");
 }
 
-export async function executeInManualTransaction(_txnSessionId: string, _sql: string, _database: string, _schema?: string, _maxRows?: number): Promise<QueryResult[]> {
+export async function executeInManualTransaction(_txnSessionId: string, _sql: string, _database: string, _schema?: string, _maxRows?: number, _tableDataPreview?: boolean, _pageSize?: number, _resultSessionId?: string): Promise<QueryResult[]> {
   throw new Error("Manual transaction management is only available in the desktop app.");
 }
 
@@ -1137,6 +1267,15 @@ export async function rollbackManualTransaction(_txnSessionId: string): Promise<
 export async function cancelQuery(executionId: string): Promise<boolean> {
   const result = await post<boolean | { cancelled?: boolean }>("/api/query/cancel", { executionId });
   return typeof result === "boolean" ? result : result.cancelled === true;
+}
+
+export interface ConditionalUpdateCancellationResult {
+  requested: boolean;
+  terminal: boolean;
+}
+
+export async function cancelConditionalUpdate(executionId: string): Promise<ConditionalUpdateCancellationResult> {
+  return post("/api/query/cancel-conditional-update", { executionId });
 }
 
 export async function analyzeSqlReferences(sql: string, dialect?: string): Promise<SqlReferenceAnalysis> {
@@ -1188,7 +1327,7 @@ export async function buildDroppedFilePreviewSql(options: DroppedFilePreviewSqlO
 }
 
 export async function buildTableSelectSql(options: BuildTableSelectSqlOptions): Promise<string> {
-  return post("/api/query/build-table-select-sql", { options });
+  return post("/api/query/build-table-select-sql", { options, includeDatabaseName: options.includeDatabaseName === true });
 }
 
 export async function buildDatabaseSearchSql(options: DatabaseSearchSqlOptions): Promise<DatabaseSearchSql | null> {
@@ -1201,6 +1340,14 @@ export async function buildSearchResultWhere(options: SearchResultWhereOptions):
 
 export async function buildRenameObjectSql(options: BuildRenameObjectSqlOptions): Promise<string> {
   return post("/api/query/build-rename-object-sql", { options });
+}
+
+export async function buildRenameDatabaseSql(options: { databaseType?: DatabaseType; oldName: string; newName: string; terminateConnections: boolean }): Promise<string> {
+  return post("/api/query/build-rename-database-sql", options);
+}
+
+export async function buildRenameDatabasePreflightSql(options: { databaseType?: DatabaseType; databaseName: string }): Promise<string> {
+  return post("/api/query/build-rename-database-preflight-sql", options);
 }
 
 export async function buildCreateDatabaseSql(options: CreateDatabaseSqlOptions): Promise<string> {
@@ -1237,6 +1384,10 @@ export async function buildEmptyTableSql(options: TableAdminSqlOptions): Promise
 
 export async function buildTruncateTableSql(options: TableAdminSqlOptions): Promise<string> {
   return post("/api/query/build-truncate-table-sql", { options });
+}
+
+export async function buildVacuumTableSql(options: VacuumTableSqlOptions): Promise<string> {
+  return post("/api/query/build-vacuum-table-sql", { options });
 }
 
 export async function buildMysqlAutoIncrementSql(options: MysqlAutoIncrementSqlOptions): Promise<string> {
@@ -1293,6 +1444,10 @@ export async function buildViewDdlSql(input: BuildViewDdlInput): Promise<string>
 
 export async function buildTableStructureChangeSql(options: BuildTableStructureChangeSqlOptions): Promise<TableStructureChangeSql> {
   return post("/api/query/build-table-structure-change-sql", { options });
+}
+
+export async function buildTableOwnerChangeSql(options: BuildTableOwnerChangeSqlOptions): Promise<TableStructureChangeSql> {
+  return post("/api/query/build-table-owner-change-sql", { options });
 }
 
 export async function previewSqliteTableStructureChange(connectionId: string, database: string, options: BuildTableStructureChangeSqlOptions): Promise<SqliteTableStructureChangePreview> {
@@ -1364,6 +1519,11 @@ export async function buildDataGridColumnDistinctValuesSql(options: DataGridColu
 
 export async function buildDataGridCountSql(options: DataGridCountSqlOptions): Promise<string> {
   return post("/api/query/build-data-grid-count-sql", { options });
+}
+
+export async function buildDataGridConditionalUpdateSql(options: DataGridConditionalUpdateSqlOptions): Promise<string | undefined> {
+  const result = await post<string | null>("/api/query/build-data-grid-conditional-update-sql", { options });
+  return result ?? undefined;
 }
 
 export async function buildHiveTablePropertiesSql(options: HiveTablePropertiesSqlOptions): Promise<string> {
@@ -1678,6 +1838,14 @@ export async function saveSavedSqlEditorPositions(positions: unknown[]): Promise
   await saveBrowserAppState("saved_sql_editor_positions", positions);
 }
 
+export async function loadTransferTaskLibrary(): Promise<unknown | null> {
+  return loadBrowserAppState("transfer_task_library");
+}
+
+export async function saveTransferTaskLibrary(library: unknown): Promise<void> {
+  await saveBrowserAppState("transfer_task_library", library);
+}
+
 export async function completeAppClose(_action: "quit" | "hide"): Promise<void> {
   return undefined;
 }
@@ -1975,6 +2143,10 @@ export async function pendingOpenConnectionLinks(): Promise<string[]> {
   return [];
 }
 
+export async function pendingOpenAiConfigLinks(): Promise<string[]> {
+  return [];
+}
+
 export async function readExternalSqlFile(_path: string): Promise<string> {
   throw new Error("Opening external SQL file paths is only available in the desktop app");
 }
@@ -2189,6 +2361,10 @@ function downloadDatabaseExportFile(exportId: string): void {
 
 export async function cancelDatabaseExport(exportId: string): Promise<void> {
   await post("/api/export/database/cancel", { exportId });
+}
+
+export async function recordDatabaseExportDestination(_directory: string): Promise<void> {
+  throw new Error("Scheduled database backups are only available in the desktop app.");
 }
 
 // --- Table Export ---
@@ -2482,6 +2658,10 @@ export async function redisSetString(connectionId: string, db: number, keyRaw: s
 
 export async function redisDeleteKey(connectionId: string, db: number, keyRaw: string): Promise<void> {
   return post("/api/redis/delete-key", { connectionId, db, keyRaw });
+}
+
+export async function redisRenameKey(connectionId: string, db: number, keyRaw: string, newKeyRaw: string): Promise<void> {
+  return post("/api/redis/rename-key", { connectionId, db, keyRaw, newKeyRaw });
 }
 
 export async function redisHashSet(connectionId: string, db: number, keyRaw: string, field: string, value: string, ttl?: number): Promise<void> {
@@ -3134,12 +3314,16 @@ export async function consulMeshExportedServicesApply(connectionId: string, name
 // Nacos
 // ---------------------------------------------------------------------------
 
-export async function nacosTestConnection(connectionId: string): Promise<NacosConnectionInfo> {
-  return post("/api/nacos/test-connection", { connectionId });
+export async function nacosTestConnection(connectionId: string, forceRefresh = false): Promise<NacosConnectionInfo> {
+  return post("/api/nacos/test-connection", { connectionId, forceRefresh });
 }
 
 export async function nacosListNamespaces(connectionId: string): Promise<NacosNamespaceInfo[]> {
   return post("/api/nacos/namespaces/list", { connectionId });
+}
+
+export async function nacosSidebarSnapshot(connectionId: string): Promise<NacosNamespaceSidebarSnapshot> {
+  return post("/api/nacos/sidebar/snapshot", { connectionId });
 }
 
 export async function nacosCreateNamespace(connectionId: string, req: NacosNamespaceCreate): Promise<void> {
@@ -3148,6 +3332,10 @@ export async function nacosCreateNamespace(connectionId: string, req: NacosNames
 
 export async function nacosUpdateNamespace(connectionId: string, req: NacosNamespaceUpdate): Promise<void> {
   return post("/api/nacos/namespaces/update", { connectionId, req });
+}
+
+export async function nacosDeleteNamespace(connectionId: string, namespaceId: string): Promise<void> {
+  return post("/api/nacos/namespaces/delete", { connectionId, namespaceId });
 }
 
 export async function nacosListConfigs(connectionId: string, query: NacosConfigQuery): Promise<NacosConfigList> {
@@ -3281,6 +3469,54 @@ export async function nacosGetRNacosConsoleCaptcha(connectionId: string): Promis
 
 export async function nacosLoginRNacosConsole(connectionId: string, captcha?: string): Promise<void> {
   return post("/api/nacos/rnacos-console/login", { connectionId, captcha });
+}
+
+export async function nacosListUsers(connectionId: string, query: NacosUserQuery): Promise<NacosUserList> {
+  return post("/api/nacos/users/list", { connectionId, query });
+}
+
+export async function nacosCreateUser(connectionId: string, req: NacosUserCreate): Promise<void> {
+  return post("/api/nacos/users/create", { connectionId, req });
+}
+
+export async function nacosUpdateUser(connectionId: string, req: NacosUserUpdate): Promise<void> {
+  return post("/api/nacos/users/update", { connectionId, req });
+}
+
+export async function nacosDeleteUser(connectionId: string, username: string): Promise<void> {
+  return post("/api/nacos/users/delete", { connectionId, username });
+}
+
+export async function nacosListRoleBindings(connectionId: string, query: NacosRoleQuery): Promise<NacosRoleList> {
+  return post("/api/nacos/roles/list", { connectionId, query });
+}
+
+export async function nacosAssignRole(connectionId: string, binding: NacosRoleBinding): Promise<void> {
+  return post("/api/nacos/roles/assign", { connectionId, binding });
+}
+
+export async function nacosRemoveRole(connectionId: string, binding: NacosRoleBinding): Promise<void> {
+  return post("/api/nacos/roles/remove", { connectionId, binding });
+}
+
+export async function nacosAccessSnapshot(connectionId: string): Promise<NacosAccessControlSnapshot> {
+  return post("/api/nacos/access/snapshot", { connectionId });
+}
+
+export async function nacosStartAccessOperation(connectionId: string, req: NacosAccessOperationRequest): Promise<NacosAccessOperationResult> {
+  return post("/api/nacos/access/operations/start", { connectionId, req });
+}
+
+export async function nacosGetAccessOperation(connectionId: string, operationId: string): Promise<NacosAccessOperationResult> {
+  return post("/api/nacos/access/operations/get", { connectionId, operationId });
+}
+
+export async function nacosRetryAccessOperation(connectionId: string, retry: NacosAccessOperationRetry): Promise<NacosAccessOperationResult> {
+  return post("/api/nacos/access/operations/retry", { connectionId, retry });
+}
+
+export async function nacosUndoAccessOperation(connectionId: string, operationId: string): Promise<NacosAccessOperationResult> {
+  return post("/api/nacos/access/operations/undo", { connectionId, operationId });
 }
 
 export async function nacosListServices(connectionId: string, query: NacosServiceQuery): Promise<NacosServiceList> {
@@ -3444,16 +3680,34 @@ export async function elasticsearchListIndices(connectionId: string): Promise<st
   return collections.map((c) => c.name);
 }
 
+/** Lists every Meilisearch index visible to the current connection credentials. */
+export async function meilisearchListIndexes(connectionId: string): Promise<string[]> {
+  const collections = await documentListCollections(connectionId, "default");
+  return collections.map((collection) => collection.name);
+}
+
 export async function vectorListCollections(connectionId: string, database?: string): Promise<CollectionInfo[]> {
   return documentListCollections(connectionId, database || "default");
 }
 
 export async function vectorGetCollectionDetail(connectionId: string, database: string, collection: string): Promise<CollectionInfo> {
-  return post("/api/mongo/vector-collection-detail", {
+  return post("/api/vector/collection-detail", {
     connectionId,
     database,
     collection,
   });
+}
+
+export async function vectorDropDatabase(connectionId: string, database: string): Promise<void> {
+  await post("/api/vector/drop-database", { connectionId, database });
+}
+
+export async function vectorDropCollection(connectionId: string, database: string, collection: string): Promise<void> {
+  await post("/api/vector/drop-collection", { connectionId, database, collection });
+}
+
+export async function vectorRenameCollection(connectionId: string, database: string, collection: string, newName: string): Promise<void> {
+  await post("/api/vector/rename-collection", { connectionId, database, collection, newName });
 }
 
 export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, collation?: string, executionId?: string): Promise<MongoDocumentResult> {
@@ -3477,7 +3731,7 @@ export async function mongoFindOne(connectionId: string, database: string, colle
   });
 }
 
-export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, collation?: string, executionId?: string): Promise<DocumentQueryResult> {
+export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, collation?: string, executionId?: string, cursor?: string): Promise<DocumentQueryResult> {
   return post("/api/document-store/find-documents", {
     connectionId,
     database,
@@ -3488,8 +3742,22 @@ export async function documentFindDocuments(connectionId: string, database: stri
     projection,
     sort,
     collation,
+    cursor,
     executionId,
   });
+}
+
+export async function documentCountDocuments(connectionId: string, collection: string, filter?: string, executionId?: string): Promise<number> {
+  return post("/api/document-store/count-documents", {
+    connectionId,
+    collection,
+    filter,
+    executionId,
+  });
+}
+
+export async function dynamodbDescribeTable(connectionId: string, table: string): Promise<DynamoDbTableDescription> {
+  return post("/api/document-store/dynamodb-describe-table", { connectionId, table });
 }
 
 export async function elasticsearchCountDocuments(connectionId: string, index: string, filter?: string, executionId?: string): Promise<number> {
@@ -3748,6 +4016,130 @@ export async function documentSaveMeilisearchBatch(connectionId: string, collect
   });
 }
 
+export async function meilisearchSearchDocuments(
+  connectionId: string,
+  index: string,
+  params: { q?: string | null; filter?: string | null; sort?: string | null; limit: number; offset: number; hybridEmbedder?: string | null; hybridSemanticRatio?: number | null; showRankingScore?: boolean; rankingScoreThreshold?: number | null },
+): Promise<MeilisearchSearchResult> {
+  const result = await post<MeilisearchSearchWireResult>("/api/document-store/meilisearch/search", {
+    connectionId,
+    index,
+    q: params.q ?? null,
+    filter: params.filter ?? null,
+    sort: params.sort ?? null,
+    limit: params.limit,
+    offset: params.offset,
+    hybridEmbedder: params.hybridEmbedder ?? null,
+    hybridSemanticRatio: params.hybridSemanticRatio ?? null,
+    showRankingScore: params.showRankingScore ?? false,
+    rankingScoreThreshold: params.rankingScoreThreshold ?? null,
+  });
+  return decodeMeilisearchSearchResult(result);
+}
+
+export async function meilisearchFetchDocuments(connectionId: string, index: string, params: { filter?: string | null; sort?: string | null; limit: number; offset: number }): Promise<MeilisearchDocumentPage> {
+  const page = await post<MeilisearchDocumentPageWire>("/api/document-store/meilisearch/documents/fetch", {
+    connectionId,
+    index,
+    filter: params.filter ?? null,
+    sort: params.sort ?? null,
+    limit: params.limit,
+    offset: params.offset,
+  });
+  return decodeMeilisearchDocumentPage(page);
+}
+
+export async function meilisearchGetDocument(connectionId: string, index: string, id: string): Promise<string> {
+  return post("/api/document-store/meilisearch/documents/get", {
+    connectionId,
+    index,
+    id,
+  });
+}
+
+export async function meilisearchGetIndexSettings(connectionId: string, index: string): Promise<Record<string, any>> {
+  return post("/api/document-store/meilisearch/settings/get", {
+    connectionId,
+    index,
+  });
+}
+
+export async function meilisearchUpdateIndexSettings(connectionId: string, index: string, settings: Record<string, any>): Promise<void> {
+  return post("/api/document-store/meilisearch/settings/update", {
+    connectionId,
+    index,
+    settings,
+  });
+}
+
+export async function meilisearchGetIndexStats(connectionId: string, index: string): Promise<{ numberOfDocuments: number; isIndexing: boolean; fieldDistribution: Record<string, number> } & Record<string, any>> {
+  return post("/api/document-store/meilisearch/stats", {
+    connectionId,
+    index,
+  });
+}
+
+export async function meilisearchGetIndexOverview(connectionId: string, index: string): Promise<MeilisearchIndexOverview> {
+  return post("/api/document-store/meilisearch/overview", {
+    connectionId,
+    index,
+  });
+}
+
+export async function meilisearchDeleteIndex(connectionId: string, index: string): Promise<void> {
+  return post("/api/document-store/meilisearch/index/delete", {
+    connectionId,
+    index,
+  });
+}
+
+export async function meilisearchDeleteAllDocuments(connectionId: string, index: string): Promise<void> {
+  return post("/api/document-store/meilisearch/documents/delete-all", {
+    connectionId,
+    index,
+  });
+}
+
+export async function meilisearchGetSystemOverview(connectionId: string): Promise<MeilisearchSystemOverview> {
+  return post("/api/document-store/meilisearch/system/overview", { connectionId });
+}
+
+export async function meilisearchListKeys(connectionId: string, offset = 0, limit = 20): Promise<KeyPage> {
+  return post("/api/document-store/meilisearch/keys/list", { connectionId, offset, limit });
+}
+
+export async function meilisearchGetKey(connectionId: string, uid: string): Promise<KeyListItem> {
+  return post("/api/document-store/meilisearch/keys/get", { connectionId, uid });
+}
+
+export async function meilisearchCreateKey(connectionId: string, input: KeyCreateInput): Promise<CreatedKey> {
+  return post("/api/document-store/meilisearch/keys/create", { connectionId, input });
+}
+
+export async function meilisearchUpdateKey(connectionId: string, uid: string, input: KeyUpdateInput): Promise<KeyListItem> {
+  return post("/api/document-store/meilisearch/keys/update", { connectionId, uid, input });
+}
+
+export async function meilisearchDeleteKey(connectionId: string, uid: string): Promise<void> {
+  return post("/api/document-store/meilisearch/keys/delete", { connectionId, uid });
+}
+
+export async function meilisearchGetTasks(connectionId: string, input: TaskListInput): Promise<TaskPage> {
+  return post("/api/document-store/meilisearch/tasks/list", { connectionId, input });
+}
+
+export async function meilisearchGetTask(connectionId: string, uid: number, expectedIndexUid?: string): Promise<MeilisearchTask> {
+  return post("/api/document-store/meilisearch/tasks/get", { connectionId, uid, expectedIndexUid: expectedIndexUid ?? null });
+}
+
+export async function meilisearchCancelTasks(connectionId: string, selector: TaskSelector): Promise<EnqueuedTaskSummary> {
+  return post("/api/document-store/meilisearch/tasks/cancel", { connectionId, selector });
+}
+
+export async function meilisearchDeleteTasks(connectionId: string, selector: TaskSelector): Promise<EnqueuedTaskSummary> {
+  return post("/api/document-store/meilisearch/tasks/delete", { connectionId, selector });
+}
+
 export async function mongoDeleteDocuments(connectionId: string, database: string, collection: string, filterJson: string, many: boolean): Promise<{ affected_rows: number }> {
   return post("/api/mongo/delete-documents", {
     connectionId,
@@ -3859,12 +4251,17 @@ export async function checkMcpServerStatus(): Promise<import("@/lib/backend/taur
     data_dir: null,
     install_command: "npm install -g @dbx-app/mcp-server@latest",
     update_command: "npm install -g @dbx-app/mcp-server@latest",
+    uninstall_command: "npm uninstall -g @dbx-app/mcp-server",
     error: "MCP Server status is only available in the desktop app.",
   };
 }
 
 export async function installMcpServer(): Promise<string> {
   throw new Error("MCP Server installation is only available in the desktop app.");
+}
+
+export async function uninstallMcpServer(): Promise<string> {
+  throw new Error("MCP Server uninstallation is only available in the desktop app.");
 }
 
 export async function getSystemProxyUrl(): Promise<string | null> {

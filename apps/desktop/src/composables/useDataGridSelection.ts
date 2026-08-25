@@ -27,6 +27,8 @@ export interface UseDataGridSelectionOptions {
   cellFromClientPoint?: (clientX: number, clientY: number) => CellPosition | null;
   rowFromClientPoint?: (clientX: number, clientY: number) => number | null;
   onUserCellSelection?: () => void;
+  shouldUpdateDraggedRowsImmediately?: () => boolean;
+  onDraggedRowSelectionChange?: () => void;
   runtimeScope?: DataGridRuntimeScope;
 }
 
@@ -41,8 +43,9 @@ const AUTO_SCROLL_EDGE_SIZE = 40;
 const AUTO_SCROLL_MAX_SPEED = 28;
 // Trackpad/mouse jitter during a plain click can move the pointer a few pixels between
 // mousedown and mouseup. Without a minimum drag distance, that jitter reads as an
-// intentional drag and turns a single click into a multi-cell/row selection. Matches
-// TAB_DRAG_HORIZONTAL_THRESHOLD in useTabDrag.ts, which guards the same class of gesture.
+// intentional drag and turns a single click into a multi-cell/row selection. Guards the
+// same class of gesture as TAB_DRAG_HORIZONTAL_THRESHOLD in useTabDrag.ts, though that one
+// is tuned higher to also absorb touchscreen tap jitter, which doesn't apply here.
 const GRID_SELECTION_DRAG_THRESHOLD_PX = 12;
 type RowSelectionOperation = "replace" | "add" | "remove";
 
@@ -59,6 +62,7 @@ export function useDataGridSelection(options: UseDataGridSelectionOptions) {
   let selectionPointerDownClientY = 0;
   let selectionDragConfirmed = false;
   let selectionAutoScrollFrame = 0;
+  let selectionInterruptionListenersAttached = false;
   let rowSelectionRangeAnchorIndex = -1;
   let rowSelectionFocusIndex = -1;
   let rowSelectionBaseIds = new Set<number>();
@@ -419,6 +423,7 @@ export function useDataGridSelection(options: UseDataGridSelectionOptions) {
       }
     }
     rowSelectionFocusIndex = focusRowIndex;
+    options.onDraggedRowSelectionChange?.();
   }
 
   function updateRowSelectionFromPointer() {
@@ -435,11 +440,44 @@ export function useDataGridSelection(options: UseDataGridSelectionOptions) {
     return true;
   }
 
+  function primaryMouseButtonReleased(event: MouseEvent): boolean {
+    return typeof event.buttons === "number" && (event.buttons & 1) === 0;
+  }
+
+  function handleSelectionVisibilityChange() {
+    if (document.visibilityState === "hidden") finishSelection();
+  }
+
+  function attachSelectionInterruptionListeners() {
+    if (selectionInterruptionListenersAttached) return;
+    selectionInterruptionListenersAttached = true;
+    if (typeof window !== "undefined") {
+      window.addEventListener("blur", finishSelection);
+      window.addEventListener("pointercancel", finishSelection, true);
+    }
+    document.addEventListener("visibilitychange", handleSelectionVisibilityChange);
+  }
+
+  function detachSelectionInterruptionListenersIfIdle() {
+    if (!selectionInterruptionListenersAttached || isSelectingCells.value || isSelectingRows.value) return;
+    selectionInterruptionListenersAttached = false;
+    if (typeof window !== "undefined") {
+      window.removeEventListener("blur", finishSelection);
+      window.removeEventListener("pointercancel", finishSelection, true);
+    }
+    document.removeEventListener("visibilitychange", handleSelectionVisibilityChange);
+  }
+
   function handleRowSelectionPointerMove(event: MouseEvent) {
     if (!isSelectingRows.value) return;
+    if (primaryMouseButtonReleased(event)) {
+      finishRowSelection();
+      return;
+    }
     if (!confirmSelectionDrag(event.clientX, event.clientY)) return;
     selectionPointerClientX = event.clientX;
     selectionPointerClientY = event.clientY;
+    if (options.shouldUpdateDraggedRowsImmediately?.()) updateRowSelectionFromPointer();
     if (!selectionAutoScrollFrame) selectionAutoScrollFrame = requestAnimationFrame(runSelectionAutoScroll);
   }
 
@@ -458,10 +496,12 @@ export function useDataGridSelection(options: UseDataGridSelectionOptions) {
     document.removeEventListener("mouseup", finishRowSelection);
     document.removeEventListener("mousemove", handleRowSelectionPointerMove);
     stopSelectionAutoScroll();
+    detachSelectionInterruptionListenersIfIdle();
   }
 
   function beginRowSelection(rowIndex: number, rowId: number, event: MouseEvent) {
     if (event.button !== 0) return;
+    finishSelection();
     event.preventDefault();
     focusGridWithoutScrolling();
     clearCellSelection();
@@ -483,6 +523,7 @@ export function useDataGridSelection(options: UseDataGridSelectionOptions) {
     selectionDragConfirmed = false;
     document.addEventListener("mouseup", finishRowSelection);
     document.addEventListener("mousemove", handleRowSelectionPointerMove);
+    attachSelectionInterruptionListeners();
   }
 
   function finishCellSelection() {
@@ -490,6 +531,7 @@ export function useDataGridSelection(options: UseDataGridSelectionOptions) {
     document.removeEventListener("mouseup", finishCellSelection);
     document.removeEventListener("mousemove", handleSelectionPointerMove);
     stopSelectionAutoScroll();
+    detachSelectionInterruptionListenersIfIdle();
   }
 
   function restoreCellSelectionState(state: RestoredCellSelectionState) {
@@ -549,6 +591,10 @@ export function useDataGridSelection(options: UseDataGridSelectionOptions) {
 
   function handleSelectionPointerMove(event: MouseEvent) {
     if (!isSelectingCells.value) return;
+    if (primaryMouseButtonReleased(event)) {
+      finishCellSelection();
+      return;
+    }
     if (!confirmSelectionDrag(event.clientX, event.clientY)) return;
     selectionPointerClientX = event.clientX;
     selectionPointerClientY = event.clientY;
@@ -563,6 +609,7 @@ export function useDataGridSelection(options: UseDataGridSelectionOptions) {
   function beginCellSelection(rowIndex: number, colIndex: number, event: MouseEvent) {
     if (event.button !== 0) return;
     if (editingCell.value) return;
+    finishSelection();
     event.preventDefault();
     focusGridWithoutScrolling();
     clearCellSelection();
@@ -577,6 +624,7 @@ export function useDataGridSelection(options: UseDataGridSelectionOptions) {
     if (showTranspose.value) transposeRowIndex.value = rowIndex;
     document.addEventListener("mouseup", finishCellSelection);
     document.addEventListener("mousemove", handleSelectionPointerMove);
+    attachSelectionInterruptionListeners();
   }
 
   function finishSelection() {

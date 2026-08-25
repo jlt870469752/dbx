@@ -15,6 +15,7 @@ const DatabaseDocsDialog = defineAsyncComponent(() => import("@/components/docs/
 const TableImportDialog = defineAsyncComponent(() => import("@/components/import/TableImportDialog.vue"));
 const FieldLineageDialog = defineAsyncComponent(() => import("@/components/lineage/FieldLineageDialog.vue"));
 const ConfigPassphraseDialog = defineAsyncComponent(() => import("@/components/config/ConfigPassphraseDialog.vue"));
+const ConfigConnectionSelectDialog = defineAsyncComponent(() => import("@/components/config/ConfigConnectionSelectDialog.vue"));
 const DatabaseSearchDialog = defineAsyncComponent(() => import("@/components/search/DatabaseSearchDialog.vue"));
 const SshHostKeyPromptDialog = defineAsyncComponent(() => import("@/components/ssh/SshHostKeyPromptDialog.vue"));
 const ConnectionPasswordPromptDialog = defineAsyncComponent(() => import("@/components/connection/ConnectionPasswordPromptDialog.vue"));
@@ -275,13 +276,37 @@ watch(
     :prefill-tables="dialogs.databaseExportPrefillTables.value"
     :prefill-all-databases="dialogs.databaseExportAllDatabases.value"
   />
+  <ConfigConnectionSelectDialog
+    v-if="dialogs.showConfigConnectionSelectDialog.value"
+    :open="dialogs.showConfigConnectionSelectDialog.value"
+    :mode="dialogs.configConnectionSelectMode.value"
+    :busy="dialogs.applyingImportSelection.value"
+    :connections="dialogs.configConnectionSelectList.value"
+    @update:open="dialogs.onConfigConnectionSelectOpenChange"
+    @confirm="dialogs.onConfigConnectionSelectConfirm"
+  />
   <ConfigPassphraseDialog
     v-if="dialogs.showConfigPassphraseDialog.value"
-    v-model:open="dialogs.showConfigPassphraseDialog.value"
+    :open="dialogs.showConfigPassphraseDialog.value"
     :mode="dialogs.configPassphraseMode.value"
     :external-error="dialogs.configPassphraseError.value"
+    :busy="dialogs.configExportBusy.value"
+    @update:open="dialogs.onConfigPassphraseOpenChange"
+    @request-unencrypted="dialogs.onRequestUnencryptedExport"
     @confirm="dialogs.configPassphraseMode.value === 'export' ? dialogs.onExportConfirm($event) : dialogs.onImportConfirm($event)"
   />
+  <Dialog v-if="dialogs.showConfigUnencryptedExportConfirm.value" :open="dialogs.showConfigUnencryptedExportConfirm.value" @update:open="dialogs.onConfigUnencryptedExportOpenChange">
+    <DialogContent class="sm:max-w-[440px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("configExport.unencryptedWarningTitle") }}</DialogTitle>
+      </DialogHeader>
+      <p class="text-sm text-muted-foreground">{{ t("configExport.unencryptedWarningDescription") }}</p>
+      <DialogFooter>
+        <Button type="button" variant="outline" :disabled="dialogs.configExportBusy.value" @click="dialogs.onConfigUnencryptedExportCancel()">{{ t("dangerDialog.cancel") }}</Button>
+        <Button type="button" variant="destructive" :disabled="dialogs.configExportBusy.value" @click="dialogs.onConfigUnencryptedExportConfirm()">{{ t("configExport.confirmUnencryptedExport") }}</Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
   <Dialog v-model:open="dialogs.showImportLayoutConfirm.value">
     <DialogContent class="sm:max-w-[400px]">
       <DialogHeader>

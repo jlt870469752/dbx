@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod agent_catalog;
 pub mod agent_connection;
 pub mod agent_events;
@@ -5,6 +7,7 @@ pub mod agent_explain;
 pub mod agent_kv;
 pub mod agent_loop;
 pub mod agent_manager;
+pub mod agent_offline_export;
 pub mod agent_recovery;
 pub mod agent_runtime;
 pub mod agent_service;
@@ -35,6 +38,7 @@ pub mod data_grid_extractors;
 pub mod data_grid_sql;
 pub mod database_capabilities;
 pub mod database_export;
+pub mod database_manifest;
 pub mod database_search_sql;
 pub mod db;
 pub mod db_admin_sql;
@@ -47,6 +51,7 @@ pub mod hbase_ops;
 pub mod history;
 pub mod jdbc;
 pub mod models;
+pub mod mongo_oidc;
 pub mod mongo_ops;
 pub mod mongo_shell;
 #[cfg(feature = "mq-admin")]
@@ -54,6 +59,7 @@ pub mod mq;
 #[cfg(feature = "mq-admin")]
 pub mod mqtt;
 pub(crate) mod mysql_ddl_normalize;
+pub mod mysql_event_sql;
 pub mod nacos;
 #[cfg(all(target_os = "windows", target_env = "gnu"))]
 mod nanosleep_stub;
@@ -70,10 +76,12 @@ pub mod query_result_export;
 pub mod query_result_sql;
 pub mod redis_ops;
 pub mod risk_metrics;
+pub mod runtime_config;
 pub mod saved_sql;
 pub mod schema;
 pub mod schema_diff;
 pub mod script_generator;
+pub mod session_credentials;
 pub mod sql;
 pub mod sql_analysis;
 pub mod sql_diagnostics;

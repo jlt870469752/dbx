@@ -231,6 +231,8 @@ const COMMON_SOFT_STATEMENT_START_KEYWORDS = [
   "COPY",
 ] as const;
 
+const SOFT_STATEMENT_FUNCTION_KEYWORDS = new Set(["REPLACE", "TRUNCATE"]);
+
 const DATABASE_SOFT_STATEMENT_KEYWORDS: Partial<Record<DatabaseType, readonly string[]>> = {
   mysql: ["HANDLER", "LOAD", "OPTIMIZE", "REPAIR"],
   postgres: ["DO", "LISTEN", "NOTIFY", "UNLISTEN"],
@@ -301,7 +303,8 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
   let statementEnd = -1;
   let statementHitStart = 0;
   let pendingHintStart = -1;
-  let pendingProxyDirectiveStart = -1;
+  let pendingMysqlDirectiveStart = -1;
+  let pendingMysqlDirectiveLineEnd = -1;
   let customDelimiter: string | null = null;
   let state: QuoteState = "none";
   let dollarTag = "";
@@ -309,13 +312,54 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
   let oraclePlSqlStatementEnd: number | null | undefined;
   let i = 0;
 
+  // Incremental cache for the MySQL routine-block check below: without it, every
+  // semicolon inside a CREATE PROCEDURE/FUNCTION/TRIGGER body (which, unlike a
+  // DELIMITER-wrapped body, still contains ordinary internal semicolons) would
+  // re-tokenize the whole prefix back to statementStart from scratch, and re-walk
+  // the whole BEGIN/CASE/END nesting from scratch, turning a single edit to an
+  // N-statement routine body into O(N^2) work (see mysqlRoutineBlockCompleteness).
+  let mysqlRoutineScan: {
+    from: number;
+    scannedTo: number;
+    lexState: MysqlRoutineLexState;
+    tokens: MysqlRoutineToken[];
+    completeness: MysqlRoutineBlockCompleteness;
+  } | null = null;
+  const mysqlRoutineTokensUpTo = (to: number): MysqlRoutineToken[] => {
+    if (!mysqlRoutineScan || mysqlRoutineScan.from !== statementStart) {
+      mysqlRoutineScan = { from: statementStart, scannedTo: statementStart, lexState: "none", tokens: [], completeness: newMysqlRoutineBlockCompleteness() };
+    }
+    if (to > mysqlRoutineScan.scannedTo) {
+      const { tokens: newTokens, endState } = mysqlRoutineTokens(sql, parameterOptions, mysqlRoutineScan.scannedTo, to, mysqlRoutineScan.lexState);
+      mysqlRoutineScan.tokens.push(...newTokens);
+      mysqlRoutineScan.lexState = endState;
+      mysqlRoutineScan.scannedTo = to;
+    }
+    return mysqlRoutineScan.tokens;
+  };
+  const mysqlRoutineBlockIsCompleteUpTo = (to: number): boolean => {
+    const tokens = mysqlRoutineTokensUpTo(to);
+    return advanceMysqlRoutineBlockCompleteness(mysqlRoutineScan!.completeness, tokens);
+  };
+
   const isWhitespace = (ch: string) => ch === " " || ch === "\t" || ch === "\r" || ch === "\n";
+  const nextLineBreak = (from: number) => {
+    const carriageReturn = sql.indexOf("\r", from);
+    const lineFeed = sql.indexOf("\n", from);
+    if (carriageReturn === -1) return lineFeed === -1 ? len : lineFeed;
+    if (lineFeed === -1) return carriageReturn;
+    return Math.min(carriageReturn, lineFeed);
+  };
 
   const markContent = (pos: number) => {
     if (statementStart === -1) {
-      statementStart = pendingProxyDirectiveStart !== -1 ? pendingProxyDirectiveStart : pendingHintStart === -1 ? pos : pendingHintStart;
+      // TDSQL accepts arbitrary leading block directives on the SQL line. The
+      // exact /*proxy*/ directive also keeps its historical multiline support.
+      const directiveStart = pendingMysqlDirectiveStart !== -1 && (sql.startsWith("/*proxy*/", pendingMysqlDirectiveStart) || pos < pendingMysqlDirectiveLineEnd) ? pendingMysqlDirectiveStart : -1;
+      statementStart = directiveStart !== -1 ? directiveStart : pendingHintStart === -1 ? pos : pendingHintStart;
       pendingHintStart = -1;
-      pendingProxyDirectiveStart = -1;
+      pendingMysqlDirectiveStart = -1;
+      pendingMysqlDirectiveLineEnd = -1;
     }
     statementEnd = pos + 1;
   };
@@ -324,7 +368,8 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
     if (statementStart === -1) {
       statementEnd = -1;
       pendingHintStart = -1;
-      pendingProxyDirectiveStart = -1;
+      pendingMysqlDirectiveStart = -1;
+      pendingMysqlDirectiveLineEnd = -1;
       postgresDollarQuotedRoutine = false;
       oraclePlSqlStatementEnd = undefined;
       return;
@@ -336,9 +381,11 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
     statementStart = -1;
     statementEnd = -1;
     pendingHintStart = -1;
-    pendingProxyDirectiveStart = -1;
+    pendingMysqlDirectiveStart = -1;
+    pendingMysqlDirectiveLineEnd = -1;
     postgresDollarQuotedRoutine = false;
     oraclePlSqlStatementEnd = undefined;
+    mysqlRoutineScan = null;
   };
 
   while (i < len) {
@@ -441,13 +488,15 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
 
     // Line comments consume up to (and including) the newline.
     if (ch === "-" && next === "-") {
-      pendingProxyDirectiveStart = -1;
+      pendingMysqlDirectiveStart = -1;
+      pendingMysqlDirectiveLineEnd = -1;
       const newline = sql.indexOf("\n", i);
       i = newline === -1 ? len : newline + 1;
       continue;
     }
     if (startsHashLineComment(sql, i, databaseType, parameterOptions)) {
-      pendingProxyDirectiveStart = -1;
+      pendingMysqlDirectiveStart = -1;
+      pendingMysqlDirectiveLineEnd = -1;
       const newline = sql.indexOf("\n", i);
       i = newline === -1 ? len : newline + 1;
       continue;
@@ -458,7 +507,15 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
       if (statementStart === -1 && pendingHintStart === -1 && (hintMarker === "+" || hintMarker === "@" || hintMarker === "&")) pendingHintStart = i;
       const close = sql.indexOf("*/", i + 2);
       if (statementStart === -1) {
-        pendingProxyDirectiveStart = databaseType === "mysql" && sql.startsWith("/*proxy*/", i) ? i : -1;
+        if (databaseType === "mysql") {
+          if (pendingMysqlDirectiveStart === -1 || i > pendingMysqlDirectiveLineEnd) {
+            pendingMysqlDirectiveStart = i;
+            pendingMysqlDirectiveLineEnd = nextLineBreak(i);
+          }
+        } else {
+          pendingMysqlDirectiveStart = -1;
+          pendingMysqlDirectiveLineEnd = -1;
+        }
       }
       i = close === -1 ? len : close + 2;
       continue;
@@ -519,9 +576,10 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
         continue;
       }
     } else if (ch === ";") {
-      const isMysqlRoutineBlock = isMysqlRoutineBlockDatabase(databaseType) && statementStart !== -1 && startsWithMysqlRoutineBlock(sql.slice(statementStart, i), parameterOptions);
+      const routineTokensBeforeSemicolon = isMysqlRoutineBlockDatabase(databaseType) && statementStart !== -1 ? mysqlRoutineTokensUpTo(i) : null;
+      const isMysqlRoutineBlock = routineTokensBeforeSemicolon !== null && isMysqlRoutineDdlStartFromWords(mysqlRoutineDdlStartWords(routineTokensBeforeSemicolon)) && mysqlRoutineTokensContainBegin(routineTokensBeforeSemicolon);
       if (isMysqlRoutineBlock) {
-        if (!mysqlRoutineBlockIsComplete(sql.slice(statementStart, i + 1), parameterOptions)) {
+        if (!mysqlRoutineBlockIsCompleteUpTo(i + 1)) {
           markContent(i);
           i += 1;
           continue;
@@ -933,7 +991,7 @@ function softStatementKeywordAt(sql: string, pos: number, databaseType?: Databas
   const match = /^[A-Za-z_][\w$]*/.exec(sql.slice(pos));
   if (!match) return null;
   const keyword = match[0].toUpperCase();
-  if (keyword === "REPLACE" && nextNonWhitespaceChar(sql, pos + match[0].length) === "(") return null;
+  if (SOFT_STATEMENT_FUNCTION_KEYWORDS.has(keyword) && nextNonWhitespaceChar(sql, pos + match[0].length) === "(") return null;
   // COMMENT is also a common column name. Only COMMENT ON starts a standalone
   // SQL command; otherwise a line-start projection column must stay in SELECT.
   if (keyword === "COMMENT" && nextSqlWord(sql, pos + match[0].length, databaseType, parameterOptions) !== "ON") return null;
@@ -1502,11 +1560,30 @@ function isMysqlRoutineBlockDatabase(databaseType?: DatabaseType): boolean {
 }
 
 function startsWithMysqlRoutineBlock(sql: string, parameterOptions?: SqlParameterOptions): boolean {
-  return isMysqlRoutineDdlStart(sql, parameterOptions) && mysqlRoutineTokens(sql, parameterOptions).some((token) => token.kind === "word" && token.value === "BEGIN");
+  return isMysqlRoutineDdlStart(sql, parameterOptions) && mysqlRoutineTokensContainBegin(mysqlRoutineTokens(sql, parameterOptions).tokens);
+}
+
+function mysqlRoutineTokensContainBegin(tokens: readonly MysqlRoutineToken[]): boolean {
+  return tokens.some((token) => token.kind === "word" && token.value === "BEGIN");
 }
 
 function isMysqlRoutineDdlStart(sql: string, parameterOptions?: SqlParameterOptions): boolean {
-  const words = mysqlRoutineWords(sql, parameterOptions).slice(0, 16);
+  return isMysqlRoutineDdlStartFromWords(mysqlRoutineWords(sql, parameterOptions).slice(0, 16));
+}
+
+/** First 16 word tokens, scanned without ever visiting the tail of `tokens` -
+ * the routine-detection check only ever needs this small fixed-size prefix. */
+function mysqlRoutineDdlStartWords(tokens: readonly MysqlRoutineToken[], limit = 16): string[] {
+  const words: string[] = [];
+  for (const token of tokens) {
+    if (token.kind !== "word") continue;
+    words.push(token.value);
+    if (words.length >= limit) break;
+  }
+  return words;
+}
+
+function isMysqlRoutineDdlStartFromWords(words: readonly string[]): boolean {
   if (words[0] !== "CREATE") return false;
 
   for (const word of words.slice(1)) {
@@ -1516,53 +1593,102 @@ function isMysqlRoutineDdlStart(sql: string, parameterOptions?: SqlParameterOpti
   return false;
 }
 
-function mysqlRoutineBlockIsComplete(sql: string, parameterOptions?: SqlParameterOptions): boolean {
-  if (!startsWithMysqlRoutineBlock(sql, parameterOptions)) return false;
+/**
+ * Incremental, resumable equivalent of walking `mysqlRoutineTokens(...)` with a
+ * fresh `blockStack`/`sawBegin` on every call. Driven token-by-token from
+ * `mysqlRoutineBlockIsCompleteUpTo` in splitSqlStatementRanges, so a routine body
+ * with N internal semicolons costs O(N) total instead of O(N^2) (re-walking the
+ * whole BEGIN/CASE/END nesting from the top on every semicolon while typing).
+ *
+ * Semantics mirror the non-incremental token walk exactly: `lastWordToken` plays
+ * the role of `previousWordToken(tokens, index)` (both reset to null once a
+ * semicolon is crossed), and `pendingEndAwaitingSuffix` defers resolving an "END"
+ * token's effect on `blockStack` until the following token arrives, which plays
+ * the role of `nextWordToken(tokens, index)`'s lookahead without needing to
+ * revisit already-processed tokens.
+ */
+interface MysqlRoutineBlockCompleteness {
+  processedTokenCount: number;
+  blockStack: Array<"BEGIN" | "CASE">;
+  sawBegin: boolean;
+  lastWordToken: string | null;
+  pendingEndAwaitingSuffix: boolean;
+  lastTokenKind: "word" | "semicolon" | null;
+}
 
-  const tokens = mysqlRoutineTokens(sql, parameterOptions);
-  const blockStack: Array<"BEGIN" | "CASE"> = [];
-  let sawBegin = false;
+function newMysqlRoutineBlockCompleteness(): MysqlRoutineBlockCompleteness {
+  return { processedTokenCount: 0, blockStack: [], sawBegin: false, lastWordToken: null, pendingEndAwaitingSuffix: false, lastTokenKind: null };
+}
 
-  for (let index = 0; index < tokens.length; index += 1) {
-    const token = tokens[index];
-    if (token.kind !== "word") continue;
-    if (token.value === "BEGIN") {
-      if (previousWordToken(tokens, index) === "END") continue;
-      sawBegin = true;
-      blockStack.push("BEGIN");
-      continue;
-    }
-    if (token.value === "CASE") {
-      if (previousWordToken(tokens, index) === "END") continue;
-      blockStack.push("CASE");
-      continue;
-    }
-    if (token.value === "END" && sawBegin) {
-      const suffix = nextWordToken(tokens, index) ?? "";
-      if (suffix === "CASE") {
-        if (blockStack[blockStack.length - 1] === "CASE") blockStack.pop();
-        continue;
+/** Folds any `tokens` not yet seen into `state` and returns whether the routine body is complete so far. */
+function advanceMysqlRoutineBlockCompleteness(state: MysqlRoutineBlockCompleteness, tokens: readonly MysqlRoutineToken[]): boolean {
+  while (state.processedTokenCount < tokens.length) {
+    const token = tokens[state.processedTokenCount];
+    state.processedTokenCount += 1;
+
+    if (token.kind === "semicolon") {
+      if (state.pendingEndAwaitingSuffix) {
+        state.blockStack.pop();
+        state.pendingEndAwaitingSuffix = false;
       }
-      if (MYSQL_CONTROL_BLOCK_SUFFIXES.has(suffix)) continue;
-      blockStack.pop();
+      state.lastWordToken = null;
+      state.lastTokenKind = "semicolon";
+      continue;
     }
+
+    const value = token.value;
+    if (state.pendingEndAwaitingSuffix) {
+      if (value === "CASE") {
+        if (state.blockStack[state.blockStack.length - 1] === "CASE") state.blockStack.pop();
+      } else if (!MYSQL_CONTROL_BLOCK_SUFFIXES.has(value)) {
+        state.blockStack.pop();
+      }
+      state.pendingEndAwaitingSuffix = false;
+    }
+
+    if (value === "BEGIN") {
+      if (state.lastWordToken !== "END") {
+        state.sawBegin = true;
+        state.blockStack.push("BEGIN");
+      }
+    } else if (value === "CASE") {
+      if (state.lastWordToken !== "END") {
+        state.blockStack.push("CASE");
+      }
+    } else if (value === "END" && state.sawBegin) {
+      state.pendingEndAwaitingSuffix = true;
+    }
+    state.lastWordToken = value;
+    state.lastTokenKind = "word";
   }
 
-  return sawBegin && blockStack.length === 0 && tokens[tokens.length - 1]?.kind === "semicolon";
+  return state.sawBegin && state.blockStack.length === 0 && state.lastTokenKind === "semicolon";
 }
 
 function mysqlRoutineWords(sql: string, parameterOptions?: SqlParameterOptions): string[] {
   return mysqlRoutineTokens(sql, parameterOptions)
-    .filter((token): token is { kind: "word"; value: string } => token.kind === "word")
+    .tokens.filter((token): token is { kind: "word"; value: string } => token.kind === "word")
     .map((token) => token.value);
 }
 
-function mysqlRoutineTokens(sql: string, parameterOptions?: SqlParameterOptions): Array<{ kind: "word" | "semicolon"; value: string }> {
-  const tokens: Array<{ kind: "word" | "semicolon"; value: string }> = [];
-  let state: QuoteState | "lineComment" | "blockComment" = "none";
-  let i = 0;
+type MysqlRoutineToken = { kind: "word" | "semicolon"; value: string };
+type MysqlRoutineLexState = QuoteState | "lineComment" | "blockComment";
 
-  while (i < sql.length) {
+const MYSQL_ROUTINE_WORD_RE = /[A-Za-z_][\w$]*/y;
+
+/**
+ * Tokenizes `sql` starting at `fromIndex` (resuming from `initialState`, the lexer
+ * state left over from any earlier chunk) and stops at `toIndex`. Callers that
+ * re-check an ever-growing prefix on every semicolon (see splitSqlStatementRanges)
+ * rely on this being resumable so they only re-scan the newly typed suffix instead
+ * of the whole prefix from scratch every time.
+ */
+function mysqlRoutineTokens(sql: string, parameterOptions?: SqlParameterOptions, fromIndex = 0, toIndex = sql.length, initialState: MysqlRoutineLexState = "none"): { tokens: MysqlRoutineToken[]; endState: MysqlRoutineLexState } {
+  const tokens: MysqlRoutineToken[] = [];
+  let state: MysqlRoutineLexState = initialState;
+  let i = fromIndex;
+
+  while (i < toIndex) {
     const ch = sql[i];
     const next = sql[i + 1] ?? "";
 
@@ -1652,7 +1778,8 @@ function mysqlRoutineTokens(sql: string, parameterOptions?: SqlParameterOptions)
       continue;
     }
 
-    const word = /^[A-Za-z_][\w$]*/.exec(sql.slice(i))?.[0];
+    MYSQL_ROUTINE_WORD_RE.lastIndex = i;
+    const word = MYSQL_ROUTINE_WORD_RE.exec(sql)?.[0];
     if (word) {
       tokens.push({ kind: "word", value: word.toUpperCase() });
       i += word.length;
@@ -1661,7 +1788,7 @@ function mysqlRoutineTokens(sql: string, parameterOptions?: SqlParameterOptions)
     i += 1;
   }
 
-  return tokens;
+  return { tokens, endState: state };
 }
 
 function startsWithOraclePlSqlBlock(sql: string): boolean {
@@ -1756,7 +1883,7 @@ function oraclePlSqlBlockEnd(sql: string): number | null {
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     if (token.kind === "semicolon") {
-      const complete = objectKind === "spec" ? stack.length === 0 : sawBegin && stack.length === 0;
+      const complete = objectKind !== null ? stack.length === 0 : sawBegin && stack.length === 0;
       if (complete) return token.to;
       continue;
     }
@@ -1926,6 +2053,7 @@ function oraclePlSqlTokens(sql: string): OraclePlSqlToken[] {
 
 function previousWordToken(tokens: Array<{ kind: "word" | "semicolon"; value: string }>, index: number): string | null {
   for (let i = index - 1; i >= 0; i -= 1) {
+    if (tokens[i].kind === "semicolon") return null;
     if (tokens[i].kind === "word") return tokens[i].value;
   }
   return null;
@@ -1933,6 +2061,7 @@ function previousWordToken(tokens: Array<{ kind: "word" | "semicolon"; value: st
 
 function nextWordToken(tokens: Array<{ kind: "word" | "semicolon"; value: string }>, index: number): string | null {
   for (let i = index + 1; i < tokens.length; i += 1) {
+    if (tokens[i].kind === "semicolon") return null;
     if (tokens[i].kind === "word") return tokens[i].value;
   }
   return null;

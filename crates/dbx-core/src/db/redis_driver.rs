@@ -1057,6 +1057,33 @@ where
     redis::cmd("SELECT").arg(db).query_async(con).await.map_err(|e| e.to_string())
 }
 
+pub async fn execute_console_command<C>(
+    con: &mut C,
+    db: u32,
+    command_text: &str,
+    skip_safety_check: bool,
+) -> Result<RedisCommandResult, String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let selection: redis::RedisResult<()> = redis::cmd("SELECT").arg(db).query_async(con).await;
+    if let Err(error) = selection {
+        if !is_unavailable_db_zero_select(&error, db) {
+            return Err(error.to_string());
+        }
+    }
+    execute_command(con, command_text, skip_safety_check).await
+}
+
+fn is_unavailable_db_zero_select(error: &redis::RedisError, db: u32) -> bool {
+    if db != 0 || error.kind() != redis::ErrorKind::ResponseError {
+        return false;
+    }
+    let detail = error.detail().unwrap_or_default().trim_start();
+    let prefix_len = "unknown command".len();
+    detail.get(..prefix_len).is_some_and(|prefix| prefix.eq_ignore_ascii_case("unknown command"))
+}
+
 pub fn ensure_cluster_db(db: u32) -> Result<(), String> {
     if db == 0 {
         Ok(())
@@ -2074,8 +2101,8 @@ where
 
 /// Batch-scan keys with server-side multi-SCAN support.
 ///
-/// Performs up to `max_iterations` SCAN cycles in a single call. TYPE metadata
-/// is optional so large key-name searches can avoid extra Redis work.
+/// Performs up to `max_iterations` SCAN cycles in a single call. TYPE and TTL
+/// metadata is optional so large key-name searches can avoid extra Redis work.
 /// DBSIZE is only called on the first iteration (cursor == 0).
 pub async fn scan_keys_batch<C>(
     con: &mut C,
@@ -2116,6 +2143,13 @@ where
                 } else {
                     String::new()
                 };
+                // 精确命中单个 key 时顺带查询一次 TTL（O(1) 命令），
+                // 让前端列表行无需再点开 key 就能看到过期信息。
+                let key_ttl: i64 = if include_types {
+                    redis::cmd("TTL").arg(pattern).query_async(con).await.unwrap_or(-2)
+                } else {
+                    -2
+                };
 
                 let value_preview = if include_types { redis_key_value_preview(&key_type) } else { String::new() };
 
@@ -2123,7 +2157,7 @@ where
                     key_display: redis_key_bytes_to_display(pattern.as_bytes()),
                     key_raw: redis_key_bytes_to_raw(pattern.as_bytes()),
                     key_type,
-                    ttl: -2,
+                    ttl: key_ttl,
                     size: 0,
                     value_preview,
                 };
@@ -2154,14 +2188,28 @@ where
         let (next_cursor, keys) = parse_scan_keys(raw)?;
 
         if !keys.is_empty() {
-            let key_types: Vec<String> = if include_types {
-                let mut pipe = redis::pipe();
+            let (key_types, key_ttls): (Vec<String>, Vec<i64>) = if include_types {
+                let mut type_pipe = redis::pipe();
                 for key in &keys {
-                    pipe.cmd("TYPE").arg(key);
+                    type_pipe.cmd("TYPE").arg(key);
                 }
-                pipe.query_async(con).await.unwrap_or_default()
+                let type_count = type_pipe.len();
+                let type_values = con.req_packed_commands(&type_pipe, 0, type_count).await.unwrap_or_default();
+                let key_types = type_values
+                    .iter()
+                    .map(|value| String::from_redis_value(value).unwrap_or_else(|_| "unknown".to_string()))
+                    .collect();
+
+                let mut ttl_pipe = redis::pipe();
+                for key in &keys {
+                    ttl_pipe.cmd("TTL").arg(key);
+                }
+                let ttl_count = ttl_pipe.len();
+                let ttl_values = con.req_packed_commands(&ttl_pipe, 0, ttl_count).await.unwrap_or_default();
+                let key_ttls = ttl_values.iter().map(|value| i64::from_redis_value(value).unwrap_or(-2)).collect();
+                (key_types, key_ttls)
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
 
             for (index, key) in keys.iter().enumerate() {
@@ -2179,7 +2227,7 @@ where
                     key_display: redis_key_bytes_to_display(key),
                     key_raw: redis_key_bytes_to_raw(key),
                     key_type,
-                    ttl: -2,
+                    ttl: key_ttls.get(index).copied().unwrap_or(-2),
                     size: 0,
                     value_preview,
                 });
@@ -2860,6 +2908,20 @@ where
     C: ConnectionLike + Send + Sync + Unpin,
 {
     redis::cmd("DEL").arg(key).query_async::<()>(con).await.map_err(|e| e.to_string())
+}
+
+/// Rename a key without overwriting an existing destination.
+pub async fn rename_key<C>(con: &mut C, key: &[u8], new_key: &[u8]) -> Result<(), String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let renamed =
+        redis::cmd("RENAMENX").arg(key).arg(new_key).query_async::<bool>(con).await.map_err(|e| e.to_string())?;
+    if renamed {
+        Ok(())
+    } else {
+        Err("Target key already exists".to_string())
+    }
 }
 
 async fn apply_expire_if_needed<C>(con: &mut C, key: &[u8], ttl: Option<i64>) -> Result<(), String>
@@ -3657,6 +3719,85 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn db0_console_command_continues_when_select_is_unavailable() {
+        let select_error = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "An error was signalled by the server",
+            "unknown command 'select', with args beginning with: '0'".to_string(),
+        ));
+        let mut con = FakeRedisConnection::with_results(vec![Err(select_error), Ok(bulk("Ada"))]);
+
+        let result = super::execute_console_command(&mut con, 0, "GET name", false).await.unwrap();
+
+        assert_eq!(result.command, "GET");
+        assert_eq!(result.value, serde_json::json!("Ada"));
+        assert_eq!(con.command_count("SELECT"), 1);
+        assert_eq!(con.command_count("GET"), 1);
+    }
+
+    #[tokio::test]
+    async fn console_command_keeps_supported_db_zero_selection() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Okay, bulk("Ada")]);
+
+        let result = super::execute_console_command(&mut con, 0, "GET name", false).await.unwrap();
+
+        assert_eq!(result.value, serde_json::json!("Ada"));
+        assert_eq!(con.command_count("SELECT"), 1);
+        assert_eq!(con.command_count("GET"), 1);
+    }
+
+    #[tokio::test]
+    async fn console_command_does_not_ignore_unavailable_select_for_nonzero_db() {
+        let select_error = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "An error was signalled by the server",
+            "unknown command 'select', with args beginning with: '1'".to_string(),
+        ));
+        let mut con = FakeRedisConnection::with_results(vec![Err(select_error), Ok(bulk("wrong db"))]);
+
+        let error = super::execute_console_command(&mut con, 1, "GET name", false).await.unwrap_err();
+
+        assert!(error.contains("unknown command"));
+        assert_eq!(con.command_count("SELECT"), 1);
+        assert_eq!(con.command_count("GET"), 0);
+    }
+
+    #[tokio::test]
+    async fn console_command_propagates_non_compatibility_select_errors() {
+        let errors = vec![
+            redis::RedisError::from((
+                redis::ErrorKind::ResponseError,
+                "An error was signalled by the server",
+                "invalid DB index".to_string(),
+            )),
+            noperm("SELECT"),
+            redis::RedisError::from((redis::ErrorKind::AuthenticationFailed, "Authentication failed")),
+            redis::RedisError::from((redis::ErrorKind::ParseError, "Invalid response")),
+            redis::RedisError::from(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset")),
+        ];
+
+        for select_error in errors {
+            let mut con = FakeRedisConnection::with_results(vec![Err(select_error), Ok(bulk("must not run"))]);
+
+            assert!(super::execute_console_command(&mut con, 0, "GET name", false).await.is_err());
+            assert_eq!(con.command_count("SELECT"), 1);
+            assert_eq!(con.command_count("GET"), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_database_selection_keeps_unavailable_select_error() {
+        let select_error = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "An error was signalled by the server",
+            "unknown command 'select'".to_string(),
+        ));
+        let mut con = FakeRedisConnection::with_results(vec![Err(select_error)]);
+
+        assert!(super::select_db(&mut con, 0).await.is_err());
+    }
+
     #[test]
     fn parses_stream_entries() {
         let raw = RedisRawValue::Array(vec![RedisRawValue::Array(vec![
@@ -4178,6 +4319,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rename_key_uses_renamenx_without_overwriting_the_destination() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(1)]);
+
+        super::rename_key(&mut con, b"session:old", b"session:new").await.unwrap();
+
+        assert_eq!(con.commands.len(), 1);
+        assert!(con.commands[0].contains("\r\nRENAMENX\r\n"));
+        assert!(con.commands[0].contains("\r\nsession:old\r\n"));
+        assert!(con.commands[0].contains("\r\nsession:new\r\n"));
+    }
+
+    #[tokio::test]
+    async fn rename_key_reports_a_destination_conflict() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(0)]);
+
+        let error = super::rename_key(&mut con, b"session:old", b"session:new").await.unwrap_err();
+
+        assert_eq!(error, "Target key already exists");
+    }
+
+    #[tokio::test]
     async fn set_expire_at_uses_expireat_with_the_unix_timestamp() {
         let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(1)]);
 
@@ -4323,6 +4485,85 @@ mod tests {
         assert_eq!(result.keys[0].key_display, key);
         assert_eq!(result.keys[0].key_raw, redis_key_bytes_to_raw(key.as_bytes()));
         assert_eq!(con.command_count("SCAN"), 2);
+    }
+
+    #[tokio::test]
+    async fn scan_keys_batch_batches_type_and_ttl_metadata() {
+        let mut con = FakeRedisConnection::new(vec![
+            RedisRawValue::Int(2),
+            scan_response("0", vec!["session:a", "cache:b"]),
+            RedisRawValue::SimpleString("string".to_string()),
+            RedisRawValue::SimpleString("hash".to_string()),
+            RedisRawValue::Int(-1),
+            RedisRawValue::Int(3600),
+        ]);
+
+        let result = super::scan_keys_batch(&mut con, 0, "*", 100, 1, true).await.unwrap();
+
+        assert_eq!(result.keys.len(), 2);
+        assert_eq!(result.keys[0].key_type, "string");
+        assert_eq!(result.keys[0].ttl, -1);
+        assert_eq!(result.keys[1].key_type, "hash");
+        assert_eq!(result.keys[1].ttl, 3600);
+        let type_pipeline = con.commands.iter().find(|packed| packed.contains("\r\nTYPE\r\n")).unwrap();
+        let ttl_pipeline = con.commands.iter().find(|packed| packed.contains("\r\nTTL\r\n")).unwrap();
+        assert_eq!(type_pipeline.matches("\r\nTYPE\r\n").count(), 2);
+        assert_eq!(type_pipeline.matches("\r\nTTL\r\n").count(), 0);
+        assert_eq!(ttl_pipeline.matches("\r\nTYPE\r\n").count(), 0);
+        assert_eq!(ttl_pipeline.matches("\r\nTTL\r\n").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn scan_keys_batch_preserves_types_when_one_ttl_command_fails() {
+        let mut con = FakeRedisConnection::new(vec![
+            RedisRawValue::Int(2),
+            scan_response("0", vec!["session:a", "cache:b"]),
+            RedisRawValue::SimpleString("string".to_string()),
+            RedisRawValue::SimpleString("hash".to_string()),
+            redis::parse_redis_value(b"-NOPERM this user has no permissions to run the 'ttl' command\r\n").unwrap(),
+            RedisRawValue::Int(3600),
+        ]);
+
+        let result = super::scan_keys_batch(&mut con, 0, "*", 100, 1, true).await.unwrap();
+
+        assert_eq!(result.keys.len(), 2);
+        assert_eq!(result.keys[0].key_type, "string");
+        assert_eq!(result.keys[0].ttl, -2);
+        assert_eq!(result.keys[1].key_type, "hash");
+        assert_eq!(result.keys[1].ttl, 3600);
+    }
+
+    #[tokio::test]
+    async fn scan_keys_batch_skips_type_and_ttl_when_metadata_disabled() {
+        // include_types=false 是“加载全部”的百万 key 链路，不能多发出任何 TYPE/TTL 命令
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(1), scan_response("0", vec!["cache:b"])]);
+
+        let result = super::scan_keys_batch(&mut con, 0, "*", 100, 1, false).await.unwrap();
+
+        assert_eq!(result.keys.len(), 1);
+        assert_eq!(result.keys[0].key_type, "");
+        assert_eq!(result.keys[0].ttl, -2);
+        assert_eq!(con.command_count("TYPE"), 0);
+        assert_eq!(con.command_count("TTL"), 0);
+    }
+
+    #[tokio::test]
+    async fn scan_keys_batch_exact_match_returns_ttl() {
+        let mut con = FakeRedisConnection::new(vec![
+            RedisRawValue::Int(1),
+            RedisRawValue::Int(1),
+            RedisRawValue::SimpleString("string".to_string()),
+            RedisRawValue::Int(-1),
+        ]);
+
+        let result = super::scan_keys_batch(&mut con, 0, "session:a", 100, 1, true).await.unwrap();
+
+        assert_eq!(result.keys.len(), 1);
+        assert_eq!(result.keys[0].key_display, "session:a");
+        assert_eq!(result.keys[0].key_type, "string");
+        assert_eq!(result.keys[0].ttl, -1);
+        assert_eq!(con.command_count("EXISTS"), 1);
+        assert_eq!(con.command_count("TTL"), 1);
     }
 
     #[tokio::test]

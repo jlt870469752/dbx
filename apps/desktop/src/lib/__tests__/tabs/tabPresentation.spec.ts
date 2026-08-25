@@ -1,7 +1,21 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { useConnectionStore } from "@/stores/connectionStore";
-import { connectionGroupDisplayName, executionSummaryItems, middleEllipsis, queryResultBaseSql, queryResultExecutionSql, resultGridCacheKey, resultGridInstanceKey, resultSourceRange, statementExecutionMarkers, tabTooltipLines, tabularResultItems } from "@/lib/tabs/tabPresentation";
+import {
+  connectionGroupDisplayName,
+  executionSummaryItems,
+  middleEllipsis,
+  queryResultBaseSql,
+  queryResultExecutionSql,
+  resultGridCacheKey,
+  resultGridColumnWidthCacheKey,
+  resultGridInstanceKey,
+  resultSourceRange,
+  statementExecutionMarkers,
+  tabDisplayTitle,
+  tabTooltipLines,
+  tabularResultItems,
+} from "@/lib/tabs/tabPresentation";
 import { sqlTextFingerprint } from "@/lib/sql/sqlTextFingerprint";
 import type { ConnectionConfig, QueryTab } from "@/types/database";
 
@@ -136,16 +150,26 @@ describe("query result labels", () => {
 describe("query result grid identity", () => {
   it("separates rerun payloads while retaining run and result-set identity", () => {
     const first = queryTab({ activeResultRunId: "run-1", activeResultIndex: 2, resultGridRevision: "execution-1" });
-    const rerun = queryTab({ activeResultRunId: "run-1", activeResultIndex: 2, resultGridRevision: "execution-2" });
+    const rerun = queryTab({ activeResultRunId: "run-2", activeResultIndex: 2, resultGridRevision: "execution-2" });
 
     expect(resultGridInstanceKey(first)).toBe("tab-1-run-1-2-execution-1");
     expect(resultGridInstanceKey(rerun)).not.toBe(resultGridInstanceKey(first));
     expect(resultGridInstanceKey({ ...first, activeResultIndex: 1 })).toBe("tab-1-run-1-1-execution-1");
-    expect(resultGridCacheKey(rerun)).toBe(resultGridCacheKey(first));
+    expect(resultGridCacheKey(rerun)).not.toBe(resultGridCacheKey(first));
+    expect(resultGridColumnWidthCacheKey(rerun)).toBe(resultGridColumnWidthCacheKey(first));
+    expect(resultGridColumnWidthCacheKey({ ...first, activeResultIndex: 1 })).not.toBe(resultGridColumnWidthCacheKey(first));
   });
 });
 
 describe("tab group presentation", () => {
+  it("uses the live database and branch context for Dolt version control tabs", () => {
+    const store = useConnectionStore();
+    store.connections = [{ id: "conn-1", name: "Production Dolt", db_type: "mysql", driver_profile: "dolt", database: "app" } as ConnectionConfig];
+
+    expect(tabDisplayTitle(queryTab({ mode: "dolt-version-control", title: "Dolt Version Control", workspaceBranch: "feature/orders" }), translate)).toBe("Production Dolt VCS@db.feature/orders");
+    expect(tabDisplayTitle(queryTab({ mode: "dolt-version-control", title: "Dolt Version Control" }), translate)).toBe("Production Dolt VCS@db");
+  });
+
   it("adds the full, live group path to tab tooltips", () => {
     const store = useConnectionStore();
     store.connections = [{ id: "conn-1", name: "PostgreSQL", db_type: "postgres", database: "app" } as ConnectionConfig];

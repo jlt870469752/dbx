@@ -1,6 +1,9 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { EDITOR_SETTINGS_DRAFT_KEYS, editorSettingsDraftFromSettings, editorSettingsDraftChanged, editorSettingsPatchFromDraft, normalizeQueryResultMaxRowsDraft, normalizeTableOpenPageSizeDraft } from "../editorSettingsDraft";
+import { EDITOR_SETTINGS_DRAFT_KEYS, editorSettingsDraftFromSettings, editorSettingsDraftChanged, editorSettingsPatchFromDraft, normalizeQueryResultMaxRowsDraft, normalizeTableOpenPageSizeDraft, shouldConfirmEditorSettingsDialogClose } from "../editorSettingsDraft";
 import type { EditorSettings } from "@/stores/settingsStore";
+
+const settingsDialogSource = readFileSync(new URL("../../../components/editor/EditorSettingsDialog.vue", import.meta.url), "utf8");
 
 function makeSettings(overrides: Partial<EditorSettings> = {}): EditorSettings {
   return {
@@ -25,6 +28,7 @@ function makeSettings(overrides: Partial<EditorSettings> = {}): EditorSettings {
     confirmUnsavedSqlClose: true,
     savedSqlOpenTargetMode: "saved",
     objectBrowserViewMode: "list",
+    sqlVariableSubstitutionEnabled: true,
     sqlVariableSyntaxOverrides: {},
     tabLayout: "scroll",
     ...overrides,
@@ -35,6 +39,10 @@ describe("EDITOR_SETTINGS_DRAFT_KEYS", () => {
   it("keeps connection and query timeout ownership outside editor settings", () => {
     expect(EDITOR_SETTINGS_DRAFT_KEYS).not.toContain("globalConnectTimeoutSecs");
     expect(EDITOR_SETTINGS_DRAFT_KEYS).not.toContain("globalQueryTimeoutSecs");
+  });
+
+  it("includes showLineNumbers", () => {
+    expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("showLineNumbers");
   });
 
   it("includes continueOnErrorOnBatch", () => {
@@ -60,16 +68,93 @@ describe("EDITOR_SETTINGS_DRAFT_KEYS", () => {
     expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("dataTabReuseMode");
   });
 
+  it("includes adjacent data-tab opening", () => {
+    expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("openDataTabsNextToActive");
+  });
+
   it("includes data grid type colors", () => {
     expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("colorizeDataGridCellTypes");
+  });
+
+  it("includes the type color scheme in the apply-footer draft", () => {
+    expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("dataGridTypeColorSchemes");
+    expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("activeDataGridTypeColorSchemeId");
+
+    const base = editorSettingsDraftFromSettings(makeSettings({ dataGridTypeColorSchemes: [], activeDataGridTypeColorSchemeId: "auto" }));
+    const withScheme = editorSettingsDraftFromSettings(
+      makeSettings({
+        dataGridTypeColorSchemes: [{ id: "type-colors-1", name: "配色方案 1", colors: { integer: "#254fce", numeric: "#0e7490", string: "#fdc9c9", boolean: "#100cc2", temporal: "#7e22ce", structured: "#be185d", identifier: "#92400e", binary: "#b91c1c", spatial: "#047857" } }],
+        activeDataGridTypeColorSchemeId: "type-colors-1",
+      }),
+    );
+
+    expect(editorSettingsDraftChanged(withScheme, base)).toBe(true);
+    expect(editorSettingsPatchFromDraft(withScheme, base)).toEqual({
+      dataGridTypeColorSchemes: [{ id: "type-colors-1", name: "配色方案 1", colors: { integer: "#254fce", numeric: "#0e7490", string: "#fdc9c9", boolean: "#100cc2", temporal: "#7e22ce", structured: "#be185d", identifier: "#92400e", binary: "#b91c1c", spatial: "#047857" } }],
+      activeDataGridTypeColorSchemeId: "type-colors-1",
+    });
+  });
+
+  it("includes the data grid filter view", () => {
+    expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("dataGridFilterEditorView");
+    expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("dataGridTextFilterPanelHeight");
+  });
+
+  it("includes the cell detail button visibility", () => {
+    expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("dataGridCellDetailButtonVisible");
   });
 
   it("includes completionTriggerMode", () => {
     expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("completionTriggerMode");
   });
+
+  it("includes the SQL variable substitution master switch", () => {
+    expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("sqlVariableSubstitutionEnabled");
+  });
+});
+
+describe("cell detail button settings control", () => {
+  it("binds the switch through apply and both reset paths", () => {
+    expect(settingsDialogSource).toContain("const editDataGridCellDetailButtonVisible = ref(settingsStore.editorSettings.dataGridCellDetailButtonVisible)");
+    expect(settingsDialogSource).toContain("dataGridCellDetailButtonVisible: editDataGridCellDetailButtonVisible.value");
+    expect(settingsDialogSource).toContain("editDataGridCellDetailButtonVisible.value = settingsStore.editorSettings.dataGridCellDetailButtonVisible");
+    expect(settingsDialogSource.match(/editDataGridCellDetailButtonVisible\.value = DEFAULT_EDITOR_SETTINGS\.dataGridCellDetailButtonVisible/g)).toHaveLength(2);
+    expect(settingsDialogSource).toContain('id="data-grid-cell-detail-button-visible" v-model="editDataGridCellDetailButtonVisible"');
+  });
 });
 
 describe("editorSettingsDraftFromSettings", () => {
+  it("round-trips a hidden line-number preference through the draft patch", () => {
+    const settings = makeSettings({ showLineNumbers: true });
+    const draft = editorSettingsDraftFromSettings(settings);
+    const base = editorSettingsDraftFromSettings(settings);
+
+    draft.showLineNumbers = false;
+
+    expect(editorSettingsPatchFromDraft(draft, base)).toEqual({ showLineNumbers: false });
+  });
+
+  it("toggles substitution without discarding per-database overrides", () => {
+    const base = editorSettingsDraftFromSettings(
+      makeSettings({
+        sqlVariableSubstitutionEnabled: true,
+        sqlVariableSyntaxOverrides: { mysql: { shell: false } },
+      }),
+    );
+    const draft = editorSettingsDraftFromSettings(
+      makeSettings({
+        sqlVariableSubstitutionEnabled: true,
+        sqlVariableSyntaxOverrides: { mysql: { shell: false } },
+      }),
+    );
+
+    draft.sqlVariableSubstitutionEnabled = false;
+
+    expect(editorSettingsPatchFromDraft(draft, base)).toEqual({ sqlVariableSubstitutionEnabled: false });
+    expect(draft.sqlVariableSyntaxOverrides).toEqual({ mysql: { shell: false } });
+    expect(base.sqlVariableSyntaxOverrides).toEqual({ mysql: { shell: false } });
+  });
+
   it("does not include persisted global timeout values in editor drafts", () => {
     const settings = makeSettings({ globalConnectTimeoutSecs: 17, globalQueryTimeoutSecs: 43 });
     const draft = editorSettingsDraftFromSettings(settings);
@@ -92,6 +177,12 @@ describe("editorSettingsDraftFromSettings", () => {
 
   it("maps the data grid type color preference from settings", () => {
     expect(editorSettingsDraftFromSettings(makeSettings({ colorizeDataGridCellTypes: false })).colorizeDataGridCellTypes).toBe(false);
+  });
+
+  it("maps the data grid filter view from settings", () => {
+    const draft = editorSettingsDraftFromSettings(makeSettings({ dataGridFilterEditorView: "text", dataGridTextFilterPanelHeight: 224 }));
+    expect(draft.dataGridFilterEditorView).toBe("text");
+    expect(draft.dataGridTextFilterPanelHeight).toBe(224);
   });
 
   it("preserves the table-open default for legacy settings", () => {
@@ -182,6 +273,14 @@ describe("editorSettingsDraftChanged", () => {
     expect(editorSettingsDraftChanged(draft, base)).toBe(true);
   });
 
+  it("detects adjacent data-tab opening changes", () => {
+    const settings = makeSettings({ openDataTabsNextToActive: false });
+    const draft = editorSettingsDraftFromSettings(settings);
+    const base = editorSettingsDraftFromSettings(settings);
+    draft.openDataTabsNextToActive = true;
+    expect(editorSettingsDraftChanged(draft, base)).toBe(true);
+  });
+
   it("detects completionTriggerMode change", () => {
     const settings = makeSettings({ completionTriggerMode: "positional" } as Partial<EditorSettings>);
     const draft = editorSettingsDraftFromSettings(settings);
@@ -199,6 +298,15 @@ describe("editorSettingsDraftChanged", () => {
 });
 
 describe("editorSettingsPatchFromDraft", () => {
+  it("applies, cancels, and re-enables the cell detail button visibility", () => {
+    const visible = editorSettingsDraftFromSettings(makeSettings({ dataGridCellDetailButtonVisible: true }));
+    const hidden = editorSettingsDraftFromSettings(makeSettings({ dataGridCellDetailButtonVisible: false }));
+
+    expect(editorSettingsPatchFromDraft(hidden, visible)).toEqual({ dataGridCellDetailButtonVisible: false });
+    expect(editorSettingsPatchFromDraft(visible, visible)).toEqual({});
+    expect(editorSettingsPatchFromDraft(visible, hidden)).toEqual({ dataGridCellDetailButtonVisible: true });
+  });
+
   it("includes continueOnErrorOnBatch in patch when changed", () => {
     const settings = makeSettings({ continueOnErrorOnBatch: false });
     const draft = editorSettingsDraftFromSettings(settings);
@@ -238,6 +346,14 @@ describe("editorSettingsPatchFromDraft", () => {
     const base = editorSettingsDraftFromSettings(settings);
     draft.dataTabReuseMode = "always-new";
     expect(editorSettingsPatchFromDraft(draft, base).dataTabReuseMode).toBe("always-new");
+  });
+
+  it("includes adjacent data-tab opening when changed", () => {
+    const settings = makeSettings({ openDataTabsNextToActive: false });
+    const draft = editorSettingsDraftFromSettings(settings);
+    const base = editorSettingsDraftFromSettings(settings);
+    draft.openDataTabsNextToActive = true;
+    expect(editorSettingsPatchFromDraft(draft, base).openDataTabsNextToActive).toBe(true);
   });
 
   it("includes completionTriggerMode in patch when changed", () => {
@@ -285,6 +401,33 @@ describe("editorSettingsDraftChanged - tabLayout", () => {
     const draft = editorSettingsDraftFromSettings(settings);
     const base = editorSettingsDraftFromSettings(settings);
     expect(editorSettingsDraftChanged(draft, base)).toBe(false);
+  });
+});
+
+describe("shouldConfirmEditorSettingsDialogClose", () => {
+  // Regression for https://github.com/t8y2/dbx/issues/5905: customizing a
+  // shortcut or the sidebar activation mode and then dismissing the dialog
+  // via Escape/outside-click/the "Close" button (anything other than Apply)
+  // must not silently drop the draft.
+  it("requests confirmation when the dialog is closing with an unsaved shortcut/sidebarActivation edit", () => {
+    const settings = makeSettings({ sidebarActivation: "single" } as Partial<EditorSettings>);
+    const base = editorSettingsDraftFromSettings(settings);
+    const draft = editorSettingsDraftFromSettings(settings);
+    draft.sidebarActivation = "double";
+
+    expect(shouldConfirmEditorSettingsDialogClose(false, editorSettingsDraftChanged(draft, base))).toBe(true);
+  });
+
+  it("does not block closing when there is no unsaved draft", () => {
+    const settings = makeSettings();
+    const base = editorSettingsDraftFromSettings(settings);
+    const draft = editorSettingsDraftFromSettings(settings);
+
+    expect(shouldConfirmEditorSettingsDialogClose(false, editorSettingsDraftChanged(draft, base))).toBe(false);
+  });
+
+  it("never blocks opening the dialog, even with a stale dirty flag", () => {
+    expect(shouldConfirmEditorSettingsDialogClose(true, true)).toBe(false);
   });
 });
 

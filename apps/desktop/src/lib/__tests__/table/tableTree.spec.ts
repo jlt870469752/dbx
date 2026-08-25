@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { appendTableTreeLoadMoreNode, buildGroupedObjectTreeNodes, buildSimpleObjectTreeNodes, buildTableTreeNodes, mergeTableInfosIntoObjects, mergeTableTreePageChildren, tablePartitionGroups, withoutTableTreeLoadMoreNodes } from "@/lib/table/tableTree";
+import { appendTableTreeLoadMoreNode, buildGroupedObjectTreeNodes, buildObjectGroupPlaceholderNodes, buildSimpleObjectTreeNodes, buildTableTreeNodes, mergeTableInfosIntoObjects, mergeTableTreePageChildren, tablePartitionGroups, withoutTableTreeLoadMoreNodes } from "@/lib/table/tableTree";
 import type { ObjectInfo, TableInfo, TreeNode } from "@/types/database";
 
 const context = {
@@ -117,6 +117,16 @@ describe("PostgreSQL custom type metadata", () => {
 });
 
 describe("programmable database objects", () => {
+  it("renders only the synonym group for the Xugu public-synonym scope", () => {
+    const groups = buildObjectGroupPlaceholderNodes({
+      ...context,
+      schema: "\u0000DBX_XUGU_PUBLIC_SYNONYMS",
+      objectTypes: ["SYNONYM"],
+    });
+
+    expect(groups).toEqual([expect.objectContaining({ type: "group-synonyms", label: "tree.synonyms" })]);
+  });
+
   it("coalesces Xugu package specification and body into one top-level node", () => {
     const objects: ObjectInfo[] = [
       { name: "DBX_UI_PKG", object_type: "PACKAGE", schema: "APP", valid: true },
@@ -236,6 +246,38 @@ describe("programmable database objects", () => {
         meta: trigger,
       }),
     ]);
+  });
+
+  it("groups MySQL scheduled events under a dedicated Events group", () => {
+    const objects: ObjectInfo[] = [{ name: "event_daily_middle_db_sync", object_type: "EVENT", schema: "shop" }];
+
+    const groups = buildGroupedObjectTreeNodes({ ...context, schema: "shop", objects, databaseType: "mysql" });
+    const eventGroup = groups.find((node) => node.type === "group-events");
+
+    expect(eventGroup).toEqual(expect.objectContaining({ objectCount: 1, label: "tree.events" }));
+    expect(eventGroup?.children).toEqual([expect.objectContaining({ type: "event", objectName: "event_daily_middle_db_sync" })]);
+  });
+
+  it("keeps table-scoped Kingbase triggers distinct and source-addressable", () => {
+    const objects: ObjectInfo[] = [
+      { name: "audit_before", object_type: "TRIGGER", schema: "public", parent_schema: "public", parent_name: "items" },
+      { name: "audit_before", object_type: "TRIGGER", schema: "public", parent_schema: "public", parent_name: "orders" },
+    ];
+
+    const simple = buildSimpleObjectTreeNodes({ ...context, schema: "public", objects, databaseType: "kingbase" });
+    expect(simple.map((node) => ({ label: node.label, tableName: node.tableName }))).toEqual([
+      { label: "audit_before (items)", tableName: "items" },
+      { label: "audit_before (orders)", tableName: "orders" },
+    ]);
+    expect(new Set(simple.map((node) => node.id)).size).toBe(2);
+
+    const grouped = buildGroupedObjectTreeNodes({ ...context, schema: "public", objects, databaseType: "kingbase" });
+    const triggers = grouped.find((node) => node.type === "group-triggers")?.children ?? [];
+    expect(triggers.map((node) => ({ label: node.label, objectName: node.objectName, tableName: node.tableName }))).toEqual([
+      { label: "audit_before (items)", objectName: "audit_before", tableName: "items" },
+      { label: "audit_before (orders)", objectName: "audit_before", tableName: "orders" },
+    ]);
+    expect(new Set(triggers.map((node) => node.id)).size).toBe(2);
   });
 
   it("groups Xugu private synonyms as source objects", () => {

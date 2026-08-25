@@ -101,6 +101,8 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
     await connectionStore.ensureConnected(target.connectionId);
     if (!isPreparationCurrent()) return;
     if (!config) throw new Error("Connection config not found");
+    const metadataGenerationAtStart = connectionStore.metadataGenerationFor(target.connectionId, target.database);
+    const isCurrentGeneration = () => connectionStore.metadataGenerationFor(target.connectionId, target.database) === metadataGenerationAtStart;
     const effectiveDbType = effectiveDatabaseTypeForConnection(config);
     const identifierQuote = connectionStore.connectionIdentifierQuote?.(target.connectionId);
     const querySchema = metadataSchemaForConnection(config, target.database, tableSchema);
@@ -116,13 +118,14 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
         catalog: target.catalog,
         database: target.database,
         tableName: target.tableName,
+        includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
         tableType: targetTableType,
         columns: columns.map((column) => column.name),
         primaryKeys,
         whereInput: target.whereInput,
         limit: pageLimit,
       });
-      if (!isPreparationCurrent()) return;
+      if (!isPreparationCurrent() || !isCurrentGeneration()) return;
       queryStore.updateSql(tabId, sql);
       queryStore.setTableMeta(tabId, {
         catalog: target.catalog,
@@ -160,6 +163,7 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
       catalog: target.catalog,
       database: target.database,
       tableName: target.tableName,
+      includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
       tableType: targetTableType,
       columns: eagerColumns.map((column) => column.name),
       primaryKeys: eagerPrimaryKeys,
@@ -167,7 +171,7 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
       whereInput: target.whereInput,
       limit: pageLimit,
     });
-    if (!isPreparationCurrent()) return;
+    if (!isPreparationCurrent() || !isCurrentGeneration()) return;
     queryStore.updateSql(tabId, sql);
     queryStore.setTableMeta(tabId, {
       schema: tableSchema,
@@ -207,6 +211,7 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
         catalog: target.catalog,
         database: target.database,
         tableName: target.tableName,
+        includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
         tableType: targetTableType,
         whereInput: target.whereInput,
         limit: 0,
@@ -232,7 +237,7 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
       const primaryKeys = metadata.primaryKeys;
       // 异步窗口内 tab 可能已被复用为其他目标：旧请求的元数据不得落地、
       // 不得解除新目标的 pending
-      if (!isCurrentTarget()) return;
+      if (!isCurrentTarget() || !isCurrentGeneration()) return;
       const useRowId = usesSyntheticRowIdKey(effectiveDbType, primaryKeys, targetTableType);
       queryStore.setTableMeta(tabId, {
         schema: tableSchema,
@@ -252,6 +257,7 @@ async function openTableTarget(target: NavigationTarget, options: { tableInfoTab
           catalog: target.catalog,
           database: target.database,
           tableName: target.tableName,
+          includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
           tableType: targetTableType,
           whereInput: target.whereInput,
           primaryKeys,
@@ -349,6 +355,7 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
         const capturedMeta = tab.tableMeta!;
         const capturedSchema = tab.schema || capturedMeta.schema;
         const capturedTarget = { connectionId: tab.connectionId, database: tab.database, schema: capturedSchema, catalog: capturedMeta.catalog, tableName: capturedMeta.tableName };
+        const metadataGenerationAtStart = connectionStore.metadataGenerationFor(tab.connectionId, tab.database);
         const metadataSchema = metadataSchemaForConnection(connection, tab.database, capturedSchema);
         // 分组含 tableType：主键计算依赖它，不同 tableType 不能共享加载结果
         const catalogKey = `${capturedMeta.catalog ?? ""}\u0000${capturedMeta.tableType ?? ""}`;
@@ -370,6 +377,7 @@ export function useNavigationTargets(dialogs: { showFieldLineageDialog: { value:
           loadedByCatalog.set(catalogKey, metadata);
         }
         const currentTab = queryStore.tabs.find((item) => item.id === tab.id);
+        if (connectionStore.metadataGenerationFor(tab.connectionId, tab.database) !== metadataGenerationAtStart) continue;
         if (!canApplyDataTabMetadata(currentTab, capturedTarget)) continue;
         queryStore.setTableMeta(tab.id, {
           ...capturedMeta,
