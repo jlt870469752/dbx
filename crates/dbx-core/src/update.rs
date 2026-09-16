@@ -96,6 +96,11 @@ fn update_check_candidates(source: crate::DownloadSource) -> Vec<String> {
             format!("{}{LATEST_JSON_R2_PATH}", crate::R2_CDN_BASE),
             LATEST_JSON_GITHUB_PATH.to_string(),
         ],
+        crate::DownloadSource::Myfork => vec![
+            "https://github.com/jlt870469752/dbx/releases/latest/download/latest.json".to_string(),
+            format!("{}{LATEST_JSON_R2_PATH}", crate::R2_CDN_BASE),
+            LATEST_JSON_GITHUB_PATH.to_string(),
+        ],
     }
 }
 
@@ -519,6 +524,14 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
             super::update_check_candidates(crate::DownloadSource::Cnb),
             vec![
                 "https://cnb.cool/dbxio.com/dbx/-/releases/latest/download/latest.json",
+                "https://dl.dbxio.com/releases/latest/latest.json",
+                "https://github.com/t8y2/dbx/releases/latest/download/latest.json",
+            ]
+        );
+        assert_eq!(
+            super::update_check_candidates(crate::DownloadSource::Myfork),
+            vec![
+                "https://github.com/jlt870469752/dbx/releases/latest/download/latest.json",
                 "https://dl.dbxio.com/releases/latest/latest.json",
                 "https://github.com/t8y2/dbx/releases/latest/download/latest.json",
             ]

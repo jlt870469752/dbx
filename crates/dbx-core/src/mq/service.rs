@@ -14,6 +14,7 @@ use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
 const MAX_PEEK_MESSAGES: u32 = 100;
+const MAX_KAFKA_PEEK_MESSAGES: u32 = 1_000;
 
 /// Test connectivity to the message queue admin endpoint. Successful MQ
 /// adapters are cached so agent-backed systems do not cold-start on every
@@ -497,11 +498,76 @@ pub async fn mq_peek_messages_core(
     if count == 0 {
         return Ok(PeekMessagesResult::default());
     }
-    if count > MAX_PEEK_MESSAGES {
-        return Err(format!("Peek message count must be between 1 and {MAX_PEEK_MESSAGES}"));
+    let cfg = state.configs.read().await.get(conn_id).cloned().ok_or("Connection not found")?;
+    let mqc = state.mq_admin_config_for_connection(conn_id, &cfg).await?;
+    let max_count = if mqc.system_kind == MqSystemKind::Kafka { MAX_KAFKA_PEEK_MESSAGES } else { MAX_PEEK_MESSAGES };
+    if count > max_count {
+        return Err(format!("Peek message count must be between 1 and {max_count}"));
     }
     let adapter = get_adapter(state, conn_id).await?;
     adapter.peek_messages(&topic, &sub, count, options.unwrap_or_default()).await
+}
+
+fn validate_kafka_read_count(count: u32) -> Result<(), String> {
+    if count == 0 {
+        return Ok(());
+    }
+    if count > MAX_KAFKA_PEEK_MESSAGES {
+        return Err(format!("Peek message count must be between 1 and {MAX_KAFKA_PEEK_MESSAGES}"));
+    }
+    Ok(())
+}
+
+pub async fn mq_peek_messages_range_core(
+    state: &AppState,
+    conn_id: &str,
+    topic: TopicRef,
+    sub: String,
+    partition: Option<i32>,
+    start_offset: i64,
+    end_offset: i64,
+    count: u32,
+) -> Result<PeekMessagesResult, String> {
+    validate_kafka_read_count(count)?;
+    if start_offset < 0 || end_offset <= start_offset {
+        return Err("Kafka offset range must satisfy 0 <= startOffset < endOffset".to_string());
+    }
+    let adapter = get_adapter(state, conn_id).await?;
+    adapter.peek_messages_range(&topic, &sub, partition, start_offset, end_offset, count).await
+}
+
+pub async fn mq_start_read_session_core(
+    state: &AppState,
+    conn_id: &str,
+    topic: TopicRef,
+    sub: String,
+    partition: Option<i32>,
+    start_offset: i64,
+    end_offset: i64,
+    count: u32,
+) -> Result<ReadSessionBatchResult, String> {
+    validate_kafka_read_count(count)?;
+    if start_offset < 0 || end_offset <= start_offset {
+        return Err("Kafka offset range must satisfy 0 <= startOffset < endOffset".to_string());
+    }
+    let adapter = get_adapter(state, conn_id).await?;
+    adapter.start_read_session(&topic, &sub, partition, start_offset, end_offset, count).await
+}
+
+pub async fn mq_read_session_next_core(
+    state: &AppState,
+    conn_id: &str,
+    session_id: String,
+    count: u32,
+) -> Result<ReadSessionBatchResult, String> {
+    validate_kafka_read_count(count)?;
+    let adapter = get_adapter(state, conn_id).await?;
+    adapter.read_session_next(&session_id, count).await
+}
+
+pub async fn mq_close_read_session_core(state: &AppState, conn_id: &str, session_id: String) -> Result<(), String> {
+    let adapter = get_adapter(state, conn_id).await?;
+    adapter.close_read_session(&session_id).await
 }
 
 pub async fn mq_expire_messages_core(

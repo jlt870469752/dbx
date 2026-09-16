@@ -242,6 +242,33 @@ pub(crate) struct PeekMessagesReq {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct PeekMessagesRangeReq {
+    connection_id: String,
+    topic: dbx_core::mq::TopicRef,
+    sub: String,
+    #[serde(default)]
+    partition: Option<i32>,
+    start_offset: i64,
+    end_offset: i64,
+    count: u32,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReadSessionNextReq {
+    connection_id: String,
+    session_id: String,
+    count: u32,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReadSessionCloseReq {
+    connection_id: String,
+    session_id: String,
+}
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ExpireMessagesReq {
     connection_id: String,
     topic: dbx_core::mq::TopicRef,
@@ -887,6 +914,73 @@ pub async fn peek_messages(
     .await
     .map_err(AppError::from)?;
     Ok(Json(result))
+}
+
+pub async fn peek_messages_range(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<PeekMessagesRangeReq>,
+) -> Result<Json<dbx_core::mq::PeekMessagesResult>, AppError> {
+    super::mcp_policy::ensure_scope(&state, &headers, &req.connection_id).await?;
+    let result = dbx_core::mq::service::mq_peek_messages_range_core(
+        &state.app,
+        &req.connection_id,
+        req.topic,
+        req.sub,
+        req.partition,
+        req.start_offset,
+        req.end_offset,
+        req.count,
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
+pub async fn start_read_session(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<PeekMessagesRangeReq>,
+) -> Result<Json<dbx_core::mq::ReadSessionBatchResult>, AppError> {
+    super::mcp_policy::ensure_scope(&state, &headers, &req.connection_id).await?;
+    let result = dbx_core::mq::service::mq_start_read_session_core(
+        &state.app,
+        &req.connection_id,
+        req.topic,
+        req.sub,
+        req.partition,
+        req.start_offset,
+        req.end_offset,
+        req.count,
+    )
+    .await
+    .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
+pub async fn read_session_next(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<ReadSessionNextReq>,
+) -> Result<Json<dbx_core::mq::ReadSessionBatchResult>, AppError> {
+    super::mcp_policy::ensure_scope(&state, &headers, &req.connection_id).await?;
+    let result =
+        dbx_core::mq::service::mq_read_session_next_core(&state.app, &req.connection_id, req.session_id, req.count)
+            .await
+            .map_err(AppError::from)?;
+    Ok(Json(result))
+}
+
+pub async fn close_read_session(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Json(req): Json<ReadSessionCloseReq>,
+) -> Result<Json<()>, AppError> {
+    super::mcp_policy::ensure_scope(&state, &headers, &req.connection_id).await?;
+    dbx_core::mq::service::mq_close_read_session_core(&state.app, &req.connection_id, req.session_id)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(()))
 }
 
 pub async fn expire_messages(

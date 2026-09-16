@@ -47,6 +47,7 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "dataGridCellDetailButtonVisible",
   "pageSize",
   "tableOpenPageSize",
+  "kafkaUseReadSession",
   "queryResultMaxRowsEnabled",
   "queryResultMaxRows",
   "infiniteScroll",

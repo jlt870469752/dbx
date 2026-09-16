@@ -2228,7 +2228,7 @@ export interface UpdateInfo {
   release_notes: string;
 }
 
-export type UpdateDownloadSource = "official" | "cnb";
+export type UpdateDownloadSource = "official" | "cnb" | "myfork";
 
 export interface UpdateDownloadProgress {
   downloaded: number;

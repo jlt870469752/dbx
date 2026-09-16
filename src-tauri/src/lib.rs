@@ -2413,6 +2413,14 @@ pub fn run() {
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_peek_messages,
             #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_peek_messages_range,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_start_read_session,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_read_session_next,
+            #[cfg(feature = "mq-admin")]
+            commands::mq_cmd::mq_close_read_session,
+            #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_expire_messages,
             #[cfg(feature = "mq-admin")]
             commands::mq_cmd::mq_list_producers,

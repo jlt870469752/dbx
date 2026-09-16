@@ -19,6 +19,8 @@ const OFFICIAL_UPDATE_ENDPOINTS: [&str; 2] = [
 const R2_LATEST_RELEASE_DOWNLOAD_PREFIX: &str = "https://dl.dbxio.com/releases/latest/";
 const CNB_RELEASE_DOWNLOAD_PREFIX: &str = "https://cnb.cool/dbxio.com/dbx/-/releases/download/";
 const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/t8y2/dbx/releases/download/";
+const MYFORK_RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/jlt870469752/dbx/releases/download/";
+const MYFORK_LATEST_JSON_PATH: &str = "https://github.com/jlt870469752/dbx/releases/latest/download/latest.json";
 const UPDATE_DOWNLOAD_PROGRESS_EVENT: &str = "update-download-progress";
 const DOWNLOAD_CANCELED_ERROR: &str = "Download canceled by user.";
 const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -31,6 +33,7 @@ const IS_WINDOWS_7_TARGET: bool = cfg!(target_vendor = "win7");
 pub enum UpdateDownloadSource {
     Official,
     Cnb,
+    Myfork,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -195,12 +198,14 @@ impl UpdateDownloadSource {
         match self {
             Self::Official => "official",
             Self::Cnb => "cnb",
+            Self::Myfork => "myfork",
         }
     }
 
     fn endpoints(&self, latest_version: Option<&str>) -> Result<Vec<String>, String> {
         match self {
             Self::Official => Ok(OFFICIAL_UPDATE_ENDPOINTS.iter().map(|endpoint| endpoint.to_string()).collect()),
+            Self::Myfork => Ok(vec![MYFORK_LATEST_JSON_PATH.to_string(), OFFICIAL_UPDATE_ENDPOINTS[0].to_string()]),
             Self::Cnb => {
                 let version =
                     latest_version.ok_or_else(|| "Latest version is required for CNB updates.".to_string())?;
@@ -230,6 +235,7 @@ impl UpdateDownloadSource {
     fn mirror_download_prefix(&self) -> Option<&'static str> {
         match self {
             Self::Cnb => Some(CNB_RELEASE_DOWNLOAD_PREFIX),
+            Self::Myfork => Some(MYFORK_RELEASE_DOWNLOAD_PREFIX),
             Self::Official => None,
         }
     }
@@ -249,6 +255,10 @@ impl UpdateDownloadSource {
             ],
             Self::Cnb => vec![
                 format!("{CNB_RELEASE_DOWNLOAD_PREFIX}{tag}/{filename}"),
+                format!("{R2_LATEST_RELEASE_DOWNLOAD_PREFIX}{filename}"),
+            ],
+            Self::Myfork => vec![
+                format!("{MYFORK_RELEASE_DOWNLOAD_PREFIX}{tag}/{filename}"),
                 format!("{R2_LATEST_RELEASE_DOWNLOAD_PREFIX}{filename}"),
             ],
         };
@@ -289,6 +299,19 @@ impl UpdateDownloadSource {
                     urls.push(rewritten);
                 } else if !tag.is_empty() && !filename.is_empty() {
                     urls.push(format!("{CNB_RELEASE_DOWNLOAD_PREFIX}{tag}/{filename}"));
+                }
+                if !filename.is_empty() {
+                    urls.push(format!("{R2_LATEST_RELEASE_DOWNLOAD_PREFIX}{filename}"));
+                }
+                urls.push(download_url.to_string());
+                urls
+            }
+            Self::Myfork => {
+                let mut urls = Vec::new();
+                if let Ok(Some(rewritten)) = self.rewrite_download_url(download_url) {
+                    urls.push(rewritten);
+                } else if !tag.is_empty() && !filename.is_empty() {
+                    urls.push(format!("{MYFORK_RELEASE_DOWNLOAD_PREFIX}{tag}/{filename}"));
                 }
                 if !filename.is_empty() {
                     urls.push(format!("{R2_LATEST_RELEASE_DOWNLOAD_PREFIX}{filename}"));

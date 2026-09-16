@@ -81,6 +81,7 @@ export function isUpdateIgnored(info: api.UpdateInfo | null, ignoredVersion: str
 export function normalizeUpdateDownloadSource(value: unknown): SettingsUpdateDownloadSource {
   // Old persisted AtomGit preferences should retain their mainland mirror behavior.
   if (value === "atomgit") return "cnb";
+  if (value === "myfork") return "myfork";
   return value === "cnb" ? "cnb" : "official";
 }
 
@@ -93,6 +94,9 @@ export function resolveUpdateReleaseUrl(info: api.UpdateInfo | null, source: unk
   const normalizedSource = normalizeUpdateDownloadSource(source);
   if (normalizedSource === "cnb" && info?.latest_version) {
     return `https://cnb.cool/dbxio.com/dbx/-/releases/tag/${tagVersion(info.latest_version)}`;
+  }
+  if (normalizedSource === "myfork" && info?.latest_version) {
+    return `https://github.com/jlt870469752/dbx/releases/tag/${tagVersion(info.latest_version)}`;
   }
   return info?.release_url || fallbackUrl;
 }

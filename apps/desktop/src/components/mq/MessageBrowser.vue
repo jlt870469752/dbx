@@ -1,24 +1,34 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onUnmounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { Copy } from "@lucide/vue";
 import type { MqSystemKind, PeekedMessage, PeekMessagesOptions, TopicRef } from "@/types/mq";
-import { mqPeekMessages } from "@/lib/backend/api";
+import { mqCloseReadSession, mqPeekMessages, mqPeekMessagesRange, mqReadSessionNext, mqStartReadSession } from "@/lib/backend/api";
 import { formatError } from "@/lib/backend/errorUtils";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { buildKafkaMessageSearchText, kafkaMessageSearchTextMatches, normalizeKafkaMessageSearchQuery } from "@/lib/mq/kafkaMessageSearch";
 import { parseNonNegativeSafeInteger } from "@/lib/mq/mqPeekFilters";
 import { useToast } from "@/composables/useToast";
+import { useSettingsStore } from "@/stores/settingsStore";
 import { Button } from "@/components/ui/button";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import MqSearchInput from "@/components/mq/shared/MqSearchInput.vue";
 
 type MessageBrowserAppearance = "form" | "monitoring";
+
+interface KafkaPartitionRange {
+  partition: number;
+  beginOffset: number;
+  endOffset: number;
+}
 
 interface Props {
   connectionId: string;
   topic?: TopicRef | null;
   mqSystemKind?: MqSystemKind;
+  /** Known Kafka partition ids, used to calculate the next page for all-partition reads. */
+  kafkaPartitions?: number[];
+  /** Kafka beginning/end offsets, including partitions omitted from a global first page. */
+  kafkaPartitionRanges?: KafkaPartitionRange[];
   /** Flatten chrome when embedded in MonitoringPanel so it is not a second nested card. */
   appearance?: MessageBrowserAppearance;
 }
@@ -28,22 +38,30 @@ const props = withDefaults(defineProps<Props>(), {
 });
 const { t } = useI18n();
 const { toast } = useToast();
+const settingsStore = useSettingsStore();
+const KAFKA_AGENT_MAX_PEEK_COUNT = 1000;
 
 const loading = ref(false);
 const error = ref<string>();
 const messages = ref<PeekedMessage[]>([]);
 const incomplete = ref(false);
+const scanning = ref(false);
 const partition = ref<string | number>("");
 const offset = ref<string | number>("");
-const count = ref(20);
+const endOffset = ref<string | number>("");
+const count = ref(props.mqSystemKind === "kafka" ? 100 : 20);
+const pageSizePreset = ref("100");
+const currentPage = ref(1);
 const advancedExpanded = ref(false);
 const messageSearchQuery = ref("");
-type KafkaPeekStartPosition = NonNullable<PeekMessagesOptions["startPosition"]>;
-const kafkaStartPosition = ref<KafkaPeekStartPosition>("latest");
+const scanStatus = ref("");
+const lastAutoStartOffset = ref<number>();
+const lastAutoEndOffset = ref<number>();
 let messageRequestVersion = 0;
+let activeReadSessionId: string | undefined;
+let activeReadSessionConnectionId: string | undefined;
 
 const isKafka = computed(() => props.mqSystemKind === "kafka");
-const isKafkaOffsetMode = computed(() => kafkaStartPosition.value === "offset");
 const isMonitoring = computed(() => props.appearance === "monitoring");
 const normalizedMessageSearchQuery = computed(() => normalizeKafkaMessageSearchQuery(messageSearchQuery.value));
 const searchableMessages = computed(() =>
@@ -57,6 +75,161 @@ const filteredMessages = computed(() => {
   if (!query) return messages.value;
   return searchableMessages.value.filter(({ searchText }) => kafkaMessageSearchTextMatches(searchText, query)).map(({ message }) => message);
 });
+const displayMessages = computed(() => (isKafka.value ? filteredMessages.value : messages.value));
+const currentRange = computed(() => {
+  if (!isKafka.value) return undefined;
+  const range = parseKafkaRange(false);
+  if (!range) return undefined;
+  const start = range.startOffset + (currentPage.value - 1) * range.pageSize;
+  const end = Math.min(range.endOffset, start + range.pageSize);
+  return { ...range, pageStart: start, pageEnd: end };
+});
+const canGoPreviousPage = computed(() => isKafka.value && currentPage.value > 1 && !loading.value && !scanning.value);
+const canGoNextPage = computed(() => {
+  const range = currentRange.value;
+  return !!range && range.pageEnd < range.endOffset && !loading.value && !scanning.value;
+});
+
+function normalizeBrowseResult(result: Awaited<ReturnType<typeof mqPeekMessages>>) {
+  return Array.isArray(result) ? { messages: result, incomplete: false } : result;
+}
+
+function messagePartition(message: PeekedMessage): number | undefined {
+  const value = message.properties?.partition;
+  if (value == null || value === "") return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+function messageOffset(message: PeekedMessage): number | undefined {
+  if (message.messageId == null || message.messageId === "") return undefined;
+  const parsed = Number(message.messageId);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+function messageKey(message: PeekedMessage): string {
+  const messagePartitionValue = messagePartition(message);
+  const messageOffsetValue = messageOffset(message);
+  if (messagePartitionValue != null && messageOffsetValue != null) {
+    return `${messagePartitionValue}:${messageOffsetValue}`;
+  }
+  return `${messagePartitionValue ?? "p"}:${message.messageId ?? message.position}`;
+}
+
+function sortKafkaMessages(values: PeekedMessage[]): PeekedMessage[] {
+  return [...values].sort((left, right) => {
+    const leftOffset = messageOffset(left) ?? 0;
+    const rightOffset = messageOffset(right) ?? 0;
+    const leftPartition = messagePartition(left) ?? 0;
+    const rightPartition = messagePartition(right) ?? 0;
+    return leftOffset - rightOffset || leftPartition - rightPartition;
+  });
+}
+
+function normalizedCount(): number {
+  // This is the page size shown in the UI. Larger Kafka pages are split into
+  // multiple agent batches so the agent's per-RPC limit remains independent.
+  const maxCount = isKafka.value ? 10000 : 100;
+  const fallback = isKafka.value ? 100 : 20;
+  const resultLimit = Math.max(1, Math.min(maxCount, Math.trunc(Number(count.value) || fallback)));
+  count.value = resultLimit;
+  if (["100", "500", "1000"].includes(String(resultLimit))) pageSizePreset.value = String(resultLimit);
+  return resultLimit;
+}
+
+const useKafkaReadSession = computed(() => isKafka.value && settingsStore.editorSettings.kafkaUseReadSession);
+
+function selectedKafkaPartitions(): number[] {
+  const partitionText = String(partition.value).trim();
+  if (partitionText !== "") {
+    const parsedPartition = parseNonNegativeSafeInteger(partitionText);
+    return parsedPartition == null ? [] : [parsedPartition];
+  }
+
+  const partitionIds = new Set<number>([...(props.kafkaPartitions ?? []), ...(props.kafkaPartitionRanges?.map((range) => range.partition) ?? [])]);
+  for (const message of messages.value) {
+    const messagePartitionValue = messagePartition(message);
+    if (messagePartitionValue != null) partitionIds.add(messagePartitionValue);
+  }
+  return [...partitionIds].sort((left, right) => left - right);
+}
+
+function partitionRange(partitionId: number): KafkaPartitionRange | undefined {
+  return props.kafkaPartitionRanges?.find((range) => range.partition === partitionId);
+}
+
+function kafkaDefaultStartOffset(): number {
+  const partitions = selectedKafkaPartitions();
+  const ranges = partitions.map(partitionRange).filter((range): range is KafkaPartitionRange => !!range);
+  if (!ranges.length) return 0;
+  return Math.min(...ranges.map((range) => range.beginOffset));
+}
+
+function kafkaDefaultEndOffset(): number {
+  const partitions = selectedKafkaPartitions();
+  const ranges = partitions.map(partitionRange).filter((range): range is KafkaPartitionRange => !!range);
+  if (!ranges.length) return Number.MAX_SAFE_INTEGER;
+  return Math.max(...ranges.map((range) => range.endOffset));
+}
+
+function syncKafkaDefaultOffsets() {
+  if (!isKafka.value) return;
+  const ranges = props.kafkaPartitionRanges ?? [];
+  if (!ranges.length) return;
+
+  const start = kafkaDefaultStartOffset();
+  const end = kafkaDefaultEndOffset();
+  const currentStart = String(offset.value).trim();
+  const currentEnd = String(endOffset.value).trim();
+  const previousStart = lastAutoStartOffset.value == null ? "" : String(lastAutoStartOffset.value);
+  const previousEnd = lastAutoEndOffset.value == null ? "" : String(lastAutoEndOffset.value);
+
+  if (currentStart === "" || currentStart === previousStart) {
+    offset.value = String(start);
+  }
+  if (currentEnd === "" || currentEnd === previousEnd || currentEnd === String(Number.MAX_SAFE_INTEGER)) {
+    endOffset.value = String(end);
+  }
+  lastAutoStartOffset.value = start;
+  lastAutoEndOffset.value = end;
+}
+
+function parseKafkaRange(throwOnError = true): { startOffset: number; endOffset: number; pageSize: number; partition?: number } | undefined {
+  syncKafkaDefaultOffsets();
+  const pageSize = normalizedCount();
+  const partitionText = String(partition.value).trim();
+  const startText = String(offset.value).trim();
+  const endText = String(endOffset.value).trim();
+  const parsedPartition = partitionText === "" ? undefined : parseNonNegativeSafeInteger(partitionText);
+  if (partitionText !== "" && parsedPartition == null) {
+    if (throwOnError) throw new Error(t("mqMessages.partitionMustBeNonNegativeInt"));
+    return undefined;
+  }
+  const start = startText === "" ? kafkaDefaultStartOffset() : parseNonNegativeSafeInteger(startText);
+  const end = endText === "" ? kafkaDefaultEndOffset() : parseNonNegativeSafeInteger(endText);
+  if (start == null) {
+    if (throwOnError) throw new Error(t("mqMessages.startOffsetMustBeNonNegativeInt"));
+    return undefined;
+  }
+  if (end == null) {
+    if (throwOnError) throw new Error(t("mqMessages.endOffsetMustBeNonNegativeInt"));
+    return undefined;
+  }
+  if (end <= start) {
+    if (throwOnError) throw new Error(t("mqMessages.endOffsetMustBeGreaterThanStart"));
+    return undefined;
+  }
+  if (startText === "") {
+    offset.value = String(start);
+    lastAutoStartOffset.value = start;
+  }
+  if (endText === "") {
+    endOffset.value = String(end);
+    lastAutoEndOffset.value = end;
+  }
+  if (parsedPartition != null) partition.value = String(parsedPartition);
+  return { startOffset: start, endOffset: end, pageSize, partition: parsedPartition ?? undefined };
+}
 
 function peekGroupName(): string {
   if (props.mqSystemKind === "rocketmq") return "__dbx_rocketmq_viewer__";
@@ -64,6 +237,10 @@ function peekGroupName(): string {
 }
 
 async function loadMessages() {
+  if (isKafka.value) {
+    await loadKafkaPage(1);
+    return;
+  }
   const topic = props.topic;
   if (!topic || loading.value) return;
   const requestVersion = ++messageRequestVersion;
@@ -71,26 +248,17 @@ async function loadMessages() {
   error.value = undefined;
   incomplete.value = false;
   try {
-    const resultLimit = Math.max(1, Math.min(100, Math.trunc(Number(count.value) || 20)));
-    count.value = resultLimit;
+    const resultLimit = normalizedCount();
     const options: PeekMessagesOptions = {};
     const partitionText = String(partition.value).trim();
     const offsetText = String(offset.value).trim();
 
     if (isKafka.value) {
-      options.startPosition = kafkaStartPosition.value;
       if (partitionText !== "") {
         const parsedPartition = parseNonNegativeSafeInteger(partitionText);
         if (parsedPartition == null) throw new Error(t("mqMessages.partitionMustBeNonNegativeInt"));
         options.partition = parsedPartition;
         partition.value = String(parsedPartition);
-      }
-      if (isKafkaOffsetMode.value) {
-        if (offsetText === "") throw new Error(t("mqMessages.offsetRequiredForOffset"));
-        const parsedOffset = parseNonNegativeSafeInteger(offsetText);
-        if (parsedOffset == null) throw new Error(t("mqMessages.offsetMustBeNonNegativeIntRequired"));
-        options.offset = parsedOffset;
-        offset.value = String(parsedOffset);
       }
     } else {
       if (partitionText !== "") {
@@ -108,8 +276,8 @@ async function loadMessages() {
     }
     const result = await mqPeekMessages(props.connectionId, topic, peekGroupName(), resultLimit, options);
     if (requestVersion === messageRequestVersion) {
-      const browseResult = Array.isArray(result) ? { messages: result, incomplete: false } : result;
-      messages.value = browseResult.messages;
+      const browseResult = normalizeBrowseResult(result);
+      messages.value = isKafka.value ? sortKafkaMessages(browseResult.messages) : browseResult.messages;
       incomplete.value = browseResult.incomplete;
     }
   } catch (cause: unknown) {
@@ -123,12 +291,297 @@ async function loadMessages() {
   }
 }
 
+async function loadKafkaPage(page: number) {
+  const topic = props.topic;
+  if (!topic || loading.value || scanning.value) return;
+  const requestVersion = ++messageRequestVersion;
+  loading.value = true;
+  error.value = undefined;
+  incomplete.value = false;
+  scanStatus.value = "";
+  try {
+    const range = parseKafkaRange();
+    if (!range) return;
+    const pageStart = range.startOffset + (page - 1) * range.pageSize;
+    const pageEnd = Math.min(range.endOffset, pageStart + range.pageSize);
+    if (pageStart >= range.endOffset) throw new Error(t("mqMessages.pageOutOfRange"));
+    scanStatus.value = t("mqMessages.readProgress");
+    const result = await fetchKafkaOffsetWindow(pageStart, pageEnd, range);
+    if (requestVersion !== messageRequestVersion) return;
+    currentPage.value = page;
+    messages.value = sortKafkaMessages(result.messages).slice(0, range.pageSize);
+    incomplete.value = result.incomplete;
+  } catch (cause: unknown) {
+    if (requestVersion === messageRequestVersion) error.value = formatError(cause);
+  } finally {
+    if (requestVersion === messageRequestVersion) {
+      loading.value = false;
+      scanStatus.value = "";
+    }
+  }
+}
+
+async function fetchKafkaOffsetWindow(start: number, end: number, range: { pageSize: number; partition?: number }) {
+  const topic = props.topic;
+  if (!topic) return { messages: [], incomplete: false };
+  if (useKafkaReadSession.value) {
+    if (range.pageSize <= KAFKA_AGENT_MAX_PEEK_COUNT) {
+      const result = await mqPeekMessagesRange(props.connectionId, topic, peekGroupName(), range.partition, start, end, range.pageSize);
+      return normalizeBrowseResult(result);
+    }
+    return readKafkaOffsetWindowWithSession(start, end, range);
+  }
+  const windows: Array<{ start: number; end: number }> = [];
+  for (let windowStart = start; windowStart < end; windowStart += KAFKA_AGENT_MAX_PEEK_COUNT) {
+    windows.push({
+      start: windowStart,
+      end: Math.min(end, windowStart + KAFKA_AGENT_MAX_PEEK_COUNT),
+    });
+  }
+
+  const partitionIds = range.partition != null ? [range.partition] : selectedKafkaPartitions();
+  const targets: Array<{ start: number; end: number; partition?: number }> = [];
+  for (const window of windows) {
+    if (partitionIds.length) {
+      for (const partitionId of partitionIds) {
+        targets.push({ ...window, partition: partitionId });
+      }
+    } else {
+      targets.push(window);
+    }
+  }
+
+  const results: Array<{ messages: PeekedMessage[]; incomplete: boolean }> = [];
+  for (const window of targets) {
+    const batchCount = Math.min(KAFKA_AGENT_MAX_PEEK_COUNT, window.end - window.start);
+    const result = await mqPeekMessages(props.connectionId, topic, peekGroupName(), batchCount, {
+      startPosition: "offset",
+      partition: window.partition,
+      offset: window.start,
+      endOffset: window.end,
+    });
+    results.push(normalizeBrowseResult(result));
+  }
+
+  const seen = new Set<string>();
+  const messages = results
+    .flatMap((result) => result.messages)
+    .filter((message) => {
+      const messageOffsetValue = messageOffset(message);
+      if (messageOffsetValue != null && (messageOffsetValue < start || messageOffsetValue >= end)) return false;
+      const key = messageKey(message);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  return {
+    incomplete: results.some((result) => result.incomplete),
+    messages,
+  };
+}
+
+async function readKafkaOffsetWindowWithSession(start: number, end: number, range: { pageSize: number; partition?: number }) {
+  const topic = props.topic;
+  if (!topic) return { messages: [], incomplete: false };
+
+  let sessionId: string | undefined;
+  let remainingCount = range.pageSize;
+  const batches: Array<{ messages: PeekedMessage[]; incomplete: boolean }> = [];
+  try {
+    const requestCount = () => Math.min(KAFKA_AGENT_MAX_PEEK_COUNT, Math.max(1, remainingCount));
+    let batch = await mqStartReadSession(props.connectionId, topic, peekGroupName(), range.partition, start, end, requestCount());
+    sessionId = batch.sessionId;
+    if (!sessionId) throw new Error("Kafka read session did not return a sessionId");
+    while (true) {
+      batches.push({ messages: batch.messages, incomplete: batch.incomplete });
+      remainingCount = Math.max(0, remainingCount - batch.messages.length);
+      if (batch.done || remainingCount === 0) break;
+      batch = await mqReadSessionNext(props.connectionId, sessionId, requestCount());
+    }
+  } finally {
+    if (sessionId) {
+      await mqCloseReadSession(props.connectionId, sessionId).catch(() => undefined);
+    }
+  }
+
+  const seen = new Set<string>();
+  return {
+    incomplete: batches.some((batch) => batch.incomplete),
+    messages: batches
+      .flatMap((batch) => batch.messages)
+      .filter((message) => {
+        const offsetValue = messageOffset(message);
+        if (offsetValue != null && (offsetValue < start || offsetValue >= end)) return false;
+        const key = messageKey(message);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      }),
+  };
+}
+
+function isReadSessionNotFoundError(cause: unknown): boolean {
+  return formatError(cause).toLowerCase().includes("read session not found");
+}
+
+async function closeActiveReadSession() {
+  const sessionId = activeReadSessionId;
+  const connectionId = activeReadSessionConnectionId;
+  activeReadSessionId = undefined;
+  activeReadSessionConnectionId = undefined;
+  if (!sessionId || !connectionId) return;
+  try {
+    await mqCloseReadSession(connectionId, sessionId);
+  } catch {
+    // The agent may already have reclaimed the session.
+  }
+}
+
+function sessionSearchMessageMatches(messagesToCheck: PeekedMessage[], query: string): PeekedMessage[] {
+  return messagesToCheck.filter((message) => kafkaMessageSearchTextMatches(buildKafkaMessageSearchText(message, formatMessageTimestamp(message.publishTime)), query));
+}
+
+async function searchKafkaRangeWithSession(range: { startOffset: number; endOffset: number; pageSize: number; partition?: number }, query: string, requestVersion: number) {
+  const topic = props.topic;
+  if (!topic) return;
+
+  let resumeOffset = range.startOffset;
+  let restartCount = 0;
+  while (requestVersion === messageRequestVersion) {
+    let sessionId: string | undefined;
+    activeReadSessionId = undefined;
+    activeReadSessionConnectionId = undefined;
+    try {
+      const first = await mqStartReadSession(
+        props.connectionId,
+        topic,
+        peekGroupName(),
+        range.partition,
+        resumeOffset,
+        range.endOffset,
+        // Range search scans many pages, so use the largest agent batch.
+        KAFKA_AGENT_MAX_PEEK_COUNT,
+      );
+      sessionId = first.sessionId;
+      if (!sessionId) throw new Error("Kafka read session did not return a sessionId");
+      activeReadSessionId = sessionId;
+      activeReadSessionConnectionId = props.connectionId;
+
+      let batch = first;
+      while (requestVersion === messageRequestVersion) {
+        const batchMessages = batch.messages;
+        if (batchMessages.length) {
+          const minimumOffset = Math.min(...batchMessages.map((message) => messageOffset(message) ?? resumeOffset));
+          resumeOffset = Math.max(range.startOffset, range.startOffset + Math.floor((minimumOffset - range.startOffset) / range.pageSize) * range.pageSize);
+        }
+        const matches = sessionSearchMessageMatches(batchMessages, query);
+        if (matches.length) {
+          const matchedOffset = messageOffset(matches[0]) ?? resumeOffset;
+          const page = Math.floor((matchedOffset - range.startOffset) / range.pageSize) + 1;
+          const pageStart = range.startOffset + (page - 1) * range.pageSize;
+          const pageEnd = Math.min(range.endOffset, pageStart + range.pageSize);
+          await closeActiveReadSession();
+          const pageResult = await fetchKafkaOffsetWindow(pageStart, pageEnd, range);
+          currentPage.value = page;
+          messages.value = sortKafkaMessages(pageResult.messages).slice(0, range.pageSize);
+          incomplete.value = batch.incomplete || pageResult.incomplete;
+          scanStatus.value = t("mqMessages.scanMatched", { page });
+          return;
+        }
+        if (batch.done) {
+          currentPage.value = 1;
+          messages.value = [];
+          scanStatus.value = t("mqMessages.scanNoMatch");
+          return;
+        }
+        batch = await mqReadSessionNext(props.connectionId, sessionId, KAFKA_AGENT_MAX_PEEK_COUNT);
+      }
+      return;
+    } catch (cause: unknown) {
+      if (requestVersion !== messageRequestVersion) return;
+      if (!isReadSessionNotFoundError(cause) || restartCount >= 3) {
+        throw cause;
+      }
+      restartCount += 1;
+      await closeActiveReadSession();
+      // Restart from the beginning of the current page boundary. This may
+      // reread a small amount, but avoids skipping another partition.
+      scanStatus.value = t("mqMessages.scanSessionRetry", { attempt: restartCount });
+    } finally {
+      if (sessionId) await closeActiveReadSession();
+    }
+  }
+}
+
+async function goToPreviousPage() {
+  if (canGoPreviousPage.value) await loadKafkaPage(currentPage.value - 1);
+}
+
+async function goToNextPage() {
+  if (canGoNextPage.value) await loadKafkaPage(currentPage.value + 1);
+}
+
+async function searchKafkaRange() {
+  const query = normalizedMessageSearchQuery.value;
+  if (!query) {
+    await loadKafkaPage(1);
+    return;
+  }
+  const topic = props.topic;
+  if (!topic || loading.value || scanning.value) return;
+  const requestVersion = ++messageRequestVersion;
+  scanning.value = true;
+  error.value = undefined;
+  incomplete.value = false;
+  messages.value = [];
+  try {
+    const range = parseKafkaRange();
+    if (!range) return;
+    if (useKafkaReadSession.value) {
+      await searchKafkaRangeWithSession(range, query, requestVersion);
+      return;
+    }
+    const scanBatchSize = KAFKA_AGENT_MAX_PEEK_COUNT;
+    const totalBatches = Math.max(1, Math.ceil((range.endOffset - range.startOffset) / scanBatchSize));
+    for (let scanBatch = 1; scanBatch <= totalBatches; scanBatch += 1) {
+      if (requestVersion !== messageRequestVersion) return;
+      const scanStart = range.startOffset + (scanBatch - 1) * scanBatchSize;
+      const scanEnd = Math.min(range.endOffset, scanStart + scanBatchSize);
+      scanStatus.value = t("mqMessages.scanProgress", { current: scanBatch, total: totalBatches });
+      const result = await fetchKafkaOffsetWindow(scanStart, scanEnd, { ...range, pageSize: scanBatchSize });
+      const matches = result.messages.filter((message) => kafkaMessageSearchTextMatches(buildKafkaMessageSearchText(message, formatMessageTimestamp(message.publishTime)), query));
+      if (matches.length) {
+        const matchedOffset = messageOffset(matches[0]) ?? scanStart;
+        const page = Math.floor((matchedOffset - range.startOffset) / range.pageSize) + 1;
+        const pageStart = range.startOffset + (page - 1) * range.pageSize;
+        const pageEnd = Math.min(range.endOffset, pageStart + range.pageSize);
+        const pageResult = await fetchKafkaOffsetWindow(pageStart, pageEnd, range);
+        currentPage.value = page;
+        messages.value = sortKafkaMessages(pageResult.messages).slice(0, range.pageSize);
+        incomplete.value = result.incomplete || pageResult.incomplete;
+        scanStatus.value = t("mqMessages.scanMatched", { page });
+        return;
+      }
+    }
+    currentPage.value = 1;
+    messages.value = [];
+    scanStatus.value = t("mqMessages.scanNoMatch");
+  } catch (cause: unknown) {
+    if (requestVersion === messageRequestVersion) error.value = formatError(cause);
+  } finally {
+    if (requestVersion === messageRequestVersion) scanning.value = false;
+  }
+}
+
 function invalidateMessageRequest() {
   messageRequestVersion += 1;
   loading.value = false;
   error.value = undefined;
   messages.value = [];
   incomplete.value = false;
+  scanStatus.value = "";
+  currentPage.value = 1;
+  scanning.value = false;
 }
 
 function messagePayload(message: PeekedMessage): string {
@@ -160,6 +613,7 @@ function formatMessageTimestamp(value?: string): string {
 }
 
 watch([() => props.connectionId, () => props.mqSystemKind], () => {
+  void closeActiveReadSession();
   messageSearchQuery.value = "";
   invalidateMessageRequest();
 });
@@ -167,16 +621,33 @@ watch([() => props.connectionId, () => props.mqSystemKind], () => {
 watch(
   () => JSON.stringify(props.topic ?? null),
   () => {
+    void closeActiveReadSession();
     partition.value = "";
     offset.value = "";
+    endOffset.value = "";
+    lastAutoStartOffset.value = undefined;
+    lastAutoEndOffset.value = undefined;
     messageSearchQuery.value = "";
     invalidateMessageRequest();
   },
 );
 
-watch(kafkaStartPosition, () => {
-  // Keep offset values for switching back, but never retain results from another start mode.
-  invalidateMessageRequest();
+watch([() => JSON.stringify(props.kafkaPartitions ?? []), () => JSON.stringify(props.kafkaPartitionRanges ?? []), partition], () => syncKafkaDefaultOffsets(), { immediate: true });
+
+watch(pageSizePreset, (value) => {
+  if (value !== "custom") count.value = Number(value);
+});
+
+watch(
+  () => settingsStore.editorSettings.kafkaUseReadSession,
+  () => {
+    void closeActiveReadSession();
+    invalidateMessageRequest();
+  },
+);
+
+onUnmounted(() => {
+  void closeActiveReadSession();
 });
 </script>
 
@@ -184,22 +655,12 @@ watch(kafkaStartPosition, () => {
   <section v-if="topic" class="message-browser" :class="{ 'is-monitoring': isMonitoring }" data-testid="message-browser">
     <div class="message-browser-header">
       <h4>{{ t("mqMessages.messageList") }}</h4>
-      <button type="button" class="btn-sm" :disabled="loading" @click="loadMessages">
+      <button type="button" class="btn-sm" :disabled="loading || scanning" @click="loadMessages">
         {{ loading ? t("mqMessages.loading") : t("mqMessages.loadMessages") }}
       </button>
     </div>
 
-    <p v-if="isKafka" class="peek-default-hint">
-      <template v-if="kafkaStartPosition === 'latest'">
-        {{ t("mqMessages.kafkaLatestHint") }}
-      </template>
-      <template v-else-if="kafkaStartPosition === 'earliest'">
-        {{ t("mqMessages.kafkaEarliestHint") }}
-      </template>
-      <template v-else>
-        {{ t("mqMessages.kafkaOffsetHint") }}
-      </template>
-    </p>
+    <p v-if="isKafka" class="peek-default-hint">{{ t("mqMessages.kafkaOffsetRangeHint") }}</p>
     <p v-else class="peek-default-hint">{{ t("mqMessages.peekDefaultHint") }}</p>
     <p v-if="incomplete" class="peek-incomplete" role="status" data-testid="peek-incomplete">
       {{ t("mqMessages.peekIncomplete") }}
@@ -207,29 +668,26 @@ watch(kafkaStartPosition, () => {
 
     <div class="peek-controls">
       <label>
-        <span>{{ t("mqMessages.count") }}</span>
-        <input v-model.number="count" data-testid="peek-count" type="number" min="1" max="100" :disabled="loading" />
+        <span>{{ isKafka ? t("mqMessages.pageSize") : t("mqMessages.count") }}</span>
+        <select v-if="isKafka" v-model="pageSizePreset" class="message-browser-page-size" data-testid="peek-page-size-preset" :disabled="loading || scanning">
+          <option value="100">100</option>
+          <option value="500">500</option>
+          <option value="1000">1000</option>
+          <option value="custom">{{ t("mqMessages.customPageSize") }}</option>
+        </select>
+        <input v-if="!isKafka || pageSizePreset === 'custom'" v-model.number="count" data-testid="peek-count" type="number" min="1" :max="isKafka ? 10000 : 100" :disabled="loading || scanning" />
       </label>
-      <label v-if="isKafka && !isMonitoring">
-        <span>{{ t("mqMessages.startPosition") }}</span>
-        <Select v-model="kafkaStartPosition" :disabled="loading">
-          <SelectTrigger data-testid="kafka-peek-start-position" class="message-browser-start-position">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent position="popper" class="message-browser-start-position-content">
-            <SelectItem value="latest">{{ t("mqMessages.kafkaLatest") }}</SelectItem>
-            <SelectItem value="earliest">{{ t("mqMessages.kafkaEarliest") }}</SelectItem>
-            <SelectItem value="offset">{{ t("mqMessages.kafkaOffset") }}</SelectItem>
-          </SelectContent>
-        </Select>
+      <label v-if="isKafka">
+        <span>{{ t("mqMessages.startOffset") }}</span>
+        <input v-model="offset" data-testid="kafka-peek-offset" type="number" min="0" :placeholder="t('mqMessages.offsetPlaceholderEarliest')" :disabled="loading || scanning" />
+      </label>
+      <label v-if="isKafka">
+        <span>{{ t("mqMessages.endOffset") }}</span>
+        <input v-model="endOffset" data-testid="kafka-peek-end-offset" type="number" min="0" :placeholder="t('mqMessages.endOffsetPlaceholder')" :disabled="loading || scanning" />
       </label>
       <label v-if="isKafka">
         <span>{{ t("mqMessages.partition") }}</span>
-        <input v-model="partition" data-testid="kafka-peek-partition" type="number" min="0" :placeholder="t('mqMessages.partitionPlaceholderAll')" :disabled="loading" />
-      </label>
-      <label v-if="isKafkaOffsetMode && !isMonitoring">
-        <span>{{ t("mqMessages.offset") }}</span>
-        <input v-model="offset" data-testid="kafka-peek-offset" type="number" min="0" :placeholder="t('mqMessages.offsetPlaceholderRequired')" :disabled="loading" />
+        <input v-model="partition" data-testid="kafka-peek-partition" type="number" min="0" :placeholder="t('mqMessages.partitionPlaceholderAll')" :disabled="loading || scanning" />
       </label>
     </div>
 
@@ -251,19 +709,23 @@ watch(kafkaStartPosition, () => {
       </div>
     </template>
 
-    <div v-if="isKafka && messages.length" class="message-filter-row" data-testid="kafka-message-filter">
-      <MqSearchInput v-model="messageSearchQuery" :placeholder="t('mqMessages.filterLoadedPlaceholder')" :aria-label="t('mqMessages.filterLoadedPlaceholder')" :disabled="loading" data-testid="kafka-message-filter-input" />
+    <div v-if="isKafka" class="message-filter-row" data-testid="kafka-message-filter">
+      <MqSearchInput v-model="messageSearchQuery" :placeholder="t('mqMessages.filterRangePlaceholder')" :aria-label="t('mqMessages.filterRangePlaceholder')" :disabled="loading || scanning" data-testid="kafka-message-filter-input" />
+      <button type="button" class="btn-sm" data-testid="kafka-scan-range" :disabled="loading || scanning" @click="searchKafkaRange">
+        {{ scanning ? t("mqMessages.scanning") : t("mqMessages.scanRange") }}
+      </button>
       <span class="mq-result-count" data-testid="kafka-message-filter-count" aria-live="polite">
-        {{ t("mqMessages.filterLoadedCount", { matched: filteredMessages.length, loaded: messages.length }) }}
+        {{ scanStatus || t("mqMessages.filterLoadedCount", { matched: filteredMessages.length, loaded: messages.length }) }}
       </span>
     </div>
 
     <div v-if="error" class="panel-error">{{ error }}</div>
-    <div v-else-if="loading" class="message-empty">{{ t("mqMessages.messagesLoading") }}</div>
+    <div v-else-if="loading || scanning" class="message-empty">{{ scanStatus || (scanning ? t("mqMessages.scanning") : t("mqMessages.messagesLoading")) }}</div>
+    <div v-else-if="!displayMessages.length && normalizedMessageSearchQuery" class="message-empty" data-testid="kafka-message-filter-empty">{{ t("mqMessages.noMatchingMessages") }}</div>
     <div v-else-if="!messages.length" class="message-empty">{{ t("mqMessages.noMessages") }}</div>
-    <div v-else-if="!filteredMessages.length" class="message-empty" data-testid="kafka-message-filter-empty">{{ t("mqMessages.noMatchingMessages") }}</div>
+    <div v-else-if="!displayMessages.length" class="message-empty" data-testid="kafka-message-filter-empty">{{ t("mqMessages.noMatchingMessages") }}</div>
     <div v-else class="message-list">
-      <article v-for="message in filteredMessages" :key="`${message.properties?.partition ?? 'p'}-${message.messageId || message.position}`" class="message-row">
+      <article v-for="message in displayMessages" :key="`${message.properties?.partition ?? 'p'}-${message.messageId || message.position}`" class="message-row">
         <div class="message-meta">
           <span>#{{ message.position }}</span>
           <span v-if="message.properties?.partition != null">{{ t("mqMessages.metaPartition", { partition: message.properties.partition }) }}</span>
@@ -294,6 +756,18 @@ watch(kafkaStartPosition, () => {
           </div>
         </div>
       </article>
+    </div>
+    <div v-if="isKafka" class="message-list-actions">
+      <button type="button" class="btn-sm" data-testid="previous-page-messages" :disabled="!canGoPreviousPage" @click="goToPreviousPage">
+        {{ t("mqMessages.previousPage") }}
+      </button>
+      <span class="mq-result-count" data-testid="kafka-current-page">{{ t("mqMessages.currentPage", { page: currentPage }) }}</span>
+      <button type="button" class="btn-sm" data-testid="next-page-messages" :disabled="!canGoNextPage" @click="goToNextPage">
+        {{ t("mqMessages.nextPage") }}
+      </button>
+      <span v-if="currentRange" class="mq-result-count">
+        {{ t("mqMessages.currentOffsetRange", { start: currentRange.pageStart, end: currentRange.pageEnd }) }}
+      </span>
     </div>
   </section>
 </template>
@@ -410,6 +884,19 @@ watch(kafkaStartPosition, () => {
 .message-filter-row :deep(.mq-search-input) {
   width: min(420px, 100%);
   flex: 1;
+}
+
+.message-list-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.message-list-actions .mq-result-count {
+  color: var(--color-text-tertiary);
+  font-size: 12px;
 }
 
 .collapse-toggle {

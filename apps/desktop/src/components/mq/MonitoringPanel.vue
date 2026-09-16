@@ -617,7 +617,14 @@ onUnmounted(() => {
         <div class="monitoring-message-heading">
           <button type="button" class="btn-sm" @click="emit('navigate-tab', { tab: 'messages', topic })">{{ t("mqMessages.queryTitle") }}</button>
         </div>
-        <MessageBrowser :connection-id="connectionId" :topic="getTopicRef()" mq-system-kind="kafka" appearance="monitoring" />
+        <MessageBrowser
+          :connection-id="connectionId"
+          :topic="getTopicRef()"
+          :kafka-partitions="kafkaPartitionRows.map((row) => row.partition)"
+          :kafka-partition-ranges="kafkaPartitionRows.map((row) => ({ partition: row.partition, beginOffset: row.beginOffset, endOffset: row.endOffset }))"
+          mq-system-kind="kafka"
+          appearance="monitoring"
+        />
       </div>
     </div>
 
