@@ -896,6 +896,32 @@ class KafkaAgentTest {
     }
 
     @Test
+    void lastReturnedOffsetByPartitionUsesTheHighestOffsetPerPartition() {
+        var messages = new java.util.ArrayList<Map<String, Object>>();
+        messages.add(Map.of("partition", 0, "offset", 5L));
+        messages.add(Map.of("partition", 0, "offset", 7L));
+        messages.add(Map.of("partition", 1, "offset", 2L));
+
+        Map<Integer, Long> lastReturnedOffsets = KafkaAgent.lastReturnedOffsetByPartition(messages);
+
+        assertEquals(7L, lastReturnedOffsets.get(0));
+        assertEquals(2L, lastReturnedOffsets.get(1));
+    }
+
+    @Test
+    void lastReturnedOffsetByPartitionIgnoresRecordsWithoutAValidPosition() {
+        var messages = new java.util.ArrayList<Map<String, Object>>();
+        messages.add(Map.of("partition", 0, "offset", 9L));
+        messages.add(Map.of("partition", 0, "offset", -1L));
+        messages.add(Map.of("partition", -1, "offset", 9L));
+        messages.add(Map.of("partition", 0));
+
+        Map<Integer, Long> lastReturnedOffsets = KafkaAgent.lastReturnedOffsetByPartition(messages);
+
+        assertEquals(Map.of(0, 9L), lastReturnedOffsets);
+    }
+
+    @Test
     void readSessionCloseHandlerIsIdempotent() {
         for (int id = 4; id <= 5; id++) {
             String response = KafkaAgent.handleRequest("""

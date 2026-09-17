@@ -1732,6 +1732,21 @@ public final class KafkaAgent {
         List<Map<String, Object>> messages,
         List<TopicPartition> partitions
     ) {
+        Map<Integer, Long> lastReturnedAffectedPosition = lastReturnedOffsetByPartition(messages);
+        for (TopicPartition tp : partitions) {
+            Long lastReturned = lastReturnedAffectedPosition.get(tp.partition());
+            if (lastReturned != null) {
+                consumer.seek(tp, lastReturned + 1);
+            }
+        }
+    }
+
+    /**
+     * The maximum offset actually returned to the caller for each partition. Rewinding
+     * a partition to (last returned offset + 1) resumes exactly at the first unreturned
+     * record even when poll() advanced the position past the whole fetched batch.
+     */
+    static Map<Integer, Long> lastReturnedOffsetByPartition(List<Map<String, Object>> messages) {
         Map<Integer, Long> lastReturnedOffsetByPartition = new HashMap<>();
         for (Map<String, Object> message : messages) {
             int partition = ((Number) message.getOrDefault("partition", -1)).intValue();
@@ -1745,12 +1760,7 @@ public final class KafkaAgent {
                 (current, candidate) -> Math.max(current, candidate)
             );
         }
-        for (TopicPartition tp : partitions) {
-            Long lastReturned = lastReturnedOffsetByPartition.get(tp.partition());
-            if (lastReturned != null) {
-                consumer.seek(tp, lastReturned + 1);
-            }
-        }
+        return lastReturnedOffsetByPartition;
     }
 
     private static JsonObject requireActiveConnection() {
