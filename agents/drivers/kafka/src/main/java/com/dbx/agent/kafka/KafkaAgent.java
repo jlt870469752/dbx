@@ -1709,6 +1709,7 @@ public final class KafkaAgent {
             deadlineNs,
             pollTimeout
         );
+        rewindToReturnedMessages(consumer, collection.messages, partitions);
         Map<String, Object> result = peekMessagesResult(
             sortAndLimitPeekedMessages(collection.messages, count, PeekStartPosition.OFFSET),
             collection.incomplete
@@ -1718,6 +1719,38 @@ public final class KafkaAgent {
             allPeekPartitionsCaughtUp(partitions, currentPeekPositions(consumer, partitions), endOffsets)
         );
         return result;
+    }
+
+    /**
+     * Kafka poll() advances the consumer position past every record in the fetched
+     * batch, even when max.poll.records truncates what is returned to the collector.
+     * On the next session batch that over-advanced position would silently skip the
+     * un-returned records, so re-seek each partition to the first un-returned offset.
+     */
+    private static void rewindToReturnedMessages(
+        KafkaConsumer<String, byte[]> consumer,
+        List<Map<String, Object>> messages,
+        List<TopicPartition> partitions
+    ) {
+        Map<Integer, Long> lastReturnedOffsetByPartition = new HashMap<>();
+        for (Map<String, Object> message : messages) {
+            int partition = ((Number) message.getOrDefault("partition", -1)).intValue();
+            long offset = ((Number) message.getOrDefault("offset", -1L)).longValue();
+            if (partition < 0 || offset < 0) {
+                continue;
+            }
+            lastReturnedOffsetByPartition.merge(
+                partition,
+                offset,
+                (current, candidate) -> Math.max(current, candidate)
+            );
+        }
+        for (TopicPartition tp : partitions) {
+            Long lastReturned = lastReturnedOffsetByPartition.get(tp.partition());
+            if (lastReturned != null) {
+                consumer.seek(tp, lastReturned + 1);
+            }
+        }
     }
 
     private static JsonObject requireActiveConnection() {
