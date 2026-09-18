@@ -51,6 +51,20 @@ describe("QueryEditor auto focus wiring", () => {
   it("restores focus when the active query tab changes", () => {
     expect(queryEditorSource).toMatch(/if \(tabId !== prevTabId\) \{[\s\S]*?activateTabDocument\(prevTabId, tabId, val\);[\s\S]*?if \(props\.autoFocus\) restoreEditorFocus\(\);/);
   });
+
+  it("keeps table WHERE focus separate from current-view search", () => {
+    expect(contentAreaSource).toMatch(/function focusTableWhere\(\): boolean \{[\s\S]*props\.activeTab\.mode !== "data"[\s\S]*dataGridRef\.value\?\.focusWhere\(\)/);
+    expect(contentAreaSource).not.toMatch(/function focusSearch\(\): boolean \{[\s\S]*props\.activeTab\.mode === "data" && dataGridRef\.value\?\.focusWhere\(\)/);
+  });
+
+  it("routes contextual search into MQ, MQTT, and Nacos consoles", () => {
+    expect(contentAreaSource).toContain('props.activeTab.mode === "mq"');
+    expect(contentAreaSource).toContain('props.activeTab.mode === "mqtt"');
+    expect(contentAreaSource).toContain('props.activeTab.mode === "nacos"');
+    expect(contentAreaSource).toContain('ref="mqAdminConsoleRef"');
+    expect(contentAreaSource).toContain('ref="mqttAdminConsoleRef"');
+    expect(contentAreaSource).toContain('ref="nacosAdminConsoleRef"');
+  });
 });
 
 describe("QueryEditor toolbar focus", () => {

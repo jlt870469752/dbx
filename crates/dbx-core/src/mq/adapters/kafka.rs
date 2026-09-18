@@ -336,6 +336,48 @@ impl MessageQueueAdmin for KafkaAdmin {
         Ok(peek_messages_result_from_agent(&result))
     }
 
+    async fn peek_messages_range(
+        &self,
+        topic: &TopicRef,
+        _sub: &str,
+        partition: Option<i32>,
+        start_offset: i64,
+        end_offset: i64,
+        count: u32,
+    ) -> Result<PeekMessagesResult, String> {
+        let params = read_range_params(&self.config, topic, partition, start_offset, end_offset, count);
+        let result: serde_json::Value = self.call_with_agent_timeout("mq_peek_range", params).await?;
+        Ok(peek_messages_result_from_agent(&result))
+    }
+
+    async fn start_read_session(
+        &self,
+        topic: &TopicRef,
+        _sub: &str,
+        partition: Option<i32>,
+        start_offset: i64,
+        end_offset: i64,
+        count: u32,
+    ) -> Result<ReadSessionBatchResult, String> {
+        let params = read_range_params(&self.config, topic, partition, start_offset, end_offset, count);
+        let result: serde_json::Value = self.call_with_agent_timeout("mq_start_read_session", params).await?;
+        Ok(read_session_batch_from_agent(&result))
+    }
+
+    async fn read_session_next(&self, session_id: &str, count: u32) -> Result<ReadSessionBatchResult, String> {
+        let result: serde_json::Value = self
+            .call_with_agent_timeout(
+                "mq_read_session_next",
+                serde_json::json!({ "sessionId": session_id, "count": count }),
+            )
+            .await?;
+        Ok(read_session_batch_from_agent(&result))
+    }
+
+    async fn close_read_session(&self, session_id: &str) -> Result<(), String> {
+        self.call_ok("mq_close_read_session", serde_json::json!({ "sessionId": session_id })).await
+    }
+
     async fn expire_messages(&self, _topic: &TopicRef, _sub: &str, _expire_seconds: i64) -> Result<(), String> {
         Err("Kafka does not support expiring messages on a subscription".to_string())
     }
@@ -677,6 +719,30 @@ fn peek_messages_params(
     if let Some(offset) = options.offset {
         params["offset"] = serde_json::json!(offset);
     }
+    if let Some(end_offset) = options.end_offset {
+        params["endOffset"] = serde_json::json!(end_offset);
+    }
+    params
+}
+
+fn read_range_params(
+    cfg: &MqAdminConfig,
+    topic: &TopicRef,
+    partition: Option<i32>,
+    start_offset: i64,
+    end_offset: i64,
+    count: u32,
+) -> serde_json::Value {
+    let mut params = serde_json::json!({
+        "topic": topic.topic,
+        "count": count,
+        "startOffset": start_offset,
+        "endOffset": end_offset,
+        "connection": build_connection_params(cfg),
+    });
+    if let Some(partition) = partition {
+        params["partition"] = serde_json::json!(partition);
+    }
     params
 }
 
@@ -717,6 +783,16 @@ fn peek_messages_result_from_agent(result: &serde_json::Value) -> PeekMessagesRe
         })
         .collect();
     PeekMessagesResult { messages, incomplete }
+}
+
+fn read_session_batch_from_agent(result: &serde_json::Value) -> ReadSessionBatchResult {
+    let parsed = peek_messages_result_from_agent(result);
+    ReadSessionBatchResult {
+        messages: parsed.messages,
+        incomplete: parsed.incomplete,
+        session_id: result.get("sessionId").and_then(|v| v.as_str()).map(String::from),
+        done: result.get("done").and_then(|v| v.as_bool()).unwrap_or(false),
+    }
 }
 
 fn reset_cursor_params(topic: &TopicRef, sub: &str, pos: ResetPosition) -> Result<serde_json::Value, String> {
@@ -889,6 +965,7 @@ mod tests {
                 start_position: Some(PeekStartPosition::Offset),
                 partition: Some(2),
                 offset: Some(17),
+                end_offset: Some(37),
             },
         );
 
@@ -897,6 +974,7 @@ mod tests {
         assert_eq!(params.get("startPosition").and_then(|value| value.as_str()), Some("offset"));
         assert_eq!(params.get("partition").and_then(|value| value.as_i64()), Some(2));
         assert_eq!(params.get("offset").and_then(|value| value.as_i64()), Some(17));
+        assert_eq!(params.get("endOffset").and_then(|value| value.as_i64()), Some(37));
     }
 
     #[test]
@@ -970,7 +1048,7 @@ mod tests {
             &cfg,
             &topic_ref(),
             20,
-            PeekMessagesOptions { start_position: None, partition: None, offset: Some(17) },
+            PeekMessagesOptions { start_position: None, partition: None, offset: Some(17), end_offset: None },
         );
 
         assert!(params.get("startPosition").is_none());

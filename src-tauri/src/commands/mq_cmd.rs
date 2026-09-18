@@ -376,6 +376,73 @@ pub async fn mq_peek_messages(
 }
 
 #[tauri::command]
+pub async fn mq_peek_messages_range(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    topic: dbx_core::mq::TopicRef,
+    sub: String,
+    partition: Option<i32>,
+    start_offset: i64,
+    end_offset: i64,
+    count: u32,
+) -> Result<dbx_core::mq::PeekMessagesResult, String> {
+    dbx_core::mq::service::mq_peek_messages_range_core(
+        &state,
+        &connection_id,
+        topic,
+        sub,
+        partition,
+        start_offset,
+        end_offset,
+        count,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn mq_start_read_session(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    topic: dbx_core::mq::TopicRef,
+    sub: String,
+    partition: Option<i32>,
+    start_offset: i64,
+    end_offset: i64,
+    count: u32,
+) -> Result<dbx_core::mq::ReadSessionBatchResult, String> {
+    dbx_core::mq::service::mq_start_read_session_core(
+        &state,
+        &connection_id,
+        topic,
+        sub,
+        partition,
+        start_offset,
+        end_offset,
+        count,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn mq_read_session_next(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    session_id: String,
+    count: u32,
+) -> Result<dbx_core::mq::ReadSessionBatchResult, String> {
+    dbx_core::mq::service::mq_read_session_next_core(&state, &connection_id, session_id, count).await
+}
+
+#[tauri::command]
+pub async fn mq_close_read_session(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    session_id: String,
+) -> Result<(), String> {
+    dbx_core::mq::service::mq_close_read_session_core(&state, &connection_id, session_id).await
+}
+
+#[tauri::command]
 pub async fn mq_expire_messages(
     state: State<'_, Arc<AppState>>,
     connection_id: String,

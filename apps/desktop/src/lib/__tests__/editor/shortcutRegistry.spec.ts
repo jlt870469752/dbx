@@ -77,7 +77,7 @@ describe("shortcutRegistry editor actions", () => {
     const shortcuts = normalizeShortcutSettings({ goToFirstPage: "Alt+F1", goToPreviousPage: "Alt+F1" });
 
     expect(findShortcutConflict("goToFirstPage", shortcuts.goToFirstPage, shortcuts)).toBe("goToPreviousPage");
-    expect(findShortcutConflict("goToFirstPage", "Mod+F", shortcuts)).toBeNull();
+    expect(findShortcutConflict("goToFirstPage", "Mod+F", shortcuts)).toBe("focusTableWhere");
   });
 
   it("registers go to column as an unassigned grid shortcut", () => {
@@ -102,7 +102,7 @@ describe("shortcutRegistry editor actions", () => {
     const shortcuts = normalizeShortcutSettings({ goToColumn: "Mod+D" });
 
     expect(findShortcutConflict("goToColumn", shortcuts.goToColumn, shortcuts)).toBe("copyCurrentRow");
-    expect(findShortcutConflict("goToColumn", "Mod+F", shortcuts)).toBeNull();
+    expect(findShortcutConflict("goToColumn", "Mod+F", shortcuts)).toBe("focusTableWhere");
   });
 
   it("registers copy-current-row Mod+D and edit-table-structure Mod+Shift+D as conflict-free grid defaults", () => {
@@ -164,12 +164,12 @@ describe("shortcutRegistry editor actions", () => {
     expect(findShortcutConflict("explainSql", "Mod+E", DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
   });
 
-  it("keeps current-view search and editor find contextual on Mod+F", () => {
+  it("keeps current-view search and editor find contextual on Shift+Mod+F", () => {
     const focusSearch = SHORTCUT_DEFINITIONS.find((item) => item.id === "focusSearch");
     const find = SHORTCUT_DEFINITIONS.find((item) => item.id === "find");
 
-    expect(focusSearch).toMatchObject({ scope: "global", defaultShortcut: "Mod+F" });
-    expect(find).toMatchObject({ scope: "editor", defaultShortcut: "Mod+F" });
+    expect(focusSearch).toMatchObject({ scope: "global", defaultShortcut: "Shift+Mod+F" });
+    expect(find).toMatchObject({ scope: "editor", defaultShortcut: "Shift+Mod+F" });
     expect(findShortcutConflict("focusSearch", DEFAULT_SHORTCUT_SETTINGS.focusSearch, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
     expect(findShortcutConflict("find", DEFAULT_SHORTCUT_SETTINGS.find, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
   });
@@ -191,6 +191,26 @@ describe("shortcutRegistry editor actions", () => {
     expect(normalizeShortcutSettings({ toggleAiPanel: "Ctrl+Alt+I" }, "MacIntel").toggleAiPanel).toBe("Ctrl+Mod+I");
     expect(normalizeShortcutSettings({ toggleAiPanel: "Ctrl+Mod+I" }, "Win32").toggleAiPanel).toBe("Ctrl+Alt+I");
     expect(findShortcutConflict("toggleAiPanel", normalizeShortcutSettings().toggleAiPanel, normalizeShortcutSettings())).toBeNull();
+  });
+
+  it("uses Mod+F as a dedicated table WHERE shortcut", () => {
+    const focusTableWhere = SHORTCUT_DEFINITIONS.find((item) => item.id === "focusTableWhere");
+
+    expect(focusTableWhere).toMatchObject({ scope: "grid", defaultShortcut: "Mod+F" });
+    expect(DEFAULT_SHORTCUT_SETTINGS.focusTableWhere).toBe("Mod+F");
+    expect(findShortcutConflict("focusTableWhere", DEFAULT_SHORTCUT_SETTINGS.focusTableWhere, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
+  it("migrates the previous search, find, and format defaults", () => {
+    const shortcuts = normalizeShortcutSettings({
+      focusSearch: "Mod+F",
+      find: "Mod+F",
+      formatSql: "Shift+Mod+F",
+    });
+
+    expect(shortcuts.focusSearch).toBe("Shift+Mod+F");
+    expect(shortcuts.find).toBe("Shift+Mod+F");
+    expect(shortcuts.formatSql).toBe("Mod+Alt+L");
   });
 
   it("uses Shift+Enter for inserting a complete line below", () => {
@@ -256,7 +276,7 @@ describe("shortcutRegistry editor actions", () => {
     const shortcuts = normalizeShortcutSettings({ executeSql: "Mod+Shift+Enter" });
 
     expect(shortcuts.executeSql).toBe("Mod+Shift+Enter");
-    expect(shortcuts.formatSql).toBe("Shift+Mod+F");
+    expect(shortcuts.formatSql).toBe("Mod+Alt+L");
     expect(shortcuts.toggleLineComment).toBe("Mod+/");
     expect(shortcuts.toggleBlockComment).toBe("Shift+Alt+A");
     expect(shortcuts.indentMore).toBe("");
@@ -323,7 +343,7 @@ describe("shortcutRegistry editor actions", () => {
   });
 
   it("detects conflicts between formatter editor shortcuts and other editor shortcuts", () => {
-    const shortcuts = normalizeShortcutSettings({ duplicateLine: "Mod+F" });
+    const shortcuts = normalizeShortcutSettings({ duplicateLine: "Shift+Mod+F" });
 
     expect(findShortcutConflict("duplicateLine", shortcuts.duplicateLine, shortcuts)).toBe("find");
   });
@@ -397,36 +417,34 @@ describe("shortcutRegistry editor actions", () => {
     expect(normalizeShortcutSettings({ replace: "Alt+Mod+H" }, "MacIntel").replace).toBe("Mod+R");
     // eventToShortcut 记录的 ⌥⌘H 是 Mod+Alt+H，两个顺序都必须修复到平台默认值。
     expect(normalizeShortcutSettings({ replace: "Mod+Alt+H" }, "MacIntel").replace).toBe("Mod+R");
-    expect(normalizeShortcutSettings({ find: "Mod+H" }, "MacIntel").find).toBe("Mod+F");
+    expect(normalizeShortcutSettings({ find: "Mod+H" }, "MacIntel").find).toBe("Shift+Mod+F");
     // ⌃H 不是保留键：手工编辑或同步进来的 ⌃H 绑定原样保留，绝不修复。
     expect(normalizeShortcutSettings({ replace: "Ctrl+H" }, "MacIntel").replace).toBe("Ctrl+H");
     // 未保留的 Shift+Mod+H 原样保留，其他动作的默认值不受影响。
     expect(normalizeShortcutSettings({ replace: "Shift+Mod+H" }, "MacIntel").replace).toBe("Shift+Mod+H");
     expect(normalizeShortcutSettings({ replace: "Mod+R" }, "MacIntel").replace).toBe("Mod+R");
-    expect(normalizeShortcutSettings({ replace: "Mod+H" }, "MacIntel").find).toBe("Mod+F");
+    expect(normalizeShortcutSettings({ replace: "Mod+H" }, "MacIntel").find).toBe("Shift+Mod+F");
     // Windows/Linux 上 Mod+H = Ctrl+H 必须原样保留（正常的替换键）。
     expect(normalizeShortcutSettings({ replace: "Mod+H" }, "Win32").replace).toBe("Mod+H");
     expect(normalizeShortcutSettings({ replace: "Mod+H" }, "Linux x86_64").replace).toBe("Mod+H");
   });
 
   it("clears a reserved-key repair when the platform default is already occupied by an explicit config", () => {
-    // find 的平台默认值是 Mod+F。若用户把 formatSql 显式配置为 Mod+F、而 find 又被
-    // 云同步/旧配置带入 macOS 保留键 ⌘H，修复会把 find 还原成 Mod+F，恰好抢占
-    // formatSql——QueryEditor.vue 的 keymap 里 find 绑定注册在 formatSql 之前，
-    // 先匹配先执行，formatSql 就永远不可达了。用户显式配置必须赢，因此被占用的
-    // 修复动作只能清空（"" = 未绑定），而不是把默认值强加回去。
-    const findOccupied = normalizeShortcutSettings({ find: "Mod+H", formatSql: "Mod+F" }, "MacIntel");
-    expect(findOccupied.find).toBe("");
-    expect(findOccupied.formatSql).toBe("Mod+F");
+    // find 的平台默认值是 Shift+Mod+F；格式化的旧默认 Shift+Mod+F 会被迁移走，
+    // 因此 find 的“占用即清空”场景由 replace（平台默认 Mod+R）覆盖。find 在
+    // 未被占用时修复到平台默认值 Shift+Mod+F。
+    const findOccupied = normalizeShortcutSettings({ find: "Mod+H", formatSql: "Shift+Mod+F" }, "MacIntel");
+    expect(findOccupied.find).toBe("Shift+Mod+F");
+    expect(findOccupied.formatSql).toBe("Mod+Alt+L");
     // 同理由 replace 的平台默认值 Mod+R 与显式配置的 formatSql 冲突时清空 replace。
     const replaceOccupied = normalizeShortcutSettings({ replace: "Mod+H", formatSql: "Mod+R" }, "MacIntel");
     expect(replaceOccupied.replace).toBe("");
     expect(replaceOccupied.formatSql).toBe("Mod+R");
     // 无占用时仍按原逻辑修复到平台默认值。
     expect(normalizeShortcutSettings({ replace: "Mod+H" }, "MacIntel").replace).toBe("Mod+R");
-    expect(normalizeShortcutSettings({ find: "Mod+H" }, "MacIntel").find).toBe("Mod+F");
+    expect(normalizeShortcutSettings({ find: "Mod+H" }, "MacIntel").find).toBe("Shift+Mod+F");
     // 占用者仅来自默认（未显式配置）时不清空；⌃H 不是保留键，也原样保留。
-    expect(normalizeShortcutSettings({ find: "Mod+H", replace: "Ctrl+H" }, "MacIntel").find).toBe("Mod+F");
+    expect(normalizeShortcutSettings({ find: "Mod+H", replace: "Ctrl+H" }, "MacIntel").find).toBe("Shift+Mod+F");
     expect(normalizeShortcutSettings({ replace: "Ctrl+H" }, "MacIntel").replace).toBe("Ctrl+H");
     // 非 mac 平台 Mod+H = Ctrl+H 不是保留键，原样保留且不触发清空。
     const windows = normalizeShortcutSettings({ find: "Mod+H", formatSql: "Mod+F" }, "Win32");

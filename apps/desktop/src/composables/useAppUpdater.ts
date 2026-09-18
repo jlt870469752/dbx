@@ -88,6 +88,7 @@ export function isNewerRemoteVersion(latest: string, cached: string): boolean {
 export function normalizeUpdateDownloadSource(value: unknown): SettingsUpdateDownloadSource {
   // Old persisted AtomGit preferences should retain their mainland mirror behavior.
   if (value === "atomgit") return "cnb";
+  if (value === "myfork") return "myfork";
   return value === "cnb" ? "cnb" : "official";
 }
 
@@ -102,6 +103,9 @@ export function resolveUpdateReleaseUrl(info: api.UpdateInfo | null, source: unk
     return `https://cnb.cool/dbxio.com/dbx/-/releases/tag/${tagVersion(info.latest_version)}`;
   }
   if (normalizedSource === "cnb") return "https://cnb.cool/dbxio.com/dbx/-/releases";
+  if (normalizedSource === "myfork" && info?.latest_version) {
+    return `https://github.com/jlt870469752/dbx/releases/tag/${tagVersion(info.latest_version)}`;
+  }
   return info?.release_url || fallbackUrl;
 }
 

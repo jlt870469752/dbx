@@ -139,7 +139,13 @@ watch(selectedTopic, (topic) => emit("topicSelected", topic));
         </div>
       </section>
 
-      <MessageBrowser :connection-id="connectionId" :topic="selectedTopicRef" mq-system-kind="kafka" />
+      <MessageBrowser
+        :connection-id="connectionId"
+        :topic="selectedTopicRef"
+        :kafka-partitions="partitionRows.map((row) => row.partition)"
+        :kafka-partition-ranges="partitionRows.map((row) => ({ partition: row.partition, beginOffset: row.beginOffset, endOffset: row.endOffset }))"
+        mq-system-kind="kafka"
+      />
       <SendMessagePanel v-if="canSendMessage && selectedTopic" :connection-id="connectionId" :tenant="tenant" :namespace="namespace" :topic="selectedTopic" :read-only="readOnly" mq-system-kind="kafka" is-flat-mq-cluster :supports-peek-messages="false" fixed-topic embedded />
     </div>
   </div>
@@ -158,6 +164,12 @@ watch(selectedTopic, (topic) => emit("topicSelected", topic));
 .kafka-messages-panel {
   height: 100%;
   min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 16px;
+}
+
+.kafka-messages-content {
   box-sizing: border-box;
   overflow: hidden;
   padding: 16px;
@@ -175,6 +187,7 @@ watch(selectedTopic, (topic) => emit("topicSelected", topic));
 
 .kafka-topic-section,
 .partition-overview {
+  flex-shrink: 0;
   padding: 14px;
   border: 1px solid var(--color-border);
   border-radius: var(--dbx-radius-fixed-6);

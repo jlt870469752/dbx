@@ -579,6 +579,7 @@ const editDataGridCellDetailButtonVisible = ref(settingsStore.editorSettings.dat
 const editDataGridCrosshairHighlight = ref(settingsStore.editorSettings.dataGridCrosshairHighlight);
 const editPageSize = ref(settingsStore.editorSettings.pageSize);
 const editTableOpenPageSize = ref(settingsStore.editorSettings.tableOpenPageSize);
+const editKafkaUseReadSession = ref(settingsStore.editorSettings.kafkaUseReadSession);
 const editQueryResultMaxRowsEnabled = ref(settingsStore.editorSettings.queryResultMaxRowsEnabled);
 const editQueryResultMaxRows = ref(settingsStore.editorSettings.queryResultMaxRows);
 const editExternalSqlEditorMaxMb = ref(settingsStore.editorSettings.externalSqlEditorMaxMb);
@@ -887,6 +888,7 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     dataGridShowWhitespace: editDataGridShowWhitespace.value,
     pageSize: editPageSize.value,
     tableOpenPageSize: editTableOpenPageSize.value,
+    kafkaUseReadSession: editKafkaUseReadSession.value,
     queryResultMaxRowsEnabled: editQueryResultMaxRowsEnabled.value,
     queryResultMaxRows: editQueryResultMaxRows.value,
     externalSqlEditorMaxMb: editExternalSqlEditorMaxMb.value,
@@ -1516,6 +1518,7 @@ function syncEditorSettingsDraftFromStore() {
   editDataGridShowWhitespace.value = settingsStore.editorSettings.dataGridShowWhitespace;
   editPageSize.value = settingsStore.editorSettings.pageSize;
   editTableOpenPageSize.value = settingsStore.editorSettings.tableOpenPageSize;
+  editKafkaUseReadSession.value = settingsStore.editorSettings.kafkaUseReadSession;
   editQueryResultMaxRowsEnabled.value = settingsStore.editorSettings.queryResultMaxRowsEnabled;
   editQueryResultMaxRows.value = settingsStore.editorSettings.queryResultMaxRows;
   editExternalSqlEditorMaxMb.value = settingsStore.editorSettings.externalSqlEditorMaxMb;
@@ -2118,6 +2121,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editDataGridShowWhitespace.value = DEFAULT_EDITOR_SETTINGS.dataGridShowWhitespace;
     editPageSize.value = DEFAULT_EDITOR_SETTINGS.pageSize;
     editTableOpenPageSize.value = DEFAULT_EDITOR_SETTINGS.tableOpenPageSize;
+    editKafkaUseReadSession.value = DEFAULT_EDITOR_SETTINGS.kafkaUseReadSession;
     editQueryResultMaxRowsEnabled.value = DEFAULT_EDITOR_SETTINGS.queryResultMaxRowsEnabled;
     editQueryResultMaxRows.value = DEFAULT_EDITOR_SETTINGS.queryResultMaxRows;
     editInfiniteScroll.value = DEFAULT_EDITOR_SETTINGS.infiniteScroll;
@@ -2212,6 +2216,7 @@ function resetAllDefaults() {
   editDataGridShowWhitespace.value = DEFAULT_EDITOR_SETTINGS.dataGridShowWhitespace;
   editPageSize.value = DEFAULT_EDITOR_SETTINGS.pageSize;
   editTableOpenPageSize.value = DEFAULT_EDITOR_SETTINGS.tableOpenPageSize;
+  editKafkaUseReadSession.value = DEFAULT_EDITOR_SETTINGS.kafkaUseReadSession;
   editQueryResultMaxRowsEnabled.value = DEFAULT_EDITOR_SETTINGS.queryResultMaxRowsEnabled;
   editQueryResultMaxRows.value = DEFAULT_EDITOR_SETTINGS.queryResultMaxRows;
   editExternalSqlEditorMaxMb.value = DEFAULT_EDITOR_SETTINGS.externalSqlEditorMaxMb;
@@ -2493,7 +2498,7 @@ function onUiScaleChange(value: unknown) {
 }
 
 function onUpdateDownloadSourceChange(v: any) {
-  if (v === "official" || v === "cnb") editUpdateDownloadSource.value = v;
+  if (v === "official" || v === "cnb" || v === "myfork") editUpdateDownloadSource.value = v;
 }
 
 function setSidebarObjectDisplay(value: "grouped" | "simple") {
@@ -7359,6 +7364,17 @@ onUnmounted(() => {
                 </div>
                 <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
+                    <Label for="kafka-use-read-session">
+                      {{ t("settings.kafkaUseReadSession") }}
+                    </Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.kafkaUseReadSessionDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="kafka-use-read-session" v-model="editKafkaUseReadSession" />
+                </div>
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
                     <Label for="query-result-max-rows-enabled">
                       {{ t("settings.queryResultMaxRows") }}
                     </Label>
@@ -9915,6 +9931,7 @@ LIMIT 100;</pre
                     <SelectContent>
                       <SelectItem value="official">{{ t("settings.updateDownloadSourceOfficial") }}</SelectItem>
                       <SelectItem value="cnb">{{ t("settings.updateDownloadSourceCnb") }}</SelectItem>
+                      <SelectItem value="myfork">{{ t("settings.updateDownloadSourceMyfork") }}</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>

@@ -41,8 +41,9 @@ public final class KafkaAgent {
     private static final PrintStream JSON_RPC_OUT = System.out;
     private static final Gson GSON = new GsonBuilder().serializeNulls().create();
     private static final int DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
-    private static final int MAX_PEEK_MESSAGE_COUNT = 100;
+    private static final int MAX_PEEK_MESSAGE_COUNT = 1_000;
     private static final int MAX_PEEK_SCAN_RECORDS = 1_000;
+    private static final long READ_SESSION_IDLE_TIMEOUT_MS = 60_000L;
     private static final int DEFAULT_SESSION_TIMEOUT_MS = 30_000;
     private static final int DEFAULT_ZOOKEEPER_CONNECTION_TIMEOUT_MS = 10_000;
     private static final String ZOOKEEPER_PROPERTY_PREFIX = "zookeeper.";
@@ -62,6 +63,7 @@ public final class KafkaAgent {
     private static AdminClient adminClient;
     private static KafkaProducer<String, byte[]> producer;
     private static JsonObject activeConnection;
+    private static final Map<String, ReadSession> readSessions = new LinkedHashMap<>();
     private static volatile boolean shutdownRequested;
 
     private KafkaAgent() {}
@@ -129,7 +131,8 @@ public final class KafkaAgent {
         return GSON.toJson(response);
     }
 
-    private static Object dispatch(String method, JsonObject params) throws Exception {
+    static Object dispatch(String method, JsonObject params) throws Exception {
+        cleanupReadSessions();
         return switch (method) {
             case "handshake" -> handshakeResult();
             case "connect" -> connect(params);
@@ -153,6 +156,10 @@ public final class KafkaAgent {
             case "mq_list_producers" -> listProducers(params);
             // Messages
             case "mq_peek_messages" -> peekMessages(params);
+            case "mq_peek_range" -> peekRange(params);
+            case "mq_start_read_session" -> startReadSession(params);
+            case "mq_read_session_next" -> readSessionNext(params);
+            case "mq_close_read_session" -> closeReadSession(params);
             case "mq_send_message" -> sendMessage(params);
             // ACLs
             case "mq_list_acls" -> listAcls(params);
@@ -260,6 +267,7 @@ public final class KafkaAgent {
     }
 
     private static void closeClients() {
+        closeReadSessions();
         if (adminClient != null) {
             adminClient.close(Duration.ofSeconds(5));
             adminClient = null;
@@ -270,6 +278,25 @@ public final class KafkaAgent {
         }
         activeConnection = null;
         restoreKerberosSystemProperties(BASELINE_KERBEROS_SYSTEM_PROPERTIES);
+    }
+
+    private static void cleanupReadSessions() {
+        long now = System.currentTimeMillis();
+        Iterator<Map.Entry<String, ReadSession>> iterator = readSessions.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<String, ReadSession> entry = iterator.next();
+            if (now - entry.getValue().lastAccessMs > READ_SESSION_IDLE_TIMEOUT_MS) {
+                entry.getValue().close();
+                iterator.remove();
+            }
+        }
+    }
+
+    private static void closeReadSessions() {
+        for (ReadSession session : readSessions.values()) {
+            session.close();
+        }
+        readSessions.clear();
     }
 
     // -----------------------------------------------------------------------
@@ -1582,10 +1609,11 @@ public final class KafkaAgent {
         String topic = stringOrEmpty(params, "topic");
         Integer partition = integerOrNull(params, "partition");
         Long offset = longOrNull(params, "offset");
+        Long endOffsetLimit = longOrNull(params, "endOffset");
         int count = validatedPeekCount(intOrDefault(params, "count", 10));
         PeekStartPosition startPosition = peekStartPosition(params);
         boolean explicitStartPosition = stringOrNull(params, "startPosition") != null;
-        validatePeekRequest(startPosition, explicitStartPosition, partition, offset);
+        validatePeekRequest(startPosition, explicitStartPosition, partition, offset, endOffsetLimit);
         boolean legacyOffsetRequest = !explicitStartPosition && offset != null;
 
         JsonObject conn = activeConnection;
@@ -1613,13 +1641,14 @@ public final class KafkaAgent {
             for (TopicPartition tp : candidatePartitions) {
                 long beginningOffset = beginningOffsets.getOrDefault(tp, 0L);
                 long endOffset = endOffsets.getOrDefault(tp, beginningOffset);
+                long snapshotEndOffset = boundedSnapshotEndOffset(endOffset, endOffsetLimit);
                 Long requestedOffset = requestedPeekOffset(
-                    startPosition, offset, legacyOffsetRequest, beginningOffset, endOffset
+                    startPosition, offset, legacyOffsetRequest, beginningOffset, snapshotEndOffset
                 );
                 if (requestedOffset == null) {
                     continue;
                 }
-                Long seekOffset = normalizePeekOffset(requestedOffset, beginningOffset, endOffset);
+                Long seekOffset = normalizePeekOffset(requestedOffset, beginningOffset, snapshotEndOffset);
                 if (seekOffset == null) {
                     continue;
                 }
@@ -1641,13 +1670,14 @@ public final class KafkaAgent {
                 for (TopicPartition tp : readablePartitions) {
                     long beginningOffset = beginningOffsets.getOrDefault(tp, 0L);
                     long endOffset = endOffsets.getOrDefault(tp, beginningOffset);
+                    long snapshotEndOffset = boundedSnapshotEndOffset(endOffset, endOffsetLimit);
                     seekOffsets.put(tp, recentPeekStartOffset(
-                        beginningOffset, endOffset, messagesPerPartition
+                        beginningOffset, snapshotEndOffset, messagesPerPartition
                     ));
                 }
             }
             for (TopicPartition tp : readablePartitions) {
-                snapshotEndOffsets.put(tp, endOffsets.getOrDefault(tp, 0L));
+                snapshotEndOffsets.put(tp, boundedSnapshotEndOffset(endOffsets.getOrDefault(tp, 0L), endOffsetLimit));
             }
 
             consumer.assign(readablePartitions);
@@ -1693,6 +1723,240 @@ public final class KafkaAgent {
                 collection.messages, count, startPosition
             );
             return peekMessagesResult(messages, collection.incomplete);
+        }
+    }
+
+    private static Object peekRange(JsonObject params) throws Exception {
+        String topic = stringOrEmpty(params, "topic");
+        Integer partition = integerOrNull(params, "partition");
+        Long startOffset = longOrNull(params, "startOffset");
+        Long endOffset = longOrNull(params, "endOffset");
+        int count = validatedPeekCount(intOrDefault(params, "count", 100));
+        validateRangeRequest(partition, startOffset, endOffset);
+
+        JsonObject conn = requireActiveConnection();
+        Properties props = peekConsumerProperties(conn, count);
+        Duration requestTimeout = Duration.ofMillis(peekRequestTimeoutMs(conn, props));
+        try (KafkaConsumer<String, byte[]> consumer = new KafkaConsumer<>(props)) {
+            List<TopicPartition> partitions = resolvePeekPartitions(consumer, topic, partition, requestTimeout);
+            Map<TopicPartition, Long> beginningOffsets = consumer.beginningOffsets(partitions, requestTimeout);
+            Map<TopicPartition, Long> brokerEndOffsets = consumer.endOffsets(partitions, requestTimeout);
+            List<TopicPartition> readablePartitions = new ArrayList<>();
+            Map<TopicPartition, Long> effectiveEndOffsets = new LinkedHashMap<>();
+            for (TopicPartition tp : partitions) {
+                long beginning = beginningOffsets.getOrDefault(tp, 0L);
+                long brokerEnd = brokerEndOffsets.getOrDefault(tp, beginning);
+                long effectiveStart = Math.max(beginning, startOffset);
+                long effectiveEnd = Math.min(brokerEnd, endOffset);
+                if (effectiveStart >= effectiveEnd) {
+                    continue;
+                }
+                readablePartitions.add(tp);
+                effectiveEndOffsets.put(tp, effectiveEnd);
+            }
+            consumer.assign(readablePartitions);
+            for (TopicPartition tp : readablePartitions) {
+                consumer.seek(tp, Math.max(beginningOffsets.getOrDefault(tp, 0L), startOffset));
+            }
+            return readRangeBatch(consumer, readablePartitions, effectiveEndOffsets, count, requestTimeout);
+        }
+    }
+
+    private static Object startReadSession(JsonObject params) throws Exception {
+        String topic = stringOrEmpty(params, "topic");
+        Integer partition = integerOrNull(params, "partition");
+        Long startOffset = longOrNull(params, "startOffset");
+        Long endOffset = longOrNull(params, "endOffset");
+        int count = validatedPeekCount(intOrDefault(params, "count", 100));
+        validateRangeRequest(partition, startOffset, endOffset);
+
+        JsonObject conn = requireActiveConnection();
+        Properties props = peekConsumerProperties(conn, count);
+        Duration requestTimeout = Duration.ofMillis(peekRequestTimeoutMs(conn, props));
+        KafkaConsumer<String, byte[]> consumer = new KafkaConsumer<>(props);
+        try {
+            List<TopicPartition> partitions = resolvePeekPartitions(consumer, topic, partition, requestTimeout);
+            Map<TopicPartition, Long> beginningOffsets = consumer.beginningOffsets(partitions, requestTimeout);
+            Map<TopicPartition, Long> brokerEndOffsets = consumer.endOffsets(partitions, requestTimeout);
+            Map<TopicPartition, Long> sessionEndOffsets = new LinkedHashMap<>();
+            List<TopicPartition> readablePartitions = new ArrayList<>();
+            for (TopicPartition tp : partitions) {
+                long beginning = beginningOffsets.getOrDefault(tp, 0L);
+                long brokerEnd = brokerEndOffsets.getOrDefault(tp, beginning);
+                long effectiveStart = Math.max(beginning, startOffset);
+                long effectiveEnd = Math.min(brokerEnd, endOffset);
+                if (effectiveStart >= effectiveEnd) {
+                    continue;
+                }
+                readablePartitions.add(tp);
+                sessionEndOffsets.put(tp, effectiveEnd);
+            }
+            consumer.assign(readablePartitions);
+            for (TopicPartition tp : readablePartitions) {
+                consumer.seek(tp, Math.max(beginningOffsets.getOrDefault(tp, 0L), startOffset));
+            }
+
+            String sessionId = UUID.randomUUID().toString();
+            ReadSession session = new ReadSession(
+                sessionId,
+                consumer,
+                readablePartitions,
+                sessionEndOffsets,
+                requestTimeout
+            );
+            Map<String, Object> result = readSessionResult(session, count);
+            readSessions.put(sessionId, session);
+            consumer = null;
+            return result;
+        } finally {
+            if (consumer != null) {
+                consumer.close(Duration.ofSeconds(5));
+            }
+        }
+    }
+
+    private static Object readSessionNext(JsonObject params) throws Exception {
+        String sessionId = stringOrEmpty(params, "sessionId");
+        if (sessionId.isBlank()) {
+            throw new IllegalArgumentException("sessionId is required");
+        }
+        ReadSession session = readSessions.get(sessionId);
+        if (session == null) {
+            throw new IllegalStateException("Kafka read session not found: " + sessionId);
+        }
+        session.lastAccessMs = System.currentTimeMillis();
+        int count = validatedPeekCount(intOrDefault(params, "count", 100));
+        return readSessionResult(session, count);
+    }
+
+    private static Object closeReadSession(JsonObject params) {
+        String sessionId = stringOrEmpty(params, "sessionId");
+        if (!sessionId.isBlank()) {
+            ReadSession session = readSessions.remove(sessionId);
+            if (session != null) {
+                session.close();
+            }
+        }
+        return Collections.singletonMap("ok", true);
+    }
+
+    private static Map<String, Object> readSessionResult(ReadSession session, int count) {
+        Map<String, Object> result = readRangeBatch(
+            session.consumer,
+            session.partitions,
+            session.endOffsets,
+            count,
+            session.requestTimeout
+        );
+        result.put("sessionId", session.id);
+        result.put("done", session.isDone());
+        session.lastAccessMs = System.currentTimeMillis();
+        return result;
+    }
+
+    private static Map<String, Object> readRangeBatch(
+        KafkaConsumer<String, byte[]> consumer,
+        List<TopicPartition> partitions,
+        Map<TopicPartition, Long> endOffsets,
+        int count,
+        Duration requestTimeout
+    ) {
+        if (partitions.isEmpty()) {
+            Map<String, Object> result = peekMessagesResult(Collections.emptyList(), false);
+            result.put("done", true);
+            return result;
+        }
+
+        int messagesPerPartition = peekMessagesPerPartition(count, partitions.size());
+        int scanLimit = Math.max(MAX_PEEK_SCAN_RECORDS, count);
+        Duration pollTimeout = Duration.ofMillis(Math.min(500L, requestTimeout.toMillis()));
+        long deadlineNs = System.nanoTime() + requestTimeout.toNanos();
+        PeekCollectionState collection = new PeekCollectionState(partitions, messagesPerPartition);
+        PeekCollectionCompletionChecker completionChecker = state ->
+            state.allPartitionQuotasSatisfied()
+                || allPeekPartitionsCaughtUp(partitions, currentPeekPositions(consumer, partitions), endOffsets);
+        collection.incomplete = !collectPeekedMessages(
+            timeout -> consumer.poll(timeout),
+            completionChecker,
+            record -> recordIsBeforeEndOffset(record, endOffsets),
+            collection,
+            scanLimit,
+            deadlineNs,
+            pollTimeout
+        );
+        rewindToReturnedMessages(consumer, collection.messages, partitions);
+        Map<String, Object> result = peekMessagesResult(
+            sortAndLimitPeekedMessages(collection.messages, count, PeekStartPosition.OFFSET),
+            collection.incomplete
+        );
+        result.put(
+            "done",
+            allPeekPartitionsCaughtUp(partitions, currentPeekPositions(consumer, partitions), endOffsets)
+        );
+        return result;
+    }
+
+    /**
+     * Kafka poll() advances the consumer position past every record in the fetched
+     * batch, even when max.poll.records truncates what is returned to the collector.
+     * On the next session batch that over-advanced position would silently skip the
+     * un-returned records, so re-seek each partition to the first un-returned offset.
+     */
+    private static void rewindToReturnedMessages(
+        KafkaConsumer<String, byte[]> consumer,
+        List<Map<String, Object>> messages,
+        List<TopicPartition> partitions
+    ) {
+        Map<Integer, Long> lastReturnedAffectedPosition = lastReturnedOffsetByPartition(messages);
+        for (TopicPartition tp : partitions) {
+            Long lastReturned = lastReturnedAffectedPosition.get(tp.partition());
+            if (lastReturned != null) {
+                consumer.seek(tp, lastReturned + 1);
+            }
+        }
+    }
+
+    /**
+     * The maximum offset actually returned to the caller for each partition. Rewinding
+     * a partition to (last returned offset + 1) resumes exactly at the first unreturned
+     * record even when poll() advanced the position past the whole fetched batch.
+     */
+    static Map<Integer, Long> lastReturnedOffsetByPartition(List<Map<String, Object>> messages) {
+        Map<Integer, Long> lastReturnedOffsetByPartition = new HashMap<>();
+        for (Map<String, Object> message : messages) {
+            int partition = ((Number) message.getOrDefault("partition", -1)).intValue();
+            long offset = ((Number) message.getOrDefault("offset", -1L)).longValue();
+            if (partition < 0 || offset < 0) {
+                continue;
+            }
+            lastReturnedOffsetByPartition.merge(
+                partition,
+                offset,
+                (current, candidate) -> Math.max(current, candidate)
+            );
+        }
+        return lastReturnedOffsetByPartition;
+    }
+
+    private static JsonObject requireActiveConnection() {
+        if (activeConnection == null) {
+            throw new IllegalStateException("Kafka Agent is not connected");
+        }
+        return activeConnection;
+    }
+
+    private static void validateRangeRequest(Integer partition, Long startOffset, Long endOffset) {
+        if (partition != null && partition < 0) {
+            throw new IllegalArgumentException("partition must be non-negative");
+        }
+        if (startOffset == null || startOffset < 0) {
+            throw new IllegalArgumentException("startOffset must be non-negative");
+        }
+        if (endOffset == null || endOffset < 0) {
+            throw new IllegalArgumentException("endOffset must be non-negative");
+        }
+        if (endOffset <= startOffset) {
+            throw new IllegalArgumentException("endOffset must be greater than startOffset");
         }
     }
 
@@ -2056,6 +2320,37 @@ public final class KafkaAgent {
         }
     }
 
+    private static final class ReadSession {
+        private final String id;
+        private final KafkaConsumer<String, byte[]> consumer;
+        private final List<TopicPartition> partitions;
+        private final Map<TopicPartition, Long> endOffsets;
+        private final Duration requestTimeout;
+        private long lastAccessMs = System.currentTimeMillis();
+
+        private ReadSession(
+            String id,
+            KafkaConsumer<String, byte[]> consumer,
+            List<TopicPartition> partitions,
+            Map<TopicPartition, Long> endOffsets,
+            Duration requestTimeout
+        ) {
+            this.id = id;
+            this.consumer = consumer;
+            this.partitions = new ArrayList<>(partitions);
+            this.endOffsets = new LinkedHashMap<>(endOffsets);
+            this.requestTimeout = requestTimeout;
+        }
+
+        private boolean isDone() {
+            return allPeekPartitionsCaughtUp(partitions, currentPeekPositions(consumer, partitions), endOffsets);
+        }
+
+        private void close() {
+            consumer.close(Duration.ofSeconds(5));
+        }
+    }
+
     /** When partition is null, peek across every partition of the topic. */
     static List<TopicPartition> resolvePeekPartitions(
         KafkaConsumer<String, byte[]> consumer,
@@ -2119,8 +2414,21 @@ public final class KafkaAgent {
         Integer partition,
         Long offset
     ) {
+        validatePeekRequest(startPosition, explicitStartPosition, partition, offset, null);
+    }
+
+    static void validatePeekRequest(
+        PeekStartPosition startPosition,
+        boolean explicitStartPosition,
+        Integer partition,
+        Long offset,
+        Long endOffset
+    ) {
         if (partition != null && partition < 0) {
             throw new IllegalArgumentException("partition must be non-negative");
+        }
+        if (endOffset != null && endOffset < 0) {
+            throw new IllegalArgumentException("endOffset must be non-negative");
         }
         if (!explicitStartPosition) {
             // Older clients used offset directly without a startPosition field.
@@ -2141,6 +2449,16 @@ public final class KafkaAgent {
         if (offset < 0) {
             throw new IllegalArgumentException("offset must be non-negative when startPosition is offset");
         }
+        if (endOffset != null && endOffset <= offset) {
+            throw new IllegalArgumentException("endOffset must be greater than offset");
+        }
+    }
+
+    static long boundedSnapshotEndOffset(long brokerEndOffset, Long requestEndOffset) {
+        if (requestEndOffset == null) {
+            return brokerEndOffset;
+        }
+        return Math.min(brokerEndOffset, requestEndOffset);
     }
 
     static Long requestedPeekOffset(

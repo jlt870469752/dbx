@@ -33,6 +33,7 @@ import type {
   RocketMqConsumerGroupConfig,
   PeekMessagesResult,
   PeekMessagesOptions,
+  ReadSessionBatchResult,
   MqRawRequest,
   MqRawResponse,
   SendMessageRequest,
@@ -248,6 +249,22 @@ export async function mqClearBacklog(connectionId: string, topic: TopicRef, sub:
 
 export async function mqPeekMessages(connectionId: string, topic: TopicRef, sub: string, count: number, options?: PeekMessagesOptions): Promise<PeekMessagesResult> {
   return post("/api/mq/subscriptions/peek-messages", { connectionId, topic, sub, count, options });
+}
+
+export async function mqPeekMessagesRange(connectionId: string, topic: TopicRef, sub: string, partition: number | undefined, startOffset: number, endOffset: number, count: number): Promise<PeekMessagesResult> {
+  return post("/api/mq/subscriptions/peek-range", { connectionId, topic, sub, partition, startOffset, endOffset, count });
+}
+
+export async function mqStartReadSession(connectionId: string, topic: TopicRef, sub: string, partition: number | undefined, startOffset: number, endOffset: number, count: number): Promise<ReadSessionBatchResult> {
+  return post("/api/mq/subscriptions/read-session/start", { connectionId, topic, sub, partition, startOffset, endOffset, count });
+}
+
+export async function mqReadSessionNext(connectionId: string, sessionId: string, count: number): Promise<ReadSessionBatchResult> {
+  return post("/api/mq/subscriptions/read-session/next", { connectionId, sessionId, count });
+}
+
+export async function mqCloseReadSession(connectionId: string, sessionId: string): Promise<void> {
+  return post("/api/mq/subscriptions/read-session/close", { connectionId, sessionId });
 }
 
 export async function mqExpireMessages(connectionId: string, topic: TopicRef, sub: string, expireSeconds: number): Promise<void> {

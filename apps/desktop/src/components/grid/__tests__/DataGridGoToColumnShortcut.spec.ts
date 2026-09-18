@@ -250,7 +250,7 @@ describe("DataGrid go-to-column shortcut", () => {
   it("keeps editable targets available for the application-level fallback", () => {
     const keydown = functionBody("onGridKeydown", "copyDetailValue");
     const shortcutStart = keydown.indexOf("if (!targetAllowsNativeClipboard && isGoToColumnShortcut");
-    const shortcutEnd = keydown.indexOf("if (isFocusSearchShortcut", shortcutStart);
+    const shortcutEnd = keydown.indexOf("if (isFocusTableWhereShortcut", shortcutStart);
     const shortcutBranch = keydown.slice(shortcutStart, shortcutEnd);
 
     expect(shortcutStart).toBeGreaterThan(-1);

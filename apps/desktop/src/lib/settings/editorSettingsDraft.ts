@@ -60,6 +60,7 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "dataGridCrosshairHighlight",
   "pageSize",
   "tableOpenPageSize",
+  "kafkaUseReadSession",
   "queryResultMaxRowsEnabled",
   "queryResultMaxRows",
   "externalSqlEditorMaxMb",

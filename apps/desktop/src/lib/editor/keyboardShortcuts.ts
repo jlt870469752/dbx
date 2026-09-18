@@ -8,6 +8,7 @@ export interface ShortcutLikeEvent {
   ctrlKey?: boolean;
   altKey?: boolean;
   shiftKey?: boolean;
+  repeat?: boolean;
   isComposing?: boolean;
 }
 
@@ -212,6 +213,10 @@ export function isFocusSearchShortcut(event: ShortcutLikeEvent, shortcuts?: Part
   return matchesShortcut(event, actionShortcut("focusSearch", shortcuts));
 }
 
+export function isFocusTableWhereShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
+  return matchesShortcut(event, actionShortcut("focusTableWhere", shortcuts));
+}
+
 export function isRefreshDataShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
   return matchesShortcut(event, actionShortcut("refreshData", shortcuts));
 }
@@ -323,6 +328,10 @@ export function isViewTableDdlShortcut(event: ShortcutLikeEvent, shortcuts?: Par
 
 export function isQuickOpenShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
   return matchesShortcut(event, actionShortcut("quickOpen", shortcuts));
+}
+
+export function isPlainShiftTapShortcut(event: ShortcutLikeEvent): boolean {
+  return event.key === "Shift" && !!event.shiftKey && !event.metaKey && !event.ctrlKey && !event.altKey && !event.repeat && !event.isComposing;
 }
 
 export function isNavigateTabHistoryBackShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): boolean {

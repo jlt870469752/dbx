@@ -33,6 +33,13 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ tableInfoDrawerPinned: "true" } as any).tableInfoDrawerPinned).toBe(false);
   });
 
+  it("disables Kafka read sessions by default and only preserves an explicit opt-in", () => {
+    expect(DEFAULT_EDITOR_SETTINGS.kafkaUseReadSession).toBe(false);
+    expect(normalizeEditorSettings({}).kafkaUseReadSession).toBe(false);
+    expect(normalizeEditorSettings({ kafkaUseReadSession: true }).kafkaUseReadSession).toBe(true);
+    expect(normalizeEditorSettings({ kafkaUseReadSession: "true" } as any).kafkaUseReadSession).toBe(false);
+  });
+
   it("enables SQL variable substitution by default and only preserves booleans", () => {
     expect(normalizeEditorSettings({}).sqlVariableSubstitutionEnabled).toBe(true);
     expect(normalizeEditorSettings({ sqlVariableSubstitutionEnabled: true }).sqlVariableSubstitutionEnabled).toBe(true);
@@ -138,6 +145,7 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ regexMaxMatchCount: Number.POSITIVE_INFINITY }).regexMaxMatchCount).toBe(1000);
     expect(normalizeEditorSettings({ regexMaxMatchCount: Number.NaN }).regexMaxMatchCount).toBe(1000);
   });
+
   it("defaults and bounds the sidebar indent and font size", () => {
     expect(normalizeEditorSettings({}).sidebarIndent).toBe(16);
     expect(normalizeEditorSettings({}).sidebarFontSize).toBe(14);
@@ -308,8 +316,9 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ appCloseUnsavedTabsMode: "invalid" as any }).appCloseUnsavedTabsMode).toBe("keep-drafts");
   });
 
-  it("preserves CNB, migrates AtomGit to CNB, and rejects invalid values", () => {
+  it("preserves custom download sources, migrates AtomGit to CNB, and rejects invalid values", () => {
     expect(normalizeEditorSettings({ updateDownloadSource: "cnb" }).updateDownloadSource).toBe("cnb");
+    expect(normalizeEditorSettings({ updateDownloadSource: "myfork" }).updateDownloadSource).toBe("myfork");
     expect(normalizeEditorSettings({ updateDownloadSource: "atomgit" as any }).updateDownloadSource).toBe("cnb");
     expect(normalizeEditorSettings({ updateDownloadSource: "mirror" as any }).updateDownloadSource).toBe("official");
   });

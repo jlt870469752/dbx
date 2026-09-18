@@ -31,6 +31,7 @@ import { useFileDrop } from "@/composables/useFileDrop";
 import { useLargeSqlFileStreamingFallback } from "@/composables/useLargeSqlFileFallback";
 import { usePanelResize } from "@/composables/usePanelResize";
 import { useDatabaseOptions } from "@/composables/useDatabaseOptions";
+import type { QuickOpenActionId, QuickOpenItem } from "@/composables/useQuickOpen";
 import { useSqlExecution } from "@/composables/useSqlExecution";
 import MultiDbExecuteDialog from "@/components/editor/MultiDbExecuteDialog.vue";
 import { useDialogSources } from "@/composables/useDialogSources";
@@ -84,11 +85,13 @@ import {
   isExecuteSqlShortcut,
   isFocusSearchShortcut,
   isGoToColumnShortcut,
+  isFocusTableWhereShortcut,
   isModRShortcut,
   handleTabHistoryNavigationShortcut,
   isNewQueryShortcut,
   isObjectSourceSaveShortcutTarget,
   isOpenSettingsShortcut,
+  isPlainShiftTapShortcut,
   isQuickOpenShortcut,
   isResetZoomShortcut,
   isRefreshDataShortcut,
@@ -313,7 +316,9 @@ const { mcpUpdateAvailable, refreshMcpUpdateStatus, handleMcpStatusChanged } = u
 });
 const drawDesktopWindowFrame = shouldDrawDesktopWindowFrame(isMacOS(), isDesktop, isWindows());
 const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+const DOUBLE_SHIFT_QUICK_OPEN_INTERVAL_MS = 500;
 let updateCheckTimer: ReturnType<typeof setInterval> | undefined;
+let lastPlainShiftTapAt = 0;
 const needsAuth = ref(!isDesktop);
 const authenticated = ref(isDesktop);
 const setupRequired = ref(false);
@@ -2922,9 +2927,75 @@ function onAiOpenExplainPlan(sql: string) {
   });
 }
 
-async function handleQuickOpenSelect(item: any) {
+async function handleQuickOpenAction(actionId: QuickOpenActionId): Promise<void> {
+  switch (actionId) {
+    case "new-query":
+      await newQuery();
+      return;
+    case "open-settings":
+      openSettings();
+      return;
+    case "open-shortcuts":
+      openSettings("shortcuts");
+      return;
+    case "open-driver-store":
+      openDriverStorePage();
+      return;
+    case "open-history":
+      toggleRightSidebarPanel("history");
+      return;
+    case "open-sql-library":
+      openRightSidebarPanel("sqlLibrary");
+      return;
+    case "open-sql-files":
+      openRightSidebarPanel("sqlFile");
+      return;
+    case "toggle-sidebar":
+      setSidebarOpen(!sidebarOpen.value);
+      return;
+    case "open-data-transfer":
+      dialogs.showTransferDialog.value = true;
+      return;
+    case "refresh-current":
+      contentAreaRef.value?.refreshData();
+      return;
+    case "execute-sql":
+      if (activeTab.value?.mode === "query") requestActiveEditorExecute();
+      return;
+    case "format-sql":
+      formatActiveSql();
+      return;
+    case "save-sql":
+      if (activeTab.value?.mode === "query") await openSaveSqlDialog();
+      return;
+    case "close-tab":
+      if (!queryStore.activeTabId) return;
+      if (await queryStore.clearQueryResults(queryStore.activeTabId)) return;
+      queryStore.closeTab(queryStore.activeTabId);
+      return;
+    case "focus-table-where":
+      contentAreaRef.value?.focusTableWhere();
+      return;
+    case "toggle-transpose":
+      contentAreaRef.value?.toggleDataGridTranspose();
+      return;
+    case "show-ddl":
+      contentAreaRef.value?.showDataGridDdl();
+      return;
+    case "toggle-ai":
+      toggleRightSidebarPanel("ai");
+      return;
+  }
+}
+
+async function handleQuickOpenSelect(item: QuickOpenItem) {
   const connectionStore = useConnectionStore();
   const queryStore = useQueryStore();
+
+  if (item.type === "action") {
+    if (item.actionId) await handleQuickOpenAction(item.actionId);
+    return;
+  }
 
   // Handle SQL file types first — they don't require a database connection
   if (item.type === "sql_file" && item.filePath) {
@@ -2990,6 +3061,7 @@ async function handleQuickOpenSelect(item: any) {
     }
     return;
   } else if (item.type === "database") {
+    if (!item.database) return;
     // Expand connection node first
     // Tree node ID for connection is just the connectionId
     const connNode = findTreeNodeById(connectionStore.treeNodes, item.connectionId);
@@ -3033,18 +3105,21 @@ async function handleQuickOpenSelect(item: any) {
     }
     return;
   } else if (item.type === "schema") {
+    if (!item.database || !item.schema) return;
     const dbNode = findTreeNodeById(connectionStore.treeNodes, `${item.connectionId}:${item.database}`);
     if (dbNode && !dbNode.isExpanded) await connectionStore.loadSchemas(item.connectionId, item.database);
     const schemaNode = findTreeNodeById(connectionStore.treeNodes, `${item.connectionId}:${item.database}:${item.schema}`);
     if (schemaNode && !schemaNode.isExpanded) await connectionStore.loadTables(item.connectionId, item.database, item.schema);
     return;
   } else if (item.type === "table" || item.type === "view" || item.type === "materialized_view") {
+    const tableName = item.objectName || item.tableName;
+    if (!item.database || !tableName) return;
     // Open the table/view in a data tab
     await openTableTarget({
       connectionId: item.connectionId,
       database: item.database,
       schema: item.schema,
-      tableName: item.objectName || item.tableName,
+      tableName,
       tableType: item.type === "view" ? "VIEW" : item.type === "materialized_view" ? "MATERIALIZED_VIEW" : "TABLE",
     });
   } else if (item.type === "procedure" || item.type === "function" || item.type === "trigger" || item.type === "event" || item.type === "sequence" || item.type === "package" || item.type === "package-body" || item.type === "type" || item.type === "type-body") {
@@ -3064,11 +3139,12 @@ async function handleQuickOpenSelect(item: any) {
     const objectType = objectTypeMap[item.type];
     if (!objectType) return;
 
+    const objectName = item.objectName || item.tableName;
+    if (!item.database || !objectName) return;
     const schema = item.schema || item.database;
     try {
       const databaseType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(item.connectionId));
       if (!databaseType) throw new Error("Connection type is unavailable.");
-      const objectName = item.objectName || item.tableName;
       const { editableSource, objectType: resolvedType } = await loadEditableObjectSourceForEditor(api.getObjectSource, buildEditableObjectSource, {
         connectionId: item.connectionId,
         database: item.database,
@@ -3314,16 +3390,20 @@ async function handleKeydown(e: KeyboardEvent) {
 
   const switchTabIndex = switchToTabIndexFromShortcut(e, shortcuts);
 
+  if (showQuickOpen.value) return;
+
   if (isOpenSettingsShortcut(e, shortcuts)) {
     e.preventDefault();
     e.stopPropagation();
     openSettings();
     return;
   }
-  if (isQuickOpenShortcut(e, shortcuts)) {
-    e.preventDefault();
-    e.stopPropagation();
-    showQuickOpen.value = true;
+  if (isFocusTableWhereShortcut(e, shortcuts)) {
+    const focused = contentAreaRef.value?.focusTableWhere() ?? false;
+    if (focused) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
     return;
   }
   if (isToggleAiPanelShortcut(e, shortcuts)) {
@@ -3474,6 +3554,32 @@ async function handleKeydown(e: KeyboardEvent) {
   if (isDesktop && isBrowserReloadShortcut(e)) {
     e.preventDefault();
     e.stopPropagation();
+  }
+}
+
+function handleQuickOpenKeydown(e: KeyboardEvent) {
+  if (e.defaultPrevented) return;
+
+  const shortcuts = settingsStore.editorSettings.shortcuts;
+
+  if (isPlainShiftTapShortcut(e)) {
+    const now = performance.now();
+    if (now - lastPlainShiftTapAt <= DOUBLE_SHIFT_QUICK_OPEN_INTERVAL_MS) {
+      lastPlainShiftTapAt = 0;
+      e.preventDefault();
+      e.stopPropagation();
+      showQuickOpen.value = true;
+      return;
+    }
+    lastPlainShiftTapAt = now;
+    return;
+  }
+  lastPlainShiftTapAt = 0;
+
+  if (isQuickOpenShortcut(e, shortcuts)) {
+    e.preventDefault();
+    e.stopPropagation();
+    showQuickOpen.value = true;
   }
 }
 
@@ -3631,6 +3737,7 @@ onMounted(async () => {
   applyTheme();
   void applyUiScale(settingsStore.editorSettings.uiScale);
   window.addEventListener("keydown", handleNativeSelectAll, true);
+  window.addEventListener("keydown", handleQuickOpenKeydown, true);
   window.addEventListener("keydown", handleTabSwitcherKeydownCapture, true);
   window.addEventListener("keydown", handleAuxiliarySearchKeydownCapture, true);
   window.addEventListener("keydown", handleKeydown);
@@ -3714,6 +3821,7 @@ onUnmounted(() => {
     clearInterval(updateCheckTimer);
   }
   window.removeEventListener("keydown", handleNativeSelectAll, true);
+  window.removeEventListener("keydown", handleQuickOpenKeydown, true);
   window.removeEventListener("keydown", handleTabSwitcherKeydownCapture, true);
   window.removeEventListener("keydown", handleAuxiliarySearchKeydownCapture, true);
   window.removeEventListener("keydown", handleKeydown);
@@ -4038,6 +4146,23 @@ onUnmounted(() => {
                   />
                 </div>
               </div>
+              <WelcomeScreen
+                v-else-if="!driverStoreActive && !settingsStore.settingsPageActive"
+                :connection-stats="connectionStats"
+                :recent-connections="recentConnections"
+                :saved-sql-history-items="savedSqlHistoryItems"
+                :app-version="appVersion"
+                :has-connections="connectionStore.connections.length > 0"
+                :shortcuts="settingsStore.editorSettings.shortcuts"
+                @open-connection-query="openConnectionQuery"
+                @open-saved-sql="openSavedSqlFromWelcome"
+                @new-connection="showConnectionDialog = true"
+                @new-query="newQuery"
+                @show-history="openRightSidebarPanel('history')"
+                @import-config="dialogs.onImportClick"
+                @open-github="openGitHub"
+                @open-mcp-guide="openMcpGuide"
+              />
             </div>
           </div>
 

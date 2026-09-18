@@ -11,6 +11,8 @@ export interface HostNode {
   listeners: Map<string, Array<(event: any) => void>>;
   focus(): void;
   select(): void;
+  setSelectionRange(start: number, end: number): void;
+  getBoundingClientRect(): DOMRect;
   addEventListener(name: string, listener: (event: any) => void): void;
   removeEventListener(name: string, listener: (event: any) => void): void;
 }
@@ -29,6 +31,23 @@ function createHostNode(type: string): HostNode {
     },
     select() {
       node.selected = true;
+    },
+    setSelectionRange(start, end) {
+      node.props.selectionStart = start;
+      node.props.selectionEnd = end;
+    },
+    getBoundingClientRect() {
+      return {
+        x: 0,
+        y: 0,
+        width: 320,
+        height: 24,
+        top: 0,
+        right: 320,
+        bottom: 24,
+        left: 0,
+        toJSON: () => ({}),
+      };
     },
     addEventListener(name, listener) {
       const listeners = node.listeners.get(name) ?? [];

@@ -721,6 +721,20 @@ impl PeekMessagesResult {
     }
 }
 
+/// A batch returned by Kafka's stateful read-session protocol.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadSessionBatchResult {
+    #[serde(default)]
+    pub messages: Vec<PeekedMessage>,
+    #[serde(default)]
+    pub incomplete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub done: bool,
+}
+
 /// Kafka's explicit starting position for a non-committing message peek.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -736,6 +750,7 @@ pub enum PeekStartPosition {
 /// earliest available message unless an older caller supplies `offset`.
 /// `start_position: Offset` requires a non-negative offset. When no partition
 /// is supplied, Kafka reads forward from that offset in every topic partition.
+/// `end_offset` is an exclusive Kafka offset upper bound.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeekMessagesOptions {
@@ -747,6 +762,8 @@ pub struct PeekMessagesOptions {
     pub partition: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_offset: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------

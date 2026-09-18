@@ -337,11 +337,18 @@ export interface PeekMessagesResult {
   incomplete: boolean;
 }
 
+export interface ReadSessionBatchResult extends PeekMessagesResult {
+  sessionId?: string;
+  done: boolean;
+}
+
 export interface PeekMessagesOptions {
   /** Kafka only. Omitted starts at earliest unless a legacy caller supplies offset. */
   startPosition?: "latest" | "earliest" | "offset";
   partition?: number;
   offset?: number;
+  /** Kafka only. Exclusive upper bound for offset reads. */
+  endOffset?: number;
 }
 
 // Policy scope

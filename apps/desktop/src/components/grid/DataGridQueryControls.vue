@@ -67,6 +67,7 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const containerRef = ref<HTMLDivElement>();
 const filterBuilderRef = ref<InstanceType<typeof DataGridFilterBuilder>>();
+const whereEditorRef = ref<InstanceType<typeof DataGridConditionEditor>>();
 const pendingFirstEmptyRuleColumnSearch = ref(false);
 let openingFirstEmptyRuleColumnSearch = false;
 const whereWidth = ref<number | null>(null);
@@ -120,6 +121,12 @@ function clearWhere() {
   emit("clearFilters");
 }
 
+function focusWhere(): boolean {
+  if (!props.canUseWhereSearch || !whereEditorRef.value) return false;
+  whereEditorRef.value.focus();
+  return true;
+}
+
 async function openPendingFirstEmptyRuleColumnSearch() {
   if (openingFirstEmptyRuleColumnSearch || !pendingFirstEmptyRuleColumnSearch.value || !props.filterBuilderOpen || !filterBuilderRef.value) return;
   if (!props.rules.some((rule) => !rule.columnName && !rule.disabled)) return;
@@ -154,6 +161,8 @@ async function handleFilterButtonClick() {
 watch([() => props.filterBuilderOpen, () => props.rules.map((rule) => `${rule.id}:${rule.columnName}:${rule.disabled ? "1" : "0"}`).join("\u0000"), filterBuilderRef], () => void openPendingFirstEmptyRuleColumnSearch(), { flush: "post" });
 
 onUnmounted(onResizeEnd);
+
+defineExpose({ focusWhere });
 </script>
 
 <template>
@@ -239,6 +248,7 @@ onUnmounted(onResizeEnd);
         <span v-if="filterButtonCount" class="absolute -right-1 -top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-primary px-1 text-[9px] leading-none text-primary-foreground">{{ filterButtonCount }}</span>
       </button>
       <DataGridConditionEditor
+        ref="whereEditorRef"
         :model-value="whereInput"
         kind="where"
         :columns="conditionColumns"

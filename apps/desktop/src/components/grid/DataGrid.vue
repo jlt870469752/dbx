@@ -188,6 +188,7 @@ import {
   isDeleteCurrentRowShortcut,
   isEditTableStructureShortcut,
   isFocusSearchShortcut,
+  isFocusTableWhereShortcut,
   isGoToColumnShortcut,
   isGoToFirstPageShortcut,
   isGoToLastPageShortcut,
@@ -1018,6 +1019,7 @@ const replacementText = ref("");
 const replaceScope = ref<DataGridReplaceScope>("loaded");
 const replaceCaseSensitive = ref(false);
 const replaceColumn = ref(-1);
+const queryControlsRef = ref<InstanceType<typeof DataGridQueryControls>>();
 const dataGridSearch = useDataGridSearch({
   columns: () => props.result.columns,
   suggestionColumns: () => props.tableMeta?.columns.map((column) => column.name) ?? props.result.columns,
@@ -1732,6 +1734,10 @@ function focusSearch(target: Element | null = null): boolean {
     searchBarRef.value?.focus(true);
   });
   return true;
+}
+
+function focusWhere(): boolean {
+  return queryControlsRef.value?.focusWhere() ?? false;
 }
 
 function closeSearch() {
@@ -8970,6 +8976,7 @@ async function onGridKeydown(event: KeyboardEvent) {
   if (event.defaultPrevented) return;
 
   const targetAllowsNativeClipboard = eventTargetAllowsNativeClipboard(event);
+
   if (!targetAllowsNativeClipboard && props.context === "table-data" && canOpenTableStructureEditor.value && isEditTableStructureShortcut(event, settingsStore.editorSettings.shortcuts)) {
     event.preventDefault();
     event.stopPropagation();
@@ -8981,7 +8988,14 @@ async function onGridKeydown(event: KeyboardEvent) {
     event.stopPropagation();
     return;
   }
+
   if (!targetAllowsNativeClipboard && handleGridPaginationShortcut(event)) return;
+  if (isFocusTableWhereShortcut(event, settingsStore.editorSettings.shortcuts)) {
+    event.preventDefault();
+    event.stopPropagation();
+    focusWhere();
+    return;
+  }
   if (isFocusSearchShortcut(event) && !isGoToColumnShortcut(event, settingsStore.editorSettings.shortcuts)) {
     event.preventDefault();
     focusSearch(event.target instanceof Element ? event.target : document.activeElement instanceof Element ? document.activeElement : null);
@@ -10548,6 +10562,12 @@ async function toggleTableInfo(tab?: TableInfoTab) {
 function toggleTableInfoDrawerPinned() {
   settingsStore.updateEditorSettings({ tableInfoDrawerPinned: !tableInfoDrawerPinned.value });
 }
+async function openDdl(): Promise<boolean> {
+  if (!props.tableMeta || !props.connectionId) return false;
+  showTableInfo.value = true;
+  await selectTableInfoTab("ddl");
+  return activeTableInfoTab.value === "ddl";
+}
 
 async function selectTableInfoTab(tab: TableInfoTab) {
   const tabSupported = tableInfoTabs.value.some((item) => item.id === tab);
@@ -11282,8 +11302,11 @@ defineExpose({
   multiRowTranspose,
   setMultiRowTranspose,
   toggleMultiRowTranspose,
+  toggleKeyboardTranspose,
   focusSearch,
   openGoToColumn,
+  focusWhere,
+  openDdl,
   visibleColumnCount,
   displayableColumnCount,
   hiddenColumnCount,
@@ -11755,6 +11778,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
               </template>
               <template v-if="canShowWhereSearch">
                 <DataGridQueryControls
+                  ref="queryControlsRef"
                   v-model:where-input="whereFilterInput"
                   v-model:order-by-input="orderByInput"
                   v-model:filter-builder-open="effectiveFilterBuilderOpen"

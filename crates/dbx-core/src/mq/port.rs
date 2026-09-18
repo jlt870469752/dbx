@@ -175,6 +175,34 @@ pub trait MessageQueueAdmin: Send + Sync {
         count: u32,
         options: PeekMessagesOptions,
     ) -> Result<PeekMessagesResult, String>;
+    async fn peek_messages_range(
+        &self,
+        _topic: &TopicRef,
+        _sub: &str,
+        _partition: Option<i32>,
+        _start_offset: i64,
+        _end_offset: i64,
+        _count: u32,
+    ) -> Result<PeekMessagesResult, String> {
+        Err("Range message reads are not supported by this MQ system".to_string())
+    }
+    async fn start_read_session(
+        &self,
+        _topic: &TopicRef,
+        _sub: &str,
+        _partition: Option<i32>,
+        _start_offset: i64,
+        _end_offset: i64,
+        _count: u32,
+    ) -> Result<ReadSessionBatchResult, String> {
+        Err("Read sessions are not supported by this MQ system".to_string())
+    }
+    async fn read_session_next(&self, _session_id: &str, _count: u32) -> Result<ReadSessionBatchResult, String> {
+        Err("Read sessions are not supported by this MQ system".to_string())
+    }
+    async fn close_read_session(&self, _session_id: &str) -> Result<(), String> {
+        Err("Read sessions are not supported by this MQ system".to_string())
+    }
     async fn expire_messages(&self, topic: &TopicRef, sub: &str, expire_seconds: i64) -> Result<(), String>;
 
     /// RocketMQ: read subscription group config from broker metadata.

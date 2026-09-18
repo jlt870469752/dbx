@@ -911,9 +911,115 @@ class KafkaAgentTest {
 
     @Test
     void peekCountMustStayWithinTheServiceLimit() {
-        assertEquals(100, KafkaAgent.validatedPeekCount(100));
+        assertEquals(1_000, KafkaAgent.validatedPeekCount(1_000));
         assertThrows(IllegalArgumentException.class, () -> KafkaAgent.validatedPeekCount(0));
-        assertThrows(IllegalArgumentException.class, () -> KafkaAgent.validatedPeekCount(101));
+        assertThrows(IllegalArgumentException.class, () -> KafkaAgent.validatedPeekCount(1_001));
+    }
+
+    @Test
+    void rangeReadHandlerRejectsCountsAboveTheAgentLimit() {
+        String response = KafkaAgent.handleRequest("""
+            {
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "mq_peek_range",
+              "params": {
+                "topic": "events",
+                "startOffset": 0,
+                "endOffset": 10000,
+                "count": 1001
+              }
+            }
+            """);
+
+        JsonObject error = JsonParser.parseString(response).getAsJsonObject().getAsJsonObject("error");
+        assertEquals(-1, error.get("code").getAsInt());
+        assertTrue(error.get("message").getAsString().contains("between 1 and 1000"));
+    }
+
+    @Test
+    void readSessionStartHandlerRejectsInvalidOffsetRanges() {
+        String response = KafkaAgent.handleRequest("""
+            {
+              "jsonrpc": "2.0",
+              "id": 2,
+              "method": "mq_start_read_session",
+              "params": {
+                "topic": "events",
+                "startOffset": 10,
+                "endOffset": 10,
+                "count": 100
+              }
+            }
+            """);
+
+        JsonObject error = JsonParser.parseString(response).getAsJsonObject().getAsJsonObject("error");
+        assertEquals(-1, error.get("code").getAsInt());
+        assertTrue(error.get("message").getAsString().contains("endOffset must be greater than startOffset"));
+    }
+
+    @Test
+    void readSessionNextHandlerReportsMissingSessions() {
+        String response = KafkaAgent.handleRequest("""
+            {
+              "jsonrpc": "2.0",
+              "id": 3,
+              "method": "mq_read_session_next",
+              "params": {
+                "sessionId": "missing-session",
+                "count": 100
+              }
+            }
+            """);
+
+        JsonObject error = JsonParser.parseString(response).getAsJsonObject().getAsJsonObject("error");
+        assertEquals(-1, error.get("code").getAsInt());
+        assertTrue(error.get("message").getAsString().contains("read session not found"));
+    }
+
+    @Test
+    void lastReturnedOffsetByPartitionUsesTheHighestOffsetPerPartition() {
+        var messages = new java.util.ArrayList<Map<String, Object>>();
+        messages.add(Map.of("partition", 0, "offset", 5L));
+        messages.add(Map.of("partition", 0, "offset", 7L));
+        messages.add(Map.of("partition", 1, "offset", 2L));
+
+        Map<Integer, Long> lastReturnedOffsets = KafkaAgent.lastReturnedOffsetByPartition(messages);
+
+        assertEquals(7L, lastReturnedOffsets.get(0));
+        assertEquals(2L, lastReturnedOffsets.get(1));
+    }
+
+    @Test
+    void lastReturnedOffsetByPartitionIgnoresRecordsWithoutAValidPosition() {
+        var messages = new java.util.ArrayList<Map<String, Object>>();
+        messages.add(Map.of("partition", 0, "offset", 9L));
+        messages.add(Map.of("partition", 0, "offset", -1L));
+        messages.add(Map.of("partition", -1, "offset", 9L));
+        messages.add(Map.of("partition", 0));
+
+        Map<Integer, Long> lastReturnedOffsets = KafkaAgent.lastReturnedOffsetByPartition(messages);
+
+        assertEquals(Map.of(0, 9L), lastReturnedOffsets);
+    }
+
+    @Test
+    void readSessionCloseHandlerIsIdempotent() {
+        for (int id = 4; id <= 5; id++) {
+            String response = KafkaAgent.handleRequest("""
+                {
+                  "jsonrpc": "2.0",
+                  "id": %d,
+                  "method": "mq_close_read_session",
+                  "params": {
+                    "sessionId": "missing-session"
+                  }
+                }
+                """.formatted(id));
+
+            JsonObject result = JsonParser.parseString(response).getAsJsonObject().getAsJsonObject("result");
+            assertTrue(result.get("ok").getAsBoolean());
+        }
     }
 
     @Test

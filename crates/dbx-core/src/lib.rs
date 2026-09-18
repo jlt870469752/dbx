@@ -122,6 +122,7 @@ pub mod xlsx_export;
 pub const R2_CDN_BASE: &str = "https://dl.dbxio.com/";
 pub const GITHUB_RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/t8y2/dbx/releases/download/";
 pub const CNB_RELEASE_DOWNLOAD_PREFIX: &str = "https://cnb.cool/dbxio.com/dbx/-/releases/download/";
+pub const MYFORK_RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/jlt870469752/dbx/releases/download/";
 
 #[derive(Clone, Copy, Debug, Default, serde::Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
@@ -129,6 +130,7 @@ pub enum DownloadSource {
     #[default]
     Official,
     Cnb,
+    Myfork,
 }
 
 impl DownloadSource {
@@ -139,6 +141,7 @@ impl DownloadSource {
                 r2_path,
                 rewrite_github_release_url(github_url, CNB_RELEASE_DOWNLOAD_PREFIX)?,
             )),
+            Self::Myfork => Ok(vec![rewrite_github_release_url(github_url, MYFORK_RELEASE_DOWNLOAD_PREFIX)?]),
         }
     }
 }
@@ -234,6 +237,15 @@ mod tests {
                 "https://cnb.cool/dbxio.com/dbx/-/releases/download/agents-latest/agent-registry.json",
                 "https://dl.dbxio.com/agents/agent-registry.json",
             ]
+        );
+    }
+
+    #[test]
+    fn myfork_download_candidates_use_fork_release_only() {
+        let github_url = "https://github.com/t8y2/dbx/releases/download/agents-latest/agent-registry.json";
+        assert_eq!(
+            DownloadSource::Myfork.download_candidate_urls(github_url, "agents/agent-registry.json").unwrap(),
+            vec!["https://github.com/jlt870469752/dbx/releases/download/agents-latest/agent-registry.json"]
         );
     }
 }
